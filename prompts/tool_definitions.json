@@ -1,0 +1,369 @@
+{
+  "shell": {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "Run a bounded shell command inside the assigned workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Required shell command to run (no default). May return early with status=running/background=true; poll via get_tool_run or wait_run."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Optional workspace-relative working directory. Defaults to '.'."
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "compress_context": {
+    "type": "function",
+    "function": {
+      "name": "compress_context",
+      "description": "Use this when context is long and work has entered a new phase where earlier history can be compacted. Compression removes fine-grained trajectory details, so call it at a clean split point whenever possible.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  "wait_time": {
+    "type": "function",
+    "function": {
+      "name": "wait_time",
+      "description": "Wait for a bounded number of seconds.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {
+            "type": "number",
+            "minimum": 10,
+            "maximum": 60,
+            "description": "Required wait duration in seconds. Must be >= 10 and <= 60."
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_agent_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_agent_runs",
+      "description": "List agent runs in this session, newest-to-oldest by created_at.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "Optional status filter. Accepts one string or an array of strings; values are matched as-is after normalization."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of agent runs to return per page. Defaults to runtime.tools.list_default_limit and is capped by runtime.tools.list_max_limit."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Optional opaque pagination cursor from previous list_agent_runs result. Defaults to null (first page)."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "get_agent_run": {
+    "type": "function",
+    "function": {
+      "name": "get_agent_run",
+      "description": "Get one agent run by agent_id and optionally return a message slice. Messages may be long, so keep fetches minimal.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "Required stable id of the target agent run (prefix: agent-)."
+          },
+          "messages_start": {
+            "type": "integer",
+            "description": "Optional start index for message slice (inclusive). Supports negative indexes from the tail (e.g. -1 means the last message). Omit both slice fields to fetch only the latest message."
+          },
+          "messages_end": {
+            "type": "integer",
+            "description": "Optional end index for message slice (exclusive, [start,end)). Supports negative indexes from the tail. At most 5 messages are returned per call to avoid waste on long message payloads."
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "spawn_agent": {
+    "type": "function",
+    "function": {
+      "name": "spawn_agent",
+      "description": "Create one child agent with a concrete instruction. Returns both child_agent_id (agent-*) and tool_run_id (toolrun-*).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Optional short label for the child agent. Defaults to 'Worker Agent'."
+          },
+          "instruction": {
+            "type": "string",
+            "description": "Required specific task for the child agent (no default)."
+          }
+        },
+        "required": [
+          "instruction"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "cancel_agent": {
+    "type": "function",
+    "function": {
+      "name": "cancel_agent",
+      "description": "Cancel one descendant child agent by id, recursively by default.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "Required stable descendant agent id to cancel (prefix: agent-)."
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "Optional. When true (default), cancel the whole descendant subtree."
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "steer_agent": {
+    "type": "function",
+    "function": {
+      "name": "steer_agent",
+      "description": "Send one message to another agent in the current session. The target may be reactivated if runtime allows it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "Required target agent id to receive the message (prefix: agent-)."
+          },
+          "content": {
+            "type": "string",
+            "description": "Required message content to enqueue for the target agent."
+          }
+        },
+        "required": [
+          "agent_id",
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_tool_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_tool_runs",
+      "description": "List persisted tool runs in the current session, ordered newest-to-oldest by created_at.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "oneOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "running",
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ]
+                }
+              }
+            ],
+            "description": "Optional status filter (default: no filter): queued/running/completed/failed/cancelled."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of records to return per page. Defaults to runtime.tools.list_default_limit and is capped by runtime.tools.list_max_limit."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Optional opaque pagination cursor from previous list_tool_runs result. Defaults to null (first page)."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "get_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "get_tool_run",
+      "description": "Get one tool run by tool_run_id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "Required stable id of the target tool run (prefix: toolrun-)."
+          },
+          "include_result": {
+            "type": "boolean",
+            "description": "When true, include full result payload in tool_run. Defaults to false."
+          }
+        },
+        "required": [
+          "tool_run_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "wait_run": {
+    "type": "function",
+    "function": {
+      "name": "wait_run",
+      "description": "Block until a tool run or agent run reaches the required terminal state.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "Target tool run id (prefix: toolrun-)."
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "Target agent id (prefix: agent-)."
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "tool_run_id"
+            ],
+            "not": {
+              "required": [
+                "agent_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "agent_id"
+            ],
+            "not": {
+              "required": [
+                "tool_run_id"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "cancel_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "cancel_tool_run",
+      "description": "Cancel one running or queued tool run by tool_run_id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "Required stable id of the target tool run (prefix: toolrun-)."
+          }
+        },
+        "required": [
+          "tool_run_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "finish": {
+    "type": "function",
+    "function": {
+      "name": "finish",
+      "description": "Finish the current agent loop with a concise summary payload.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "partial",
+              "interrupted",
+              "failed"
+            ],
+            "description": "Required completion state for this agent (no default)."
+          },
+          "summary": {
+            "type": "string",
+            "description": "Required concise summary of completed work, remaining gaps, and key outcomes (no default)."
+          },
+          "next_recommendation": {
+            "type": "string",
+            "description": "Worker-only advisory field. Required when worker status is 'partial' or 'failed'; ignored for root."
+          }
+        },
+        "required": [
+          "status",
+          "summary"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

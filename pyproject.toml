@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencompany"
+version = "0.1.0"
+description = "Local-first multi-agent orchestration framework with isolated workspaces and a terminal UI."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "OpenCompany" }
+]
+dependencies = [
+  "httpx>=0.27,<1.0",
+  "textual>=0.58,<1.0",
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "websockets>=12,<16"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9.0",
+  "pytest-asyncio>=0.23,<1.0"
+]
+
+[project.scripts]
+opencompany = "opencompany.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+opencompany = ["webui/static/*"]

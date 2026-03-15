@@ -1,0 +1,12 @@
+.opencompany/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+node_modules/
+.env
+.venv/
+.DS_Store

@@ -1,0 +1,205 @@
+{
+  "shell": {
+    "input": {"type": "shell", "command": "echo hello"},
+    "output_example": {
+      "exit_code": 0,
+      "stdout": "hello\n",
+      "stderr": "",
+      "duration_ms": 10
+    },
+    "allowed_output_keys": [
+      "exit_code",
+      "stdout",
+      "stderr",
+      "duration_ms",
+      "timed_out",
+      "timeout_seconds",
+      "tool_run_id",
+      "status",
+      "background",
+      "warning"
+    ],
+    "required_output_keys": ["exit_code", "stdout", "stderr", "duration_ms"],
+    "forbidden_output_keys": ["command"]
+  },
+  "wait_time": {
+    "input": {"type": "wait_time", "seconds": 10},
+    "output_example": {"wait_time_status": true},
+    "allowed_output_keys": ["wait_time_status", "timed_out", "timeout_seconds", "error"],
+    "required_output_keys": ["wait_time_status"],
+    "forbidden_output_keys": ["seconds"]
+  },
+  "compress_context": {
+    "input": {"type": "compress_context"},
+    "output_example": {
+      "compressed": true,
+      "reason": "manual",
+      "summary_version": 1,
+      "message_range": {"start": 0, "end": 2},
+      "step_range": {"start": 1, "end": 2},
+      "context_tokens_before": 120000,
+      "context_tokens_after": 3000,
+      "context_limit_tokens": 128000
+    },
+    "allowed_output_keys": [
+      "compressed",
+      "reason",
+      "summary_version",
+      "message_range",
+      "step_range",
+      "context_tokens_before",
+      "context_tokens_after",
+      "context_limit_tokens",
+      "error"
+    ],
+    "required_output_keys": [
+      "compressed",
+      "reason",
+      "summary_version",
+      "message_range",
+      "step_range",
+      "context_tokens_before",
+      "context_tokens_after",
+      "context_limit_tokens"
+    ],
+    "forbidden_output_keys": []
+  },
+  "list_agent_runs": {
+    "input": {"type": "list_agent_runs", "limit": 2},
+    "output_example": {
+      "agent_runs_count": 1,
+      "agent_runs": [
+        {
+          "id": "agent-root",
+          "name": "Root",
+          "role": "root",
+          "status": "running",
+          "created_at": "2026-03-11T10:00:00Z",
+          "summary_short": "",
+          "messages_count": 1
+        }
+      ],
+      "next_cursor": null,
+      "has_more": false
+    },
+    "allowed_output_keys": ["agent_runs_count", "agent_runs", "next_cursor", "has_more", "error"],
+    "required_output_keys": ["agent_runs_count", "agent_runs", "next_cursor", "has_more"],
+    "forbidden_output_keys": ["status", "limit", "cursor"]
+  },
+  "get_agent_run": {
+    "input": {"type": "get_agent_run", "agent_id": "agent-root"},
+    "output_example": {
+      "agent_run": {
+        "id": "agent-root",
+        "name": "Root",
+        "role": "root",
+        "status": "running",
+        "created_at": "2026-03-11T10:00:00Z",
+        "parent_agent_id": null,
+        "children_count": 0,
+        "step_count": 0
+      },
+      "messages": [{"role": "user", "content": "start"}]
+    },
+    "allowed_output_keys": ["agent_run", "messages", "warning", "next_messages_start", "error"],
+    "required_output_keys": ["agent_run", "messages"],
+    "forbidden_output_keys": ["agent_id", "messages_start", "messages_end"]
+  },
+  "spawn_agent": {
+    "input": {"type": "spawn_agent", "instruction": "Do work"},
+    "output_example": {"child_agent_id": "agent-child", "tool_run_id": "toolrun-spawn"},
+    "allowed_output_keys": ["child_agent_id", "tool_run_id", "warning", "error"],
+    "required_output_keys": ["child_agent_id", "tool_run_id"],
+    "forbidden_output_keys": ["instruction", "name"]
+  },
+  "cancel_agent": {
+    "input": {"type": "cancel_agent", "agent_id": "agent-child"},
+    "output_example": {"cancel_agent_status": true},
+    "allowed_output_keys": ["cancel_agent_status", "error"],
+    "required_output_keys": ["cancel_agent_status"],
+    "forbidden_output_keys": ["agent_id", "recursive"]
+  },
+  "steer_agent": {
+    "input": {"type": "steer_agent", "agent_id": "agent-child", "content": "Refocus on tests"},
+    "output_example": {
+      "steer_agent_status": true,
+      "steer_run_id": "steerrun-sample",
+      "target_agent_id": "agent-child",
+      "status": "waiting"
+    },
+    "allowed_output_keys": [
+      "steer_agent_status",
+      "steer_run_id",
+      "target_agent_id",
+      "status",
+      "configured_scope",
+      "error"
+    ],
+    "required_output_keys": ["steer_agent_status"],
+    "forbidden_output_keys": ["agent_id", "content"]
+  },
+  "list_tool_runs": {
+    "input": {"type": "list_tool_runs", "limit": 2},
+    "output_example": {
+      "tool_runs_count": 1,
+      "tool_runs": [
+        {
+          "id": "toolrun-sample",
+          "tool_name": "shell",
+          "status": "completed",
+          "agent_id": "agent-root",
+          "created_at": "2026-03-11T10:00:00Z",
+          "started_at": "2026-03-11T10:00:00Z",
+          "completed_at": "2026-03-11T10:00:01Z",
+          "duration_ms": 1000,
+          "error_summary": null
+        }
+      ],
+      "next_cursor": null,
+      "has_more": false
+    },
+    "allowed_output_keys": ["tool_runs_count", "tool_runs", "next_cursor", "has_more", "error"],
+    "required_output_keys": ["tool_runs_count", "tool_runs", "next_cursor", "has_more"],
+    "forbidden_output_keys": ["status", "limit", "cursor"]
+  },
+  "get_tool_run": {
+    "input": {"type": "get_tool_run", "tool_run_id": "toolrun-sample"},
+    "output_example": {
+      "tool_run": {
+        "id": "toolrun-sample",
+        "tool_name": "shell",
+        "status": "completed",
+        "agent_id": "agent-root",
+        "created_at": "2026-03-11T10:00:00Z",
+        "started_at": "2026-03-11T10:00:00Z",
+        "completed_at": "2026-03-11T10:00:01Z",
+        "duration_ms": 1000,
+        "error_summary": null
+      }
+    },
+    "allowed_output_keys": ["tool_run", "error"],
+    "required_output_keys": ["tool_run"],
+    "forbidden_output_keys": ["tool_run_id", "include_result"]
+  },
+  "wait_run": {
+    "input": {"type": "wait_run", "tool_run_id": "toolrun-sample"},
+    "output_example": {"wait_run_status": true},
+    "allowed_output_keys": ["wait_run_status", "timed_out", "timeout_seconds", "error"],
+    "required_output_keys": ["wait_run_status"],
+    "forbidden_output_keys": ["tool_run_id", "agent_id"]
+  },
+  "cancel_tool_run": {
+    "input": {"type": "cancel_tool_run", "tool_run_id": "toolrun-sample"},
+    "output_example": {"final_status": "cancelled", "cancelled_agents_count": 1},
+    "allowed_output_keys": ["final_status", "cancelled_agents_count", "error"],
+    "required_output_keys": ["final_status", "cancelled_agents_count"],
+    "forbidden_output_keys": ["tool_run_id", "cancelled_task", "cancelled_agent_ids"]
+  },
+  "finish": {
+    "input": {"type": "finish", "status": "completed", "summary": "Work finished."},
+    "output_example": {"accepted": true},
+    "allowed_output_keys": ["accepted", "error"],
+    "required_output_keys": ["accepted"],
+    "forbidden_output_keys": ["status", "summary", "follow_up_needed", "submitted_summary"]
+  }
+}

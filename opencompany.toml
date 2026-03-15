@@ -1,0 +1,249 @@
+[project]
+# 项目名称（用于展示）
+# Project name for display
+name = "OpenCompany"
+# 默认语言：auto 自动检测；可选 en / zh
+# Default locale: auto detects system locale; options: en / zh
+default_locale = "zh"
+# 运行数据目录（日志、导出文件等会写入此目录）
+# Runtime data directory (logs/exports are stored here)
+data_dir = ".opencompany"
+
+
+# LLM 提供方配置（当前为 OpenRouter）
+# LLM provider configuration (OpenRouter currently)
+[llm.openrouter]
+# OpenRouter API 基础地址
+# OpenRouter API base URL
+base_url = "https://openrouter.ai/api/v1"
+# 默认模型（当未为不同角色单独指定模型时使用）
+# Default model (used when no per-role override is set)
+model = "stepfun/step-3.5-flash:free"
+# 协调者（root）专用模型；留空则使用 model
+# Coordinator (root) model override; empty means fallback to model
+coordinator_model = ""
+# 工作者（worker）专用模型；留空则使用 model
+# Worker model override; empty means fallback to model
+worker_model = ""
+# 单次请求超时（秒）
+# Per-request timeout in seconds
+timeout_seconds = 120
+# OpenRouter 请求失败时的最大重试次数（可重试网络错误/限流 429/瞬时 5xx）
+# Max retries for failed OpenRouter requests (retryable network errors/429/transient 5xx)
+max_retries = 8
+# 重试退避基线秒数（第 n 次重试等待 retry_backoff_seconds * 2^(n-1)）
+# Retry backoff base seconds (nth retry waits retry_backoff_seconds * 2^(n-1))
+retry_backoff_seconds = 1.0
+# 发生空响应且无法解析动作时的额外重试次数（同一次 agent step 内）
+# Extra retries for empty/non-actionable model responses within one agent step
+empty_response_retries = 1
+# 单次回复最大 token 数
+# Max output tokens per response
+max_tokens = 10240
+# 采样温度：越低越稳定，越高越发散
+# Sampling temperature: lower is more stable, higher is more diverse
+temperature = 1.0
+
+
+# 运行时限制（控制多代理编排规模）
+# Runtime limits (multi-agent orchestration scale guardrails)
+[runtime.limits]
+# 每个代理最多可创建的子代理数量
+# Max child agents each agent can spawn
+max_children_per_agent = 8
+# 系统同时活跃代理数量上限
+# Max concurrently active agents in session
+max_active_agents = 32
+# root 协调软步骤阈值（达到后会提示尽快收尾）
+# Root soft step threshold (triggers wrap-up reminders)
+max_root_steps = 1024
+# 单个代理可执行的最大步骤数
+# Max steps per agent
+max_agent_steps = 128
+# root 达到软阈值后每多少轮注入一次收尾提醒
+# Reminder interval (turns) after root reaches soft threshold
+root_soft_limit_reminder_interval = 4
+# worker 达到软阈值后每多少轮注入一次收尾提醒
+# Reminder interval (turns) after worker reaches soft threshold
+worker_soft_limit_reminder_interval = 4
+
+
+# 工具调用超时（秒）
+# Tool-call timeouts in seconds
+[runtime.tool_timeouts]
+# 工具默认超时
+# Default timeout for tools
+default_seconds = 30
+# shell 工具超时；设为 0 时回退到 [sandbox].timeout_seconds
+# Shell timeout; 0 means fallback to [sandbox].timeout_seconds
+shell_seconds = 300
+
+
+# 各工具可独立配置超时（可扩展新增工具）
+# Per-tool timeout overrides (extendable)
+[runtime.tool_timeouts.actions]
+compress_context = 300
+wait_time = 65
+list_agent_runs = 10
+get_agent_run = 10
+cancel_agent = 20
+steer_agent = 10
+spawn_agent = 10
+wait_run = 300
+cancel_tool_run = 20
+
+
+# 工具注册
+# Tool registry
+[runtime.tools]
+# root 角色可用工具列表（可按需扩展或裁剪）
+# Tool list for root role (customizable)
+root_tools = [
+  "shell",
+  "compress_context",
+  "wait_time",
+  "list_agent_runs",
+  "get_agent_run",
+  "spawn_agent",
+  "cancel_agent",
+  "steer_agent",
+  "list_tool_runs",
+  "get_tool_run",
+  "wait_run",
+  "cancel_tool_run",
+  "finish",
+]
+# worker 角色可用工具列表（可按需扩展或裁剪）
+# Tool list for worker role (customizable)
+worker_tools = [
+  "shell",
+  "compress_context",
+  "wait_time",
+  "list_agent_runs",
+  "get_agent_run",
+  "spawn_agent",
+  "cancel_agent",
+  "steer_agent",
+  "list_tool_runs",
+  "get_tool_run",
+  "wait_run",
+  "cancel_tool_run",
+  "finish",
+]
+# steer_agent 的可达范围：session / descendants
+# Allowed steer_agent scope: session / descendants
+steer_agent_scope = "session"
+# 列表型工具（list_agent_runs/list_tool_runs）的默认分页大小
+# Default page size for list tools (list_agent_runs/list_tool_runs)
+list_default_limit = 20
+# 列表型工具的分页上限（实际传入 limit 会被裁剪到 1..list_max_limit）
+# Max page size for list tools (input limit is clamped to 1..list_max_limit)
+list_max_limit = 200
+# shell 工具前台等待秒数；超时后会先返回当前输出并在后台继续运行
+# Foreground wait seconds for shell; after timeout it returns current output and continues in background
+shell_inline_wait_seconds = 10
+
+
+# 上下文压缩与运行控制
+# Context compression/runtime controls
+[runtime.context]
+# 是否启用上下文压力检测与压缩编排
+# Enable context pressure detection and compression orchestration
+enabled = true
+# 提醒阈值比例（current_context_tokens / max_context_tokens）
+# Reminder ratio threshold (current_context_tokens / max_context_tokens)
+reminder_ratio = 0.75
+# 压缩后仍保留在头部的固定消息条数
+# Number of pinned head messages kept before summary
+keep_pinned_messages = 1
+# 必填上下文上限，作为唯一有效上下文预算
+# Required context limit used as the only effective budget
+max_context_tokens = 51200
+# 用于上下文压缩的专用模型
+# Dedicated model used for context compression
+compression_model = "stepfun/step-3.5-flash:free"
+# 超窗检测后的“强制压缩+重试”次数
+# Forced-compress retry attempts after overflow detection
+overflow_retry_attempts = 1
+
+
+# 沙箱执行配置
+# Sandbox execution configuration
+[sandbox]
+# 沙箱后端类型：anthropic（受约束）/ none（无约束）
+# Sandbox backend: anthropic (constrained) / none (unconstrained)
+backend = "anthropic"
+# 沙箱 CLI 路径；留空表示使用默认路径
+# Sandbox CLI path; empty means default path
+cli_path = ""
+# 网络策略：deny_all / allow_all / allowlist（推荐 allowlist）
+# Network policy: deny_all / allow_all / allowlist (allowlist recommended)
+network_policy = "allowlist"
+# allowlist 仅填写域名，不带协议/端口/路径；请按实际需求最小化维护
+# Allowlist uses domains only (no scheme/port/path); keep this list minimal for your needs
+allowed_domains = [
+  # OpenRouter API（默认 LLM 网关）
+  # OpenRouter API (default LLM gateway)
+  "openrouter.ai",
+  # GitHub 代码托管与源码下载
+  # GitHub hosting and source download
+  "github.com",
+  "api.github.com",
+  "raw.githubusercontent.com",
+  "codeload.github.com",
+  "objects.githubusercontent.com",
+  # 常用包仓库（Node / Python）
+  # Common package registries (Node / Python)
+  "registry.npmjs.org",
+  "pypi.org",
+  "files.pythonhosted.org",
+  # Java 生态（Maven / Gradle / JDK 下载）
+  # Java ecosystem (Maven / Gradle / JDK downloads)
+  "repo.maven.apache.org",
+  "repo1.maven.org",
+  "plugins.gradle.org",
+  "services.gradle.org",
+  "download.oracle.com",
+  "download.java.net",
+  "api.adoptium.net",
+  # C/C++ 生态（构建工具与包管理）
+  # C/C++ ecosystem (build tools and package registries)
+  "cmake.org",
+  "conan.io",
+  "center2.conan.io",
+  # Linux 生态（内核/GNU/常见发行版仓库）
+  # Linux ecosystem (kernel/GNU/common distro mirrors)
+  "kernel.org",
+  "cdn.kernel.org",
+  "ftp.gnu.org",
+  "deb.debian.org",
+  "security.debian.org",
+  "archive.ubuntu.com",
+  "security.ubuntu.com",
+  "dl-cdn.alpinelinux.org",
+]
+# 沙箱命令统一超时（秒）
+# Unified sandbox command timeout in seconds
+timeout_seconds = 300
+
+
+# 日志与导出文件名配置（位于 data_dir 下）
+# Log/export filename configuration (under data_dir)
+[logging]
+# 结构化事件日志（JSONL）
+# Structured event log filename (JSONL)
+jsonl_filename = "events.jsonl"
+# 导出文件名（JSON）
+# Session export filename (JSON)
+export_filename = "export.json"
+# 诊断日志（JSONL）
+# Diagnostic log filename (JSONL)
+diagnostics_filename = "diagnostics.jsonl"
+
+
+# 语言回退配置
+# Locale fallback configuration
+[locale]
+# 当无法识别本地语言时的回退语言（en / zh）
+# Fallback locale when system locale cannot be resolved (en / zh)
+fallback = "en"

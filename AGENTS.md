@@ -1,0 +1,27 @@
+# OpenCompany Agent Principles
+
+- Build OpenCompany as a local-first, modular multi-agent framework for project directories.
+- Follow the bitter lesson and first principles: prefer simple scalable primitives and direct designs over heavy handcrafted workflows.
+- Do development and verification in either the Conda environment named `OpenCompany` or an equivalent `uv` virtual environment (Python 3.12 + dev dependencies).
+- Make the root coordinator an organizer, not an executor: it may inspect context, plan, decompose work, monitor progress, and decide when to stop.
+- Let worker agents execute the actual task, collaborate through explicit tools, and finish with concise summaries the coordinator can consume.
+- Give every agent a stable unique ID plus recorded parent/child lineage and lifecycle state.
+- Support two session workspace modes: `staged` keeps isolated writable workspaces plus explicit apply/undo, while `direct` allows live writes into the target project directory under the selected sandbox backend policy (`anthropic` constrained, `none` unconstrained). In `direct`, the workspace root may be local or remote (SSH Linux directory). `staged` must reject remote workspaces in both UI setup and backend validation. Preserve the selected mode for the lifetime of the session.
+- Keep orchestration limits explicit and configurable, including child fan-out, active agents, step budgets, and root loop caps.
+- Current runtime policy deviation: when a loop or budget limit is hit, send soft summary reminders and prefer user handoff, without hard-forcing termination.
+- Keep agent tools minimal and composable: project inspection, sandboxed terminal access, subagent creation, subagent termination, agent steering, and status lookup.
+- Keep the orchestration flow modular and easy to replace so future coordination changes do not require rewrites.
+- Keep LLM backends pluggable; OpenRouter with streaming is the first supported backend.
+- Keep prompts centralized and versionable in one directory.
+- Provide dual local UIs (terminal + web) with directory switching, settings, task input, agent activity views, and interruption controls.
+- Log every meaningful action, tool call, and inter-agent message with enough structure for replay, debugging, and data collection.
+- Prefer explicit limits, checkpoints, and resumability over hidden long-running state.
+- Combine modular tests with end-to-end system tests to catch regressions and repeated failure patterns.
+- Full test runs can take several minutes; wait patiently for completion before assuming a hang.
+- Research important technical choices before locking them in; if uncertainty materially affects the design, discuss options with the user first.
+- Keep `docs/`, `README.md`, and `AGENTS.md` current as the system evolves.
+- Keep `docs/README.md` as the canonical docs index and update it whenever docs structure changes.
+- Maintain module-level docs under `docs/modules/`; update the affected module doc in the same change that modifies behavior.
+- Keep English and Chinese mirrors structurally aligned (same sections/order) across docs updates.
+- Keep prompts, docs, and README in English with synchronized Chinese mirrors named `*_cn.md`.
+- Default the UI locale to the local language; if it is neither Chinese nor English, fall back to English.

@@ -1,0 +1,369 @@
+{
+  "shell": {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "在分配到的工作区内运行受限 shell 命令。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "必填：要运行的 shell 命令（无默认值）。可能提前返回 status=running/background=true，可用 get_tool_run 或 wait_run 跟踪。"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "可选的工作区相对工作目录，默认 '.'."
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "compress_context": {
+    "type": "function",
+    "function": {
+      "name": "compress_context",
+      "description": "当上下文较多且任务进入新阶段、适合对之前上下文减负时使用。压缩会抹除具体轨迹细节，因此应尽量在可分割节点调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  "wait_time": {
+    "type": "function",
+    "function": {
+      "name": "wait_time",
+      "description": "等待一段受限时长。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {
+            "type": "number",
+            "minimum": 10,
+            "maximum": 60,
+            "description": "必填等待秒数，必须 >= 10 且 <= 60。"
+          }
+        },
+        "required": [
+          "seconds"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_agent_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_agent_runs",
+      "description": "列出当前会话中的 agent 运行记录，按 created_at 从近到远排序。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "description": "可选状态过滤。支持单个字符串或字符串数组；值会做标准化后按原值匹配。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "每页返回的最大 agent run 数。默认取 runtime.tools.list_default_limit，并受 runtime.tools.list_max_limit 限制。"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "可选分页游标（不透明字符串），来自上一页 list_agent_runs 结果。默认 null（即第一页不传）。"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "get_agent_run": {
+    "type": "function",
+    "function": {
+      "name": "get_agent_run",
+      "description": "通过 agent_id 查询一个 agent run，并可选返回消息切片。messages 通常较长，尽量少量查看避免浪费。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "必填：目标 agent run 的稳定 ID（前缀：agent-）。"
+          },
+          "messages_start": {
+            "type": "integer",
+            "description": "可选：消息切片起始下标（包含）。支持负数倒序下标（例如 -1 表示最后一条消息）。若不传切片参数，默认仅返回最后 1 条消息。"
+          },
+          "messages_end": {
+            "type": "integer",
+            "description": "可选：消息切片结束下标（不包含，区间 [start,end)）。支持负数倒序下标。单次最多返回 5 条，避免 messages 过长造成大量查看浪费。"
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "spawn_agent": {
+    "type": "function",
+    "function": {
+      "name": "spawn_agent",
+      "description": "创建一个带有具体指令的subagent。返回 child_agent_id（agent-*）和 tool_run_id（toolrun-*）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "可选subagent 标签，默认 'Worker Agent'。"
+          },
+          "instruction": {
+            "type": "string",
+            "description": "必填：分配给subagent 的具体任务（无默认值）。"
+          }
+        },
+        "required": [
+          "instruction"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "cancel_agent": {
+    "type": "function",
+    "function": {
+      "name": "cancel_agent",
+      "description": "按 id 取消一个后代subagent，默认递归取消其子树。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "必填：要取消的后代 agent 稳定 ID（前缀：agent-）。"
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "可选：为 true（默认）时递归取消整个后代子树。"
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "steer_agent": {
+    "type": "function",
+    "function": {
+      "name": "steer_agent",
+      "description": "向当前会话中的另一个 agent 发送一条消息。若 runtime 允许，目标可能被重新激活。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "description": "必填：接收消息的目标 agent id（前缀：agent-）。"
+          },
+          "content": {
+            "type": "string",
+            "description": "必填：发给目标 agent 的消息内容。"
+          }
+        },
+        "required": [
+          "agent_id",
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_tool_runs": {
+    "type": "function",
+    "function": {
+      "name": "list_tool_runs",
+      "description": "列出当前会话中的工具运行记录，按 created_at 从近到远排序。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "oneOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "running",
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ]
+                }
+              }
+            ],
+            "description": "可选状态过滤（默认不过滤）：queued/running/completed/failed/cancelled。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "每页返回记录上限。默认取 runtime.tools.list_default_limit，并受 runtime.tools.list_max_limit 限制。"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "可选分页游标（不透明字符串），来自上一页 list_tool_runs 结果。默认 null（即第一页不传）。"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "get_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "get_tool_run",
+      "description": "通过 tool_run_id 查询一个工具运行记录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "必填：目标工具运行的稳定 ID（前缀：toolrun-）。"
+          },
+          "include_result": {
+            "type": "boolean",
+            "description": "为 true 时在 tool_run 中包含完整 result，默认 false。"
+          }
+        },
+        "required": [
+          "tool_run_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "wait_run": {
+    "type": "function",
+    "function": {
+      "name": "wait_run",
+      "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "目标 tool run 的稳定 ID（前缀：toolrun-）。"
+          },
+          "agent_id": {
+            "type": "string",
+            "description": "目标 agent 的稳定 ID（前缀：agent-）。"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "tool_run_id"
+            ],
+            "not": {
+              "required": [
+                "agent_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "agent_id"
+            ],
+            "not": {
+              "required": [
+                "tool_run_id"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "cancel_tool_run": {
+    "type": "function",
+    "function": {
+      "name": "cancel_tool_run",
+      "description": "通过 tool_run_id 取消一个运行中或排队中的工具任务。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool_run_id": {
+            "type": "string",
+            "description": "必填：目标工具运行的稳定 ID（前缀：toolrun-）。"
+          }
+        },
+        "required": [
+          "tool_run_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "finish": {
+    "type": "function",
+    "function": {
+      "name": "finish",
+      "description": "结束当前 agent 循环并提交精简总结。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "partial",
+              "interrupted",
+              "failed"
+            ],
+            "description": "必填：当前 agent 的完成状态（无默认值）。"
+          },
+          "summary": {
+            "type": "string",
+            "description": "必填：对已完成工作、剩余缺口和关键结果的简明总结（无默认值）。"
+          },
+          "next_recommendation": {
+            "type": "string",
+            "description": "仅 worker 使用的建议字段。worker 在 status 为 'partial' 或 'failed' 时必须提供；root 会忽略该字段。"
+          }
+        },
+        "required": [
+          "status",
+          "summary"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

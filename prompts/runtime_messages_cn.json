@@ -1,0 +1,16 @@
+{
+  "root_initial": "用户任务：{task}\n你是本次会话的 root agent。重点做规划、拆解和基于反馈的调整，把执行工作委派给 subagent。必要时可并行发起多个相互独立的工具调用。用 tool_run_id 跟踪工具运行，用 child_agent_id 跟踪新建subagent，仅在面向用户的答案准备好后调用 finish。",
+  "worker_initial": "分配给你的指令：{instruction}\n工作区：{workspace_path}\n权限边界：这个工作区是你唯一可写区域。先分析指令，再使用工具完成任务。用 tool_run_id 跟踪工具运行，用 child_agent_id 跟踪subagent，并且仅在总结准备好后调用 finish。",
+  "invalid_response": "你上一条回复不符合协议。请仅使用提供的工具调用接口，并传入合法工具名与 JSON 参数。",
+  "step_limit_worker": "{reason} 你已达到 worker 软步骤阈值（{max_steps} 步）。请优先收尾并避免继续扩展范围。必要时可再进行少量轮次，然后只调用一次 finish，并准确说明已完成、未完成或不明确项、错误或阻塞，以及最佳下一步建议。",
+  "unfinished_children_root": "仍有未完成的subagent。请先通过 list_agent_runs（必要时配合 wait_time/wait_run）确认子任务状态，或先取消它们，再调用 finish。",
+  "unfinished_children_worker": "仍有未完成的subagent。请先通过 list_agent_runs（必要时配合 wait_time/wait_run）确认子任务状态，或先取消它们，再调用 finish。",
+  "tool_result_fallback": "动作 {action_json} 的工具结果\n{result_json}",
+  "steer_message_intro": "*你收到一条消息：*",
+  "steer_completed_agent_finish_reminder": "完成本次指令后，请再次调用 finish 工具结束该 agent。",
+  "root_loop_force_finalize": "root agent 已达到软步骤阈值，请尽快收尾。避免再创建新的大分支，可在少量后续轮次后 finish。",
+  "worker_step_limit_reason": "worker 步骤上限已触发。",
+  "context_compression_system_prompt": "你负责维护 agent 的替换式上下文总结。请将 previous_summary 与 unsummarized_messages 合并为一条“简练但足够完整、可无缝续接”的最新总结。必须整合并覆盖：当前目标/范围与明确约束；仍然有效的关键决策及其理由；当前执行计划与近期里程碑；后续仍关键的文件/产物信息（路径+用途+当前状态）；已完成的具体工作/结果；最近刚完成的动作；未解决问题/风险/阻塞/假设；以及明确继续点（应先从哪里恢复、下一步立即可执行动作）。删除过期或重复细节，去掉 internal 控制痕迹与工具调用 JSON。最后必须以 Markdown 输出（禁止 JSON），使用简短分节标题与要点列表。",
+  "context_latest_summary": "你正在继续进行中的任务。由于之前的轨迹过长，已将先前轨迹压缩如下（v{summary_version}）：\n{summary}",
+  "context_pressure_reminder": "上下文使用告警：当前 prompt tokens={current_context_tokens}，上限={context_limit_tokens}，使用率={usage_ratio}。当前上下文已较长。compress_context 会把长历史压缩为总结，可能丢失细粒度行动细节。请尽快规划并推进到一个可分割节点，然后及时调用 compress_context。若发生超窗，运行时会强制压缩并自动重试。"
+}

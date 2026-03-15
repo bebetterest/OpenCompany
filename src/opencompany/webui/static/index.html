@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenCompany Web UI</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="top-header panel">
+        <div class="brand-wrap">
+          <h1 id="app-title">OpenCompany</h1>
+          <div id="app-subtitle" class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 48 20" role="img" aria-label="OpenCompany mark">
+              <rect x="1" y="1" width="18" height="18" rx="4" />
+              <rect x="24" y="5" width="8" height="14" rx="2" />
+              <rect x="35" y="2" width="12" height="17" rx="2" />
+            </svg>
+          </div>
+        </div>
+        <div class="header-controls">
+          <button id="locale-en-button" type="button">English</button>
+          <button id="locale-zh-button" type="button">Chinese</button>
+        </div>
+      </header>
+
+      <section class="controls panel">
+        <div class="control-row">
+          <textarea id="task-input" rows="1" placeholder="Task Input"></textarea>
+          <button id="run-button" type="button">Create</button>
+          <button id="terminal-button" type="button">Terminal</button>
+          <button id="setup-button" type="button">Setup</button>
+          <button id="interrupt-button" type="button">Interrupt</button>
+        </div>
+        <div class="control-row model-row">
+          <label id="model-label" for="model-input">Model</label>
+          <input id="model-input" type="text" placeholder="Model" />
+        </div>
+        <div class="control-row model-row">
+          <label id="root-agent-name-label" for="root-agent-name-input">Root Agent Name</label>
+          <input id="root-agent-name-input" type="text" placeholder="Optional root agent name" />
+        </div>
+        <div id="control-summary" class="control-summary"></div>
+      </section>
+
+      <section class="tabs panel">
+        <div class="tab-bar">
+          <button class="tab-button active" data-tab="overview" type="button">Overview</button>
+          <button class="tab-button" data-tab="workflow" type="button">Workflow</button>
+          <button class="tab-button" data-tab="agents" type="button">Agents</button>
+          <button class="tab-button" data-tab="tool-runs" type="button">Tool Runs</button>
+          <button class="tab-button" data-tab="steer-runs" type="button">Steer Runs</button>
+          <button class="tab-button" data-tab="diff" type="button">Diff</button>
+          <button class="tab-button" data-tab="config" type="button">Config</button>
+        </div>
+
+        <div id="tab-overview" class="tab-content active">
+          <div class="overview-layout">
+            <article class="metric-card overview-config-card">
+              <h2 id="overview-launch-title">Launch</h2>
+              <div id="overview-launch"></div>
+            </article>
+            <article class="metric-card overview-insight-card">
+              <h2 id="overview-feed-title">Session Insight</h2>
+              <div id="overview-feed" class="scroll-area"></div>
+            </article>
+          </div>
+        </div>
+
+        <div id="tab-workflow" class="tab-content">
+          <div class="split two-columns">
+            <div id="workflow-panel" class="panel-body workflow-panel-body">
+              <div class="panel-head">
+                <h2 id="workflow-title">Workflow Graph</h2>
+                <div class="workflow-toolbar">
+                  <button id="workflow-zoom-out-button" type="button">-</button>
+                  <button id="workflow-zoom-reset-button" type="button">100%</button>
+                  <button id="workflow-zoom-in-button" type="button">+</button>
+                  <button id="workflow-origin-button" type="button">Origin</button>
+                  <button id="workflow-expand-button" type="button">Expand</button>
+                </div>
+              </div>
+              <div id="workflow-graph" class="scroll-area graph-area"></div>
+            </div>
+            <div class="panel-body">
+              <h2 id="activity-title">Activity</h2>
+              <div id="activity-log" class="scroll-area mono"></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-agents" class="tab-content">
+          <div class="panel-body">
+            <h2 id="agents-title">Agents</h2>
+            <div class="agents-toolbar">
+              <label id="agents-role-filter-label" for="agents-role-filter">Role</label>
+              <select id="agents-role-filter">
+                <option value="all">All</option>
+                <option value="root">Root</option>
+                <option value="worker">Worker</option>
+              </select>
+              <input id="agents-search-input" type="text" placeholder="Search agent name or id" />
+            </div>
+            <div id="agents-live" class="scroll-area agent-grid"></div>
+          </div>
+        </div>
+
+        <div id="tab-tool-runs" class="tab-content">
+          <div class="panel-body tool-runs-body">
+            <div class="tool-runs-toolbar">
+              <button id="tool-runs-refresh-button" type="button">Refresh</button>
+              <button id="tool-runs-filter-button" type="button">Filter</button>
+              <button id="tool-runs-group-button" type="button">Group</button>
+              <span id="tool-runs-status"></span>
+            </div>
+            <div id="tool-runs-summary" class="tool-runs-summary"></div>
+            <div id="tool-runs-content" class="scroll-area mono"></div>
+          </div>
+        </div>
+
+        <div id="tab-steer-runs" class="tab-content">
+          <div class="panel-body steer-runs-body">
+            <div class="steer-runs-toolbar">
+              <button id="steer-runs-refresh-button" type="button">Refresh</button>
+              <button id="steer-runs-filter-button" type="button">Filter</button>
+              <button id="steer-runs-group-button" type="button">Group</button>
+              <input id="steer-runs-search-input" type="text" placeholder="Search steer runs" />
+              <span id="steer-runs-status"></span>
+            </div>
+            <div id="steer-runs-summary" class="steer-runs-summary"></div>
+            <div id="steer-runs-content" class="scroll-area mono"></div>
+          </div>
+        </div>
+
+        <div id="tab-diff" class="tab-content">
+          <div class="panel-body">
+            <div class="diff-toolbar">
+              <button id="apply-button" type="button">Apply</button>
+              <button id="undo-button" type="button">Undo</button>
+              <span id="diff-status"></span>
+            </div>
+            <div id="diff-content" class="scroll-area mono"></div>
+          </div>
+        </div>
+
+        <div id="tab-config" class="tab-content">
+          <div class="panel-body config-body">
+            <div class="config-toolbar">
+              <button id="config-save-button" type="button">Save</button>
+              <button id="config-reload-button" type="button">Reload</button>
+              <span id="config-sync-status"></span>
+            </div>
+            <div class="config-layout">
+              <aside id="config-meta" class="config-meta"></aside>
+              <textarea id="config-editor" spellcheck="false"></textarea>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="setup-overlay" class="setup-overlay hidden" aria-hidden="true">
+      <div class="setup-shell">
+        <h2 id="setup-title">Session Setup</h2>
+        <p id="setup-help">
+          Choose whether to start from a project directory or load an existing session context.
+        </p>
+
+        <div class="setup-mode-row">
+          <button id="setup-mode-project" type="button">New Session</button>
+          <button id="setup-mode-session" type="button">Load Session</button>
+        </div>
+
+        <div class="setup-field">
+          <label id="sandbox-backend-label" for="sandbox-backend-select">Sandbox Backend</label>
+          <select id="sandbox-backend-select">
+            <option value="anthropic">anthropic</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+        <div id="sandbox-backend-status" class="path-label"></div>
+
+        <section id="setup-project-section" class="setup-section">
+          <p id="setup-project-help"></p>
+          <div class="setup-mode-row">
+            <button id="workspace-mode-direct-button" type="button">Direct</button>
+            <button id="workspace-mode-staged-button" type="button">Staged</button>
+          </div>
+          <div id="workspace-mode-status" class="path-label"></div>
+          <div class="setup-mode-row">
+            <button id="workspace-source-local-button" type="button">Local Directory</button>
+            <button id="workspace-source-remote-button" type="button">Remote SSH</button>
+          </div>
+          <section id="setup-local-source-section">
+            <button id="project-picker-button" type="button">Choose Project Directory</button>
+            <div id="project-current-path" class="path-label"></div>
+          </section>
+          <section id="setup-remote-source-section" class="hidden">
+            <div class="setup-field">
+              <label id="remote-target-label" for="remote-target-input">SSH Target</label>
+              <input id="remote-target-input" type="text" placeholder="user@host:22" />
+            </div>
+            <div class="setup-field">
+              <label id="remote-dir-label" for="remote-dir-input">Remote Directory</label>
+              <input id="remote-dir-input" type="text" placeholder="/home/user/project" />
+            </div>
+            <div class="setup-field">
+              <label id="remote-auth-label" for="remote-auth-select">Authentication</label>
+              <select id="remote-auth-select">
+                <option value="key">Key</option>
+                <option value="password">Password</option>
+              </select>
+            </div>
+            <div id="remote-key-row" class="setup-field">
+              <label id="remote-key-label" for="remote-key-input">Identity File</label>
+              <input id="remote-key-input" type="text" placeholder="~/.ssh/id_ed25519" />
+            </div>
+            <div id="remote-password-row" class="setup-field hidden">
+              <label id="remote-password-label" for="remote-password-input">Remote Password</label>
+              <input id="remote-password-input" type="password" autocomplete="off" />
+            </div>
+            <div class="setup-field">
+              <label id="remote-known-hosts-label" for="remote-known-hosts-select">Host Key Policy</label>
+              <select id="remote-known-hosts-select">
+                <option value="accept_new">Accept New</option>
+                <option value="strict">Strict</option>
+              </select>
+            </div>
+            <div class="setup-inline">
+              <button id="remote-validate-button" type="button">Validate</button>
+            </div>
+            <div id="remote-validate-status" class="path-label"></div>
+          </section>
+        </section>
+
+        <section id="setup-session-section" class="setup-section hidden">
+          <p id="setup-session-help"></p>
+          <div id="session-workspace-mode" class="path-label"></div>
+          <div class="setup-inline">
+            <button id="session-picker-button" type="button">Choose Session Folder</button>
+            <button id="session-refresh-button" type="button">Refresh Sessions</button>
+          </div>
+          <div id="sessions-root-path" class="path-label"></div>
+          <div id="session-validate-status" class="path-label"></div>
+          <div id="session-directory-list" class="scroll-area setup-list"></div>
+        </section>
+
+        <div id="setup-error" class="setup-error"></div>
+
+        <div class="setup-actions">
+          <button id="setup-close-button" type="button">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="agent-focus-overlay" class="agent-focus-overlay hidden" aria-hidden="true">
+      <div class="agent-focus-shell">
+        <div class="agent-focus-head">
+          <h2 id="agent-focus-title">Agent Detail</h2>
+          <button id="agent-focus-close-button" type="button">Close</button>
+        </div>
+        <div id="agent-focus-body" class="agent-focus-body scroll-area"></div>
+      </div>
+    </div>
+
+    <div id="steer-compose-overlay" class="steer-compose-overlay hidden" aria-hidden="true">
+      <div class="steer-compose-shell">
+        <h2 id="steer-compose-title">Steer</h2>
+        <p id="steer-compose-prompt"></p>
+        <textarea id="steer-compose-input" rows="6" spellcheck="false"></textarea>
+        <div id="steer-compose-error" class="steer-compose-error"></div>
+        <div class="steer-compose-actions">
+          <button id="steer-compose-cancel-button" type="button">Cancel</button>
+          <button id="steer-compose-submit-button" type="button">Steer</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="tool-run-detail-overlay" class="tool-run-detail-overlay hidden" aria-hidden="true">
+      <div class="tool-run-detail-shell">
+        <div class="tool-run-detail-head">
+          <h2 id="tool-run-detail-title">Tool Run Detail</h2>
+          <button id="tool-run-detail-close-button" type="button">Close</button>
+        </div>
+        <div id="tool-run-detail-body" class="tool-run-detail-body scroll-area"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
