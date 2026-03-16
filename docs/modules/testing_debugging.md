@@ -45,7 +45,7 @@ uv run pytest tests/test_orchestrator_resume.py tests/test_message_cursor.py
 
 GitHub Actions runs tests through `.github/workflows/tests.yml`:
 
-- triggers: `push` (`main`/`master`), `pull_request`, `workflow_dispatch`
+- triggers: all `push` events, `pull_request`, `workflow_dispatch`
 - environment: Conda environment `OpenCompany` created from `environment.yml`
 - command: `pytest -q` (full suite)
 

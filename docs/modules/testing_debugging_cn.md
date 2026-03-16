@@ -45,7 +45,7 @@ uv run pytest tests/test_orchestrator_resume.py tests/test_message_cursor.py
 
 GitHub Actions 通过 `.github/workflows/tests.yml` 执行测试：
 
-- 触发条件：`push`（`main`/`master`）、`pull_request`、`workflow_dispatch`
+- 触发条件：所有 `push`、`pull_request`、`workflow_dispatch`
 - 环境：由 `environment.yml` 创建 Conda 环境 `OpenCompany`
 - 执行命令：`pytest -q`（全量测试）
 
