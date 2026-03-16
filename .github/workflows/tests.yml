@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: OpenCompany
+          environment-file: environment.yml
+          auto-activate-base: false
+          miniforge-version: latest
+
+      - name: Run full test suite
+        run: pytest -q

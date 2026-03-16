@@ -41,6 +41,14 @@ uv run pytest tests/test_orchestrator_tool_runs.py tests/test_tool_runtime.py
 uv run pytest tests/test_orchestrator_resume.py tests/test_message_cursor.py
 ```
 
+## CI 自动化
+
+GitHub Actions 通过 `.github/workflows/tests.yml` 执行测试：
+
+- 触发条件：`push`（`main`/`master`）、`pull_request`、`workflow_dispatch`
+- 环境：由 `environment.yml` 创建 Conda 环境 `OpenCompany`
+- 执行命令：`pytest -q`（全量测试）
+
 ## 运行时调试面
 
 - 会话事件流：`.opencompany/sessions/<session_id>/events.jsonl`

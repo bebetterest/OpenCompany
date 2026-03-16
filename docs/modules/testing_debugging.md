@@ -41,6 +41,14 @@ uv run pytest tests/test_orchestrator_tool_runs.py tests/test_tool_runtime.py
 uv run pytest tests/test_orchestrator_resume.py tests/test_message_cursor.py
 ```
 
+## CI Automation
+
+GitHub Actions runs tests through `.github/workflows/tests.yml`:
+
+- triggers: `push` (`main`/`master`), `pull_request`, `workflow_dispatch`
+- environment: Conda environment `OpenCompany` created from `environment.yml`
+- command: `pytest -q` (full suite)
+
 ## Runtime Debugging Surfaces
 
 - Per-session runtime events: `.opencompany/sessions/<session_id>/events.jsonl`
