@@ -134,6 +134,16 @@ const state = {
       remote_password: "",
     },
   },
+  directoryPicker: {
+    open: false,
+    busy: false,
+    mode: "project",
+    root: "",
+    path: "",
+    parent: null,
+    entries: [],
+    error: "",
+  },
   activityEntries: [],
   agents: new Map(),
   agentOrder: [],
@@ -312,6 +322,16 @@ const dom = {
   sessionRefreshButton: document.getElementById("session-refresh-button"),
   setupError: document.getElementById("setup-error"),
   setupCloseButton: document.getElementById("setup-close-button"),
+  directoryPickerOverlay: document.getElementById("directory-picker-overlay"),
+  directoryPickerTitle: document.getElementById("directory-picker-title"),
+  directoryPickerHelp: document.getElementById("directory-picker-help"),
+  directoryPickerPath: document.getElementById("directory-picker-path"),
+  directoryPickerParentButton: document.getElementById("directory-picker-parent-button"),
+  directoryPickerRefreshButton: document.getElementById("directory-picker-refresh-button"),
+  directoryPickerList: document.getElementById("directory-picker-list"),
+  directoryPickerError: document.getElementById("directory-picker-error"),
+  directoryPickerCloseButton: document.getElementById("directory-picker-close-button"),
+  directoryPickerConfirmButton: document.getElementById("directory-picker-confirm-button"),
   agentFocusOverlay: document.getElementById("agent-focus-overlay"),
   agentFocusTitle: document.getElementById("agent-focus-title"),
   agentFocusBody: document.getElementById("agent-focus-body"),
@@ -656,6 +676,198 @@ function isSetupRemoteSource() {
 
 function remotePayloadFromDraft() {
   return sanitizeRemoteConfig(state.setup.remoteDraft);
+}
+
+function isNativeDirectoryPickerUnavailable(errorMessage) {
+  return String(errorMessage || "")
+    .trim()
+    .toLowerCase()
+    .includes("native directory picker is unavailable in this environment");
+}
+
+function normalizePathText(path) {
+  const raw = String(path || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const normalized = raw.replace(/[\\/]+$/, "");
+  return normalized || raw;
+}
+
+function pathParent(path) {
+  const normalized = normalizePathText(path);
+  if (!normalized) {
+    return "";
+  }
+  const slashIndex = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  if (slashIndex <= 0) {
+    if (slashIndex === 0) {
+      return normalized.slice(0, 1);
+    }
+    return "";
+  }
+  return normalized.slice(0, slashIndex);
+}
+
+function pathBaseName(path) {
+  const normalized = normalizePathText(path);
+  if (!normalized) {
+    return "";
+  }
+  const slashIndex = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+  if (slashIndex < 0) {
+    return normalized;
+  }
+  return normalized.slice(slashIndex + 1);
+}
+
+function isSessionDirectorySelection(path, sessionsRoot) {
+  const normalizedPath = normalizePathText(path);
+  const normalizedRoot = normalizePathText(sessionsRoot);
+  if (!normalizedPath || !normalizedRoot) {
+    return false;
+  }
+  return normalizePathText(pathParent(normalizedPath)) === normalizedRoot;
+}
+
+function closeDirectoryPickerOverlay() {
+  state.directoryPicker.open = false;
+  state.directoryPicker.busy = false;
+  state.directoryPicker.mode = "project";
+  state.directoryPicker.root = "";
+  state.directoryPicker.path = "";
+  state.directoryPicker.parent = null;
+  state.directoryPicker.entries = [];
+  state.directoryPicker.error = "";
+}
+
+async function loadDirectoryPickerEntries(path = null) {
+  const requested = String(path || "").trim();
+  const query = requested ? `?path=${encodeURIComponent(requested)}` : "";
+  state.directoryPicker.busy = true;
+  state.directoryPicker.error = "";
+  scheduleRender();
+  try {
+    const payload = await fetchJson(`/api/directories${query}`);
+    state.directoryPicker.root = String((payload && payload.root) || "").trim();
+    state.directoryPicker.path = String((payload && payload.path) || "").trim();
+    const parent = String((payload && payload.parent) || "").trim();
+    state.directoryPicker.parent = parent || null;
+    const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
+    state.directoryPicker.entries = entries
+      .map((entry) => ({
+        name: String((entry && entry.name) || "").trim(),
+        path: String((entry && entry.path) || "").trim(),
+      }))
+      .filter((entry) => entry.path);
+  } catch (error) {
+    state.directoryPicker.error = String(error.message || "");
+    throw error;
+  } finally {
+    state.directoryPicker.busy = false;
+    scheduleRender();
+  }
+}
+
+async function openDirectoryPickerOverlay({ mode = "project", initialPath = null } = {}) {
+  state.directoryPicker.open = true;
+  state.directoryPicker.error = "";
+  state.directoryPicker.entries = [];
+  state.directoryPicker.mode = mode === "session" ? "session" : "project";
+  scheduleRender();
+
+  const preferred = String(initialPath || "").trim();
+  if (preferred) {
+    try {
+      await loadDirectoryPickerEntries(preferred);
+      return;
+    } catch (_error) {
+      // Fall back to default root listing if current project path is outside allowed picker root.
+    }
+  }
+  await loadDirectoryPickerEntries(null);
+}
+
+async function applyDirectoryPickerSelection() {
+  const mode = state.directoryPicker.mode === "session" ? "session" : "project";
+  const selectedPath = String(state.directoryPicker.path || "").trim();
+  if (!selectedPath) {
+    state.directoryPicker.error = mode === "session" ? t("error_session_required") : t("error_project_invalid");
+    scheduleRender();
+    return;
+  }
+  state.directoryPicker.busy = true;
+  state.directoryPicker.error = "";
+  state.setup.error = "";
+  if (mode === "session") {
+    state.setup.remoteValidateBusy = true;
+    state.setup.remoteValidateOk = null;
+    state.setup.remoteValidateStatus = t("remote_validate_busy");
+  }
+  scheduleRender();
+  try {
+    if (mode === "session") {
+      if (!isSessionDirectorySelection(selectedPath, state.sessionsDir || "")) {
+        throw new Error(t("error_session_folder_invalid"));
+      }
+      const sessionId = pathBaseName(selectedPath);
+      if (!sessionId) {
+        throw new Error(t("error_session_required"));
+      }
+      const payload = await persistLaunchConfig({
+        projectDir: null,
+        sessionId,
+        sessionMode: undefined,
+        sandboxBackend: setupDraftSandboxBackend(),
+        remote: null,
+        remotePassword: null,
+      });
+      const loadedSessionId =
+        (payload &&
+          payload.launch_config &&
+          typeof payload.launch_config.session_id === "string" &&
+          payload.launch_config.session_id) ||
+        sessionId;
+      await loadSessionEvents(loadedSessionId);
+      syncRemoteDraftFromLaunch();
+      state.setup.open = false;
+      state.setup.error = "";
+      state.setup.remoteValidateOk = null;
+      state.setup.remoteValidateStatus = "";
+      closeDirectoryPickerOverlay();
+      await refreshSessions();
+    } else {
+      await persistLaunchConfig({
+        projectDir: selectedPath,
+        sessionId: null,
+        sessionMode: activeWorkspaceMode(),
+        sandboxBackend: setupDraftSandboxBackend(),
+        remote: null,
+        remotePassword: null,
+      });
+      resetRuntimeViews();
+      state.setup.workspaceSource = "local";
+      state.setup.remoteValidateOk = null;
+      state.setup.remoteValidateStatus = "";
+      state.setup.open = false;
+      closeDirectoryPickerOverlay();
+      await refreshSessions();
+    }
+  } catch (error) {
+    const reason = String(error.message || "");
+    state.directoryPicker.error = reason;
+    if (mode === "session") {
+      state.setup.remoteValidateOk = false;
+      state.setup.remoteValidateStatus = formatRemoteValidateFailed(reason);
+      state.setup.error = reason;
+    }
+  } finally {
+    state.directoryPicker.busy = false;
+    if (mode === "session") {
+      state.setup.remoteValidateBusy = false;
+    }
+    scheduleRender();
+  }
 }
 
 function ensureAgent(record, details) {
@@ -2565,6 +2777,7 @@ function render() {
   renderSteerComposeOverlay();
   renderToolRunDetailOverlay();
   renderSetupOverlay();
+  renderDirectoryPickerOverlay();
   renderDiffPanel();
   renderConfigPanel();
 }
@@ -5274,6 +5487,62 @@ function renderSetupOverlay() {
     .join("");
 }
 
+function renderDirectoryPickerOverlay() {
+  const open = Boolean(state.directoryPicker.open);
+  dom.directoryPickerOverlay.classList.toggle("hidden", !open);
+  dom.directoryPickerOverlay.setAttribute("aria-hidden", open ? "false" : "true");
+  if (!open) {
+    return;
+  }
+
+  const busy = Boolean(state.directoryPicker.busy);
+  const sessionMode = state.directoryPicker.mode === "session";
+  dom.directoryPickerTitle.textContent = t(sessionMode ? "session_picker_title" : "path_picker_title");
+  dom.directoryPickerHelp.textContent = t(
+    sessionMode ? "fallback_session_picker_help" : "fallback_directory_picker_help"
+  );
+  const currentPath =
+    state.directoryPicker.path || state.directoryPicker.root || t("unset_value");
+  dom.directoryPickerPath.textContent = `${t("current_path")}: ${currentPath}`;
+  dom.directoryPickerParentButton.textContent = t("fallback_directory_picker_parent");
+  dom.directoryPickerParentButton.disabled = busy || !state.directoryPicker.parent;
+  dom.directoryPickerRefreshButton.textContent = t("reload");
+  dom.directoryPickerRefreshButton.disabled = busy;
+  dom.directoryPickerCloseButton.textContent = t("cancel");
+  dom.directoryPickerCloseButton.disabled = busy;
+  dom.directoryPickerConfirmButton.textContent = t(sessionMode ? "select_session_dir" : "select_path");
+  const canConfirm = sessionMode
+    ? isSessionDirectorySelection(state.directoryPicker.path, state.sessionsDir || "")
+    : Boolean(state.directoryPicker.path);
+  dom.directoryPickerConfirmButton.disabled = busy || !canConfirm;
+  dom.directoryPickerError.textContent = state.directoryPicker.error || "";
+
+  const entries = Array.isArray(state.directoryPicker.entries) ? state.directoryPicker.entries : [];
+  if (entries.length === 0) {
+    const message = busy ? t("load_context_loading") : t("fallback_directory_picker_empty");
+    dom.directoryPickerList.innerHTML = `<div class="directory-picker-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+  const disabled = busy ? "disabled" : "";
+  dom.directoryPickerList.innerHTML = entries
+    .map((entry) => {
+      const name = String(entry.name || "").trim() || String(entry.path || "").trim() || "-";
+      const path = String(entry.path || "").trim();
+      if (!path) {
+        return "";
+      }
+      return `
+        <button type="button" class="directory-picker-entry" data-action="open-directory" data-path="${escapeHtml(
+          path
+        )}" ${disabled}>
+          <div class="entry-name">${escapeHtml(name)}</div>
+          <div class="entry-sub">${escapeHtml(path)}</div>
+        </button>
+      `;
+    })
+    .join("");
+}
+
 function buildRootAgents() {
   const visible = state.agentOrder
     .map((id) => state.agents.get(id))
@@ -6022,7 +6291,19 @@ async function chooseProjectDirectory() {
     state.setup.error = "";
     succeeded = true;
   } catch (error) {
-    state.setup.error = String(error.message || "");
+    const reason = String(error.message || "");
+    if (isNativeDirectoryPickerUnavailable(reason)) {
+      try {
+        await openDirectoryPickerOverlay({
+          mode: "project",
+          initialPath: state.launchConfig.project_dir || null,
+        });
+      } catch (fallbackError) {
+        state.setup.error = String(fallbackError.message || reason || "");
+      }
+    } else {
+      state.setup.error = reason;
+    }
   } finally {
     state.setup.busy = false;
     if (succeeded) {
@@ -6056,9 +6337,26 @@ async function chooseSessionDirectory() {
     state.setup.remoteValidateStatus = "";
     succeeded = true;
   } catch (error) {
-    state.setup.remoteValidateOk = false;
-    state.setup.remoteValidateStatus = formatRemoteValidateFailed(error.message || "");
-    state.setup.error = String(error.message || "");
+    const reason = String(error.message || "");
+    if (isNativeDirectoryPickerUnavailable(reason)) {
+      state.setup.remoteValidateOk = null;
+      state.setup.remoteValidateStatus = "";
+      try {
+        await openDirectoryPickerOverlay({
+          mode: "session",
+          initialPath: state.sessionsDir || null,
+        });
+      } catch (fallbackError) {
+        const fallbackReason = String(fallbackError.message || reason || "");
+        state.setup.remoteValidateOk = false;
+        state.setup.remoteValidateStatus = formatRemoteValidateFailed(fallbackReason);
+        state.setup.error = fallbackReason;
+      }
+    } else {
+      state.setup.remoteValidateOk = false;
+      state.setup.remoteValidateStatus = formatRemoteValidateFailed(reason);
+      state.setup.error = reason;
+    }
   } finally {
     state.setup.busy = false;
     state.setup.remoteValidateBusy = false;
@@ -6358,6 +6656,7 @@ function bindEvents() {
 
   dom.setupButton.addEventListener("click", () => {
     resetSetupSandboxBackendDraft();
+    closeDirectoryPickerOverlay();
     state.setup.open = true;
     state.setup.error = "";
     state.setup.remoteValidateBusy = false;
@@ -6400,6 +6699,60 @@ function bindEvents() {
 
   dom.projectPickerButton.addEventListener("click", () => {
     void chooseProjectDirectory();
+  });
+
+  dom.directoryPickerParentButton.addEventListener("click", () => {
+    if (state.directoryPicker.busy || !state.directoryPicker.parent) {
+      return;
+    }
+    void loadDirectoryPickerEntries(state.directoryPicker.parent);
+  });
+
+  dom.directoryPickerRefreshButton.addEventListener("click", () => {
+    if (state.directoryPicker.busy) {
+      return;
+    }
+    const current = String(state.directoryPicker.path || "").trim() || null;
+    void loadDirectoryPickerEntries(current);
+  });
+
+  dom.directoryPickerList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='open-directory'][data-path]");
+    if (!button || state.directoryPicker.busy) {
+      return;
+    }
+    const nextPath = String(button.getAttribute("data-path") || "").trim();
+    if (!nextPath) {
+      return;
+    }
+    void loadDirectoryPickerEntries(nextPath);
+  });
+
+  dom.directoryPickerConfirmButton.addEventListener("click", () => {
+    if (state.directoryPicker.busy) {
+      return;
+    }
+    void applyDirectoryPickerSelection();
+  });
+
+  dom.directoryPickerCloseButton.addEventListener("click", () => {
+    if (state.directoryPicker.busy) {
+      return;
+    }
+    closeDirectoryPickerOverlay();
+    scheduleRender();
+  });
+
+  dom.directoryPickerOverlay.addEventListener("click", (event) => {
+    if (event.target !== dom.directoryPickerOverlay || state.directoryPicker.busy) {
+      return;
+    }
+    closeDirectoryPickerOverlay();
+    scheduleRender();
   });
 
   dom.workspaceSourceLocalButton.addEventListener("click", () => {
@@ -6748,6 +7101,13 @@ function bindEvents() {
       closeSteerComposeOverlay({ cancelled: true });
       return;
     }
+    if (state.directoryPicker.open) {
+      if (!state.directoryPicker.busy) {
+        closeDirectoryPickerOverlay();
+        scheduleRender();
+      }
+      return;
+    }
     if (state.workflow.expanded) {
       if (state.workflow.nativeFullscreen || isWorkflowNativeFullscreen()) {
         void exitNativeFullscreen();
@@ -6764,6 +7124,7 @@ function bindEvents() {
   });
 
   dom.setupCloseButton.addEventListener("click", () => {
+    closeDirectoryPickerOverlay();
     state.setup.open = false;
     state.setup.error = "";
     scheduleRender();
