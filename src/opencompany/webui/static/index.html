@@ -254,6 +254,24 @@
       </div>
     </div>
 
+    <div id="directory-picker-overlay" class="directory-picker-overlay hidden" aria-hidden="true">
+      <div class="directory-picker-shell">
+        <h2 id="directory-picker-title">Select a Project Directory</h2>
+        <p id="directory-picker-help"></p>
+        <div id="directory-picker-path" class="path-label"></div>
+        <div class="setup-inline">
+          <button id="directory-picker-parent-button" type="button">Up One Level</button>
+          <button id="directory-picker-refresh-button" type="button">Refresh</button>
+        </div>
+        <div id="directory-picker-list" class="scroll-area setup-list"></div>
+        <div id="directory-picker-error" class="setup-error"></div>
+        <div class="setup-actions">
+          <button id="directory-picker-close-button" type="button">Cancel</button>
+          <button id="directory-picker-confirm-button" type="button">Use This Directory</button>
+        </div>
+      </div>
+    </div>
+
     <div id="agent-focus-overlay" class="agent-focus-overlay hidden" aria-hidden="true">
       <div class="agent-focus-shell">
         <div class="agent-focus-head">

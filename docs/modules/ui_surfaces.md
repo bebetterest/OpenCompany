@@ -43,7 +43,7 @@ Execution semantics:
 
 Web UI-specific capabilities:
 
-- native project/session directory pickers
+- native project/session directory pickers; when a native picker is unavailable (for example in forwarded web-only environments), Web UI falls back to an in-app directory-browser modal backed by `/api/directories` for both project and session selection
 - setup supports choosing local directory vs remote SSH workspace in `direct` mode; for remote SSH, clicking `Validate & Create` runs remote validation and immediately saves launch config on success (no separate "Use Remote Directory" step)
 - control-bar `Terminal` button that directly launches a system terminal window rooted at the active session workspace (persistent interactive shell)
   - launch command is fail-closed (`exec`): no fallback host-shell after backend terminal command startup

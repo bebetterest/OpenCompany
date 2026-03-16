@@ -265,6 +265,17 @@ TRANSLATIONS = {
         "remote_validate_busy": "Validating and preparing remote dependencies...",
         "remote_validate_failed": "Remote validation failed",
         "choose_project_dir": "Choose Project Directory",
+        "fallback_directory_picker_help": (
+            "Native directory picker is unavailable in this environment. "
+            "Browse folders below and choose one as the project directory."
+        ),
+        "fallback_session_picker_help": (
+            "Native directory picker is unavailable in this environment. "
+            "Choose a session folder under the sessions root."
+        ),
+        "fallback_directory_picker_parent": "Up One Level",
+        "fallback_directory_picker_empty": "No subdirectories found in the current folder.",
+        "current_path": "Current Path",
         "choose_session_dir": "Choose Session Folder",
         "path_picker_title": "Select a Project Directory",
         "session_picker_title": "Select a Session Folder",
@@ -620,6 +631,11 @@ TRANSLATIONS = {
         "remote_validate_busy": "正在校验并准备远程依赖...",
         "remote_validate_failed": "远程校验失败",
         "choose_project_dir": "选择项目目录",
+        "fallback_directory_picker_help": "当前环境不支持系统目录选择器，请在下方浏览目录并选择项目目录。",
+        "fallback_session_picker_help": "当前环境不支持系统目录选择器，请在会话根目录下选择一个会话目录。",
+        "fallback_directory_picker_parent": "返回上级目录",
+        "fallback_directory_picker_empty": "当前目录下没有子目录。",
+        "current_path": "当前路径",
         "choose_session_dir": "选择会话目录",
         "path_picker_title": "选择项目目录",
         "session_picker_title": "选择会话目录",
