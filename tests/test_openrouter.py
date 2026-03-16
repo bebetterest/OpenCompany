@@ -511,6 +511,161 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "ok")
         self.assertEqual(_FailThenRecoverClient.attempts, 2)
 
+    async def test_stream_chat_retries_http_400_before_first_event(self) -> None:
+        import httpx
+
+        class _FailThenRecoverStream:
+            def __init__(self, *, fail_with_400: bool) -> None:
+                self.fail_with_400 = fail_with_400
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+
+            def raise_for_status(self) -> None:
+                if not self.fail_with_400:
+                    return None
+                request = httpx.Request(
+                    "POST",
+                    "https://openrouter.ai/api/v1/chat/completions",
+                )
+                response = httpx.Response(400, request=request)
+                raise httpx.HTTPStatusError(
+                    "Client error '400 Bad Request' for url 'https://openrouter.ai/api/v1/chat/completions'",
+                    request=request,
+                    response=response,
+                )
+
+            async def aiter_text(self):
+                yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+
+        class _FailThenRecoverClient:
+            attempts = 0
+
+            def __init__(self, *, timeout: int) -> None:
+                del timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ):
+                del method, url, headers, json
+                type(self).attempts += 1
+                return _FailThenRecoverStream(fail_with_400=type(self).attempts == 1)
+
+        client = OpenRouterClient(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            timeout_seconds=30,
+            max_retries=2,
+            retry_backoff_seconds=0.0,
+        )
+        with mock.patch("httpx.AsyncClient", _FailThenRecoverClient):
+            result = await client.stream_chat(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                temperature=0.1,
+                max_tokens=64,
+            )
+
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(_FailThenRecoverClient.attempts, 2)
+
+    async def test_stream_chat_reports_retry_status_via_callback(self) -> None:
+        import httpx
+
+        class _UnauthorizedThenRecoverStream:
+            def __init__(self, *, fail_with_401: bool) -> None:
+                self.fail_with_401 = fail_with_401
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+
+            def raise_for_status(self) -> None:
+                if not self.fail_with_401:
+                    return None
+                request = httpx.Request(
+                    "POST",
+                    "https://openrouter.ai/api/v1/chat/completions",
+                )
+                response = httpx.Response(401, request=request)
+                raise httpx.HTTPStatusError(
+                    "Client error '401 Unauthorized' for url 'https://openrouter.ai/api/v1/chat/completions'",
+                    request=request,
+                    response=response,
+                )
+
+            async def aiter_text(self):
+                yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+
+        class _UnauthorizedThenRecoverClient:
+            attempts = 0
+
+            def __init__(self, *, timeout: int) -> None:
+                del timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                del exc_type, exc, tb
+
+            def stream(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, object],
+            ):
+                del method, url, headers, json
+                type(self).attempts += 1
+                return _UnauthorizedThenRecoverStream(fail_with_401=type(self).attempts == 1)
+
+        retries: list[dict[str, object]] = []
+
+        async def _on_retry(payload: dict[str, object]) -> None:
+            retries.append(payload)
+
+        client = OpenRouterClient(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            timeout_seconds=30,
+            max_retries=2,
+            retry_backoff_seconds=0.0,
+        )
+        with mock.patch("httpx.AsyncClient", _UnauthorizedThenRecoverClient):
+            result = await client.stream_chat(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                temperature=0.1,
+                max_tokens=64,
+                on_retry=_on_retry,
+            )
+
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0].get("status_code"), 401)
+        self.assertEqual(retries[0].get("status_text"), "Unauthorized")
+        self.assertEqual(retries[0].get("retry_reason"), "http_status_error")
+
     def test_retry_delay_seconds_prefers_server_retry_hint(self) -> None:
         import httpx
 

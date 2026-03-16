@@ -2683,6 +2683,57 @@ backend = "anthropic"
             state.stream_entries,
         )
 
+    def test_llm_retry_event_is_rendered_with_http_status(self) -> None:
+        try:
+            from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        state = AgentRuntimeView(id="agent-1", name="Worker")
+        app._update_stream_for_event(
+            state,
+            {
+                "event_type": "llm_retry",
+                "payload": {
+                    "step_count": 1,
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "status_code": 400,
+                    "status_text": "Bad Request",
+                    "retry_delay_seconds": 1.5,
+                    "retry_reason": "http_status_error",
+                },
+            },
+        )
+
+        self.assertEqual(len(state.stream_entries), 1)
+        self.assertEqual(state.stream_entries[0][0], "error_extra")
+        self.assertIn("status=400 Bad Request", state.stream_entries[0][1])
+        self.assertIn("attempt=1/3", state.stream_entries[0][1])
+
+    def test_format_event_includes_llm_request_error_http_status(self) -> None:
+        try:
+            from opencompany.tui.app import OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        record = {
+            "event_type": "llm_request_error",
+            "timestamp": "2026-03-10T10:00:00Z",
+            "payload": {
+                "agent_name": "Worker",
+                "status_code": 400,
+                "status_text": "Bad Request",
+                "error": "Client error '400 Bad Request' for url 'https://openrouter.ai/api/v1/chat/completions'",
+            },
+        }
+
+        rendered = app._format_event(record)
+        self.assertIn("llm request error", rendered)
+        self.assertIn("400 Bad Request", rendered)
+
     def test_step_entries_keep_full_history_without_hard_cap(self) -> None:
         try:
             from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp

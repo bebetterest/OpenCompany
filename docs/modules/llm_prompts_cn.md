@@ -25,8 +25,13 @@ SSE 解析会合并：
 
 重试覆盖：
 
-- 首个流式事件到达前的传输/API 失败（`max_retries` + 指数退避与抖动；覆盖 `429` 限流、`520` 等瞬时 5xx，并在服务端提供 `Retry-After`/`RateLimit-Reset` 时按提示等待）
+- 首个流式事件到达前的传输/API 失败（`max_retries` + 指数退避与抖动；覆盖全部 HTTP 错误状态码 `4xx/5xx` 以及可重试传输错误，并在服务端提供 `Retry-After`/`RateLimit-Reset` 时按提示等待）
 - 受保护条件下的空流响应
+
+可观测性事件日志：
+
+- `llm_retry`：OpenRouter 触发重试时记录，包含 `status_code`、`status_text`、重试次数、等待时长与重试原因
+- `llm_request_error`：OpenRouter 请求失败并上抛时记录；可用时包含 HTTP 状态元数据
 
 ## 协议归一化
 

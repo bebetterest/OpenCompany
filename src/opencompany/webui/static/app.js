@@ -2028,6 +2028,58 @@ function controlMessageText(payload) {
   return "";
 }
 
+function httpStatusLabel(payload) {
+  const statusCodeRaw = payload.status_code;
+  const statusText = String(payload.status_text || "").trim();
+  const statusCode =
+    typeof statusCodeRaw === "number" && Number.isFinite(statusCodeRaw)
+      ? String(Math.trunc(statusCodeRaw))
+      : String(statusCodeRaw || "").trim();
+  if (statusCode && statusText) {
+    return `${statusCode} ${statusText}`;
+  }
+  if (statusCode) {
+    return statusCode;
+  }
+  if (statusText) {
+    return statusText;
+  }
+  return "-";
+}
+
+function llmRetryText(payload) {
+  const attemptRaw = payload.attempt;
+  const maxAttemptsRaw = payload.max_attempts;
+  const attempt =
+    typeof attemptRaw === "number" && Number.isFinite(attemptRaw) ? Math.trunc(attemptRaw) : null;
+  const maxAttempts =
+    typeof maxAttemptsRaw === "number" && Number.isFinite(maxAttemptsRaw)
+      ? Math.trunc(maxAttemptsRaw)
+      : null;
+  let attemptText = "-";
+  if (attempt !== null && maxAttempts !== null && maxAttempts > 0) {
+    attemptText = `${attempt}/${maxAttempts}`;
+  } else if (attempt !== null) {
+    attemptText = String(attempt);
+  }
+  const delayRaw = payload.retry_delay_seconds;
+  const delaySeconds =
+    typeof delayRaw === "number" && Number.isFinite(delayRaw) ? delayRaw : Number.NaN;
+  const delayText = Number.isFinite(delaySeconds) ? `${delaySeconds.toFixed(2)}s` : "-s";
+  return `llm retry attempt=${attemptText} status=${httpStatusLabel(payload)} delay=${delayText} reason=${String(
+    payload.retry_reason || "-"
+  )}`;
+}
+
+function llmRequestErrorText(payload) {
+  const status = httpStatusLabel(payload);
+  const errorText = String(payload.error || "").trim();
+  if (errorText) {
+    return `llm request error status=${status} error=${errorText}`;
+  }
+  return `llm request error status=${status}`;
+}
+
 function toolCallIdFromAction(action) {
   if (!action || typeof action !== "object") {
     return "";
@@ -2264,6 +2316,12 @@ function eventDetail(record, agent) {
   if (eventType === "session_failed") {
     return String(payload.error || "").slice(0, 120);
   }
+  if (eventType === "llm_retry") {
+    return llmRetryText(payload).slice(0, 120);
+  }
+  if (eventType === "llm_request_error") {
+    return llmRequestErrorText(payload).slice(0, 120);
+  }
   if (eventType === "control_message") {
     return controlMessageText(payload).slice(0, 120);
   }
@@ -2321,6 +2379,12 @@ function formatActivity(record) {
   }
   if (eventType === "session_failed") {
     return `[${hhmmss}] ❌ session failed ${String(payload.error || "").slice(0, 120)}`;
+  }
+  if (eventType === "llm_retry") {
+    return `[${hhmmss}] 🔁 ${actor} ${llmRetryText(payload).slice(0, 120)}`;
+  }
+  if (eventType === "llm_request_error") {
+    return `[${hhmmss}] ❌ ${actor} ${llmRequestErrorText(payload).slice(0, 120)}`;
   }
   if (eventType === "agent_spawned") {
     return `[${hhmmss}] 🧩 ${actor} spawned ${String(payload.instruction || "").slice(0, 120)}`;
@@ -2616,6 +2680,10 @@ function consumeRuntimeEvent(record) {
     if (agent.summary) {
       appendStepEntry(agent, stepNumber, extraKind("summary"), agent.summary);
     }
+  } else if (eventType === "llm_retry") {
+    appendStepEntry(agent, stepNumber, extraKind("error"), llmRetryText(payload));
+  } else if (eventType === "llm_request_error") {
+    appendStepEntry(agent, stepNumber, extraKind("error"), llmRequestErrorText(payload));
   } else if (eventType === "protocol_error" || eventType === "sandbox_violation") {
     appendStepEntry(agent, stepNumber, extraKind("error"), String(payload.error || ""));
   } else if (eventType === "control_message") {

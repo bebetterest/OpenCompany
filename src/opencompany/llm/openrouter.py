@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from opencompany.models import ToolCall
 from opencompany.utils import ensure_directory, utc_now
 
 TokenCallback = Callable[[str], Awaitable[None] | None]
+RetryCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 OPENROUTER_HEADER_APP_NAME = "OpenCompany"
 OPENROUTER_HEADER_SITE_URL = "https://github.com/bebetterest/OpenCompany"
 
@@ -121,6 +123,7 @@ class OpenRouterClient:
         debug_module: str | None = None,
         on_token: TokenCallback | None = None,
         on_reasoning: TokenCallback | None = None,
+        on_retry: RetryCallback | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         parallel_tool_calls: bool | None = None,
@@ -170,6 +173,7 @@ class OpenRouterClient:
             response_error: dict[str, Any] | None = None
             received_event = False
             status_code: int | None = None
+            status_text: str | None = None
 
             try:
                 async with httpx.AsyncClient(timeout=effective_timeout) as client:
@@ -180,6 +184,7 @@ class OpenRouterClient:
                         json=payload,
                     ) as response:
                         status_code = getattr(response, "status_code", None)
+                        status_text = self._response_status_text(response)
                         response.raise_for_status()
                         async for chunk in response.aiter_text():
                             for event_data in parser.feed(chunk):
@@ -246,8 +251,10 @@ class OpenRouterClient:
                                     if function.get("arguments"):
                                         current["arguments"] += str(function["arguments"])
             except Exception as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
-                    status_code = exc.response.status_code
+                response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+                if response is not None:
+                    status_code = response.status_code
+                    status_text = self._response_status_text(response)
                 partial_tool_calls = [
                     {
                         "id": chunk["id"] or f"tool-call-{index}",
@@ -296,6 +303,7 @@ class OpenRouterClient:
                     request_payload=payload,
                     response_payload=partial_response_payload,
                     status_code=status_code,
+                    status_text=status_text,
                     error=exc,
                     debug_agent_id=debug_agent_id,
                     debug_module=debug_module,
@@ -307,8 +315,27 @@ class OpenRouterClient:
                     has_partial_output=received_event,
                 ):
                     raise
-                response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
-                await asyncio.sleep(self._retry_delay_seconds(attempt=attempt, response=response))
+                retry_delay_seconds = self._retry_delay_seconds(attempt=attempt, response=response)
+                if on_retry is not None:
+                    retry_payload = {
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                        "max_retries": self.max_retries,
+                        "next_attempt": attempt + 2,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "retry_reason": self._retry_reason(exc),
+                        "status_code": status_code,
+                        "status_text": status_text,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    }
+                    try:
+                        maybe = on_retry(retry_payload)
+                        if hasattr(maybe, "__await__"):
+                            await maybe
+                    except Exception:
+                        pass
+                await asyncio.sleep(retry_delay_seconds)
                 attempt += 1
                 continue
 
@@ -369,6 +396,7 @@ class OpenRouterClient:
                         },
                     },
                     status_code=status_code,
+                    status_text=status_text,
                     error=None,
                     debug_agent_id=debug_agent_id,
                     debug_module=debug_module,
@@ -408,6 +436,7 @@ class OpenRouterClient:
                     },
                 },
                 status_code=status_code,
+                status_text=status_text,
                 error=None,
                 debug_agent_id=debug_agent_id,
                 debug_module=debug_module,
@@ -438,6 +467,7 @@ class OpenRouterClient:
         request_payload: dict[str, Any],
         response_payload: dict[str, Any] | None,
         status_code: int | None,
+        status_text: str | None,
         error: Exception | None,
         debug_agent_id: str | None = None,
         debug_module: str | None = None,
@@ -458,6 +488,7 @@ class OpenRouterClient:
             },
             "response": response_payload,
             "status_code": status_code,
+            "status_text": status_text,
         }
         if debug_agent_id or debug_module:
             record["scope"] = {
@@ -494,7 +525,7 @@ class OpenRouterClient:
 
     @staticmethod
     def _is_retryable_status_code(status_code: int) -> bool:
-        return status_code in {408, 409, 429, 500, 502, 503, 504, 520}
+        return 400 <= status_code < 600
 
     def _should_retry_stream_error(
         self,
@@ -521,6 +552,41 @@ class OpenRouterClient:
             httpx.RemoteProtocolError,
         )
         return isinstance(exc, retryable_transport_errors)
+
+    @classmethod
+    def _response_status_text(cls, response: Any | None) -> str | None:
+        if response is None:
+            return None
+        reason_phrase = getattr(response, "reason_phrase", None)
+        if isinstance(reason_phrase, str):
+            normalized = reason_phrase.strip()
+            if normalized and normalized.lower() != "<none>":
+                return normalized
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return cls._status_text_from_code(status_code)
+        return None
+
+    @staticmethod
+    def _status_text_from_code(status_code: int) -> str | None:
+        try:
+            return HTTPStatus(status_code).phrase
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _retry_reason(exc: Exception) -> str:
+        import httpx
+
+        if isinstance(exc, httpx.HTTPStatusError):
+            return "http_status_error"
+        if isinstance(exc, httpx.TimeoutException):
+            return "timeout"
+        if isinstance(exc, httpx.RemoteProtocolError):
+            return "remote_protocol_error"
+        if isinstance(exc, httpx.NetworkError):
+            return "network_error"
+        return "transport_error"
 
     def _retry_delay_seconds(
         self,

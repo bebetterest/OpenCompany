@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from http import HTTPStatus
 from typing import Any, Callable
 
 from opencompany.config import OpenCompanyConfig
@@ -99,6 +100,14 @@ class AgentRuntime:
                 event_type="llm_reasoning",
                 phase="llm",
                 payload={"token": token},
+            )
+
+        async def on_retry(payload: dict[str, Any]) -> None:
+            self._log_agent_event(
+                agent,
+                event_type="llm_retry",
+                phase="llm",
+                payload=payload,
             )
 
         max_empty_response_retries = max(
@@ -219,11 +228,18 @@ class AgentRuntime:
                     debug_module="agent_runtime.ask",
                     on_token=on_token,
                     on_reasoning=on_reasoning,
+                    on_retry=on_retry,
                     tools=tools,
                     tool_choice="auto",
                     parallel_tool_calls=True,
                 )
             except Exception as exc:
+                self._log_agent_event(
+                    agent,
+                    event_type="llm_request_error",
+                    phase="llm",
+                    payload=_llm_exception_payload(exc),
+                )
                 if (
                     self.config.runtime.context.enabled
                     and overflow_retry_attempt < max_overflow_retry_attempts
@@ -489,18 +505,36 @@ class AgentRuntime:
                 ),
             },
         ]
-        result = await llm_client.stream_chat(
-            model=compression_model,
-            messages=summary_input_messages,
-            temperature=0.0,
-            max_tokens=self.config.llm.openrouter.max_tokens,
-            timeout_seconds=self._compression_timeout_seconds(),
-            debug_agent_id=agent.id,
-            debug_module="agent_runtime.compress_context",
-            tools=None,
-            tool_choice=None,
-            parallel_tool_calls=None,
-        )
+        async def on_retry(payload: dict[str, Any]) -> None:
+            self._log_agent_event(
+                agent,
+                event_type="llm_retry",
+                phase="context",
+                payload=payload,
+            )
+
+        try:
+            result = await llm_client.stream_chat(
+                model=compression_model,
+                messages=summary_input_messages,
+                temperature=0.0,
+                max_tokens=self.config.llm.openrouter.max_tokens,
+                timeout_seconds=self._compression_timeout_seconds(),
+                debug_agent_id=agent.id,
+                debug_module="agent_runtime.compress_context",
+                on_retry=on_retry,
+                tools=None,
+                tool_choice=None,
+                parallel_tool_calls=None,
+            )
+        except Exception as exc:
+            self._log_agent_event(
+                agent,
+                event_type="llm_request_error",
+                phase="context",
+                payload=_llm_exception_payload(exc),
+            )
+            raise
         latest_summary = str(result.content or "").strip()
         if not latest_summary:
             return {"compressed": False, "error": "compression model returned an empty summary."}
@@ -993,6 +1027,35 @@ def usage_cache_write_tokens(usage: dict[str, Any] | None) -> int | None:
 
 def stable_json_payload(value: Any) -> str:
     return stable_json_dumps(value)
+
+
+def _llm_exception_payload(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error_type": exc.__class__.__name__,
+        "error": str(exc),
+    }
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        payload["status_code"] = status_code
+        status_text = _http_status_text(response=response, status_code=status_code)
+        if status_text:
+            payload["status_text"] = status_text
+    return payload
+
+
+def _http_status_text(*, response: Any | None, status_code: int | None) -> str:
+    reason_phrase = getattr(response, "reason_phrase", None)
+    if isinstance(reason_phrase, str):
+        normalized = reason_phrase.strip()
+        if normalized and normalized.lower() != "<none>":
+            return normalized
+    if isinstance(status_code, int):
+        try:
+            return HTTPStatus(status_code).phrase
+        except ValueError:
+            return ""
+    return ""
 
 
 _CONTEXT_OVERFLOW_KEYWORDS = (

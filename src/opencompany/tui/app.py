@@ -5179,6 +5179,22 @@ class OpenCompanyApp(App):
                 str(details.get("error", "")),
             )
             return
+        if event_type == "llm_retry":
+            self._append_step_stream_entry(
+                state,
+                step_number,
+                self._extra_kind("error"),
+                self._llm_retry_stream_text(details),
+            )
+            return
+        if event_type == "llm_request_error":
+            self._append_step_stream_entry(
+                state,
+                step_number,
+                self._extra_kind("error"),
+                self._llm_request_error_stream_text(details),
+            )
+            return
         if event_type == "sandbox_violation":
             self._append_step_stream_entry(
                 state,
@@ -5704,6 +5720,61 @@ class OpenCompanyApp(App):
     def _should_write_activity(self, record: dict[str, Any]) -> bool:
         return str(record.get("event_type", "")) not in ACTIVITY_SKIP_EVENTS
 
+    @staticmethod
+    def _http_status_label(details: dict[str, Any]) -> str:
+        code_raw = details.get("status_code")
+        status_text = str(details.get("status_text", "")).strip()
+        code_text = ""
+        if isinstance(code_raw, int):
+            code_text = str(code_raw)
+        elif isinstance(code_raw, str) and code_raw.strip():
+            code_text = code_raw.strip()
+        if code_text and status_text:
+            return f"{code_text} {status_text}"
+        if code_text:
+            return code_text
+        if status_text:
+            return status_text
+        return "-"
+
+    @staticmethod
+    def _retry_attempt_label(details: dict[str, Any]) -> str:
+        attempt_raw = details.get("attempt")
+        max_attempts_raw = details.get("max_attempts")
+        try:
+            attempt = int(attempt_raw)
+        except (TypeError, ValueError):
+            attempt = None
+        try:
+            max_attempts = int(max_attempts_raw)
+        except (TypeError, ValueError):
+            max_attempts = None
+        if attempt is not None and max_attempts is not None and max_attempts > 0:
+            return f"{attempt}/{max_attempts}"
+        if attempt is not None:
+            return str(attempt)
+        return "-"
+
+    def _llm_retry_stream_text(self, details: dict[str, Any]) -> str:
+        delay = details.get("retry_delay_seconds")
+        try:
+            delay_text = f"{float(delay):.2f}s"
+        except (TypeError, ValueError):
+            delay_text = "-s"
+        status = self._http_status_label(details)
+        attempt_label = self._retry_attempt_label(details)
+        return (
+            f"llm retry attempt={attempt_label} status={status} "
+            f"delay={delay_text} reason={str(details.get('retry_reason', '-'))}"
+        )
+
+    def _llm_request_error_stream_text(self, details: dict[str, Any]) -> str:
+        status = self._http_status_label(details)
+        error_text = str(details.get("error", "")).strip()
+        if error_text:
+            return f"llm request error status={status} error={error_text}"
+        return f"llm request error status={status}"
+
     def _format_event(self, record: dict[str, Any]) -> str:
         timestamp = str(record.get("timestamp", ""))[11:19]
         details = record.get("payload", {})
@@ -5796,6 +5867,17 @@ class OpenCompanyApp(App):
             return f"[{timestamp}] {agent_name} {self.translator.text(status_key)}"
         if event_type == "control_message":
             return f"[{timestamp}] {agent_name} control {self._control_message_stream_text(details)}"
+        if event_type == "llm_retry":
+            return (
+                f"[{timestamp}] {agent_name} llm retry "
+                f"attempt={self._retry_attempt_label(details)} "
+                f"status={self._http_status_label(details)}"
+            )
+        if event_type == "llm_request_error":
+            return (
+                f"[{timestamp}] {agent_name} llm request error "
+                f"status={self._http_status_label(details)}"
+            )
         if event_type == "protocol_error":
             return f"[{timestamp}] {agent_name} protocol error"
         if event_type == "sandbox_violation":
