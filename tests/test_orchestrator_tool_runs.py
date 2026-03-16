@@ -267,6 +267,74 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("messages_end", str(invalid_order.get("error", "")))
             self.assertIn("must be >=", str(invalid_order.get("error", "")))
 
+    async def test_get_agent_run_skips_soft_injected_messages(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-get-agent-run-skip-soft-injected",
+            )
+
+            child_workspace = workspace_manager.fork_workspace(root.workspace_id, "agent-child")
+            child = AgentNode(
+                id="agent-child",
+                session_id=session.id,
+                name="Child",
+                role=AgentRole.WORKER,
+                instruction="work",
+                workspace_id=child_workspace.id,
+                parent_agent_id=root.id,
+                status=AgentStatus.RUNNING,
+                metadata={
+                    "created_at": "2026-03-11T10:00:05Z",
+                    "compression_excluded_message_indices": [1, 3],
+                },
+                conversation=[
+                    {"role": "assistant", "content": "work-0"},
+                    {"role": "user", "content": "context pressure reminder"},
+                    {"role": "assistant", "content": "work-1"},
+                    {"role": "user", "content": "step limit reminder"},
+                    {"role": "assistant", "content": "work-2"},
+                ],
+            )
+            agents[child.id] = child
+
+            all_visible = orchestrator.tool_executor.execute_read_only(
+                agent=root,
+                action={"type": "get_agent_run", "agent_id": child.id, "messages_start": 0, "messages_end": 3},
+                agents=agents,
+                workspace_manager=workspace_manager,
+            )
+            visible_messages = all_visible.get("messages")
+            assert isinstance(visible_messages, list)
+            self.assertEqual(
+                [item.get("content") for item in visible_messages],
+                ["work-0", "work-1", "work-2"],
+            )
+            self.assertNotIn("warning", all_visible)
+            self.assertNotIn("next_messages_start", all_visible)
+
+            latest_only = orchestrator.tool_executor.execute_read_only(
+                agent=root,
+                action={"type": "get_agent_run", "agent_id": child.id},
+                agents=agents,
+                workspace_manager=workspace_manager,
+            )
+            latest_messages = latest_only.get("messages")
+            assert isinstance(latest_messages, list)
+            self.assertEqual([item.get("content") for item in latest_messages], ["work-2"])
+
+            negative_slice = orchestrator.tool_executor.execute_read_only(
+                agent=root,
+                action={"type": "get_agent_run", "agent_id": child.id, "messages_start": -2, "messages_end": 3},
+                agents=agents,
+                workspace_manager=workspace_manager,
+            )
+            negative_messages = negative_slice.get("messages")
+            assert isinstance(negative_messages, list)
+            self.assertEqual([item.get("content") for item in negative_messages], ["work-1", "work-2"])
+
     async def test_cancel_agent_non_recursive_only_cancels_target(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
@@ -1078,6 +1146,158 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final_tool.get("status"), ToolRunStatus.COMPLETED.value)
             self.assertEqual(final_tool.get("stdout"), "final-stdout\n")
             self.assertEqual(final_tool.get("stderr"), "final-stderr\n")
+
+    async def test_execute_agent_actions_defers_compress_until_shell_finishes(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-compress-after-shell",
+            )
+            orchestrator.config.runtime.tools.shell_inline_wait_seconds = 0.01
+            root.step_count = 1
+            root.metadata["message_index_to_step"] = [1]
+
+            execution_order: list[str] = []
+            compression_snapshots: list[str] = []
+
+            async def _slow_shell(  # type: ignore[no-untyped-def]
+                _agent,
+                _action,
+                _workspace_manager,
+                *,
+                stream_listener=None,
+            ):
+                execution_order.append("shell")
+                if stream_listener is not None:
+                    await stream_listener("stdout", "partial-stdout\n")
+                await asyncio.sleep(0.05)
+                return {
+                    "exit_code": 0,
+                    "stdout": "final-stdout\n",
+                    "stderr": "",
+                    "duration_ms": 50,
+                }
+
+            async def _fake_compress_context(  # type: ignore[no-untyped-def]
+                agent,
+                *,
+                llm_client,
+                reason,
+                overflow_detail=None,
+            ):
+                del llm_client, overflow_detail
+                execution_order.append("compress_context")
+                compression_snapshots.append(json.dumps(agent.conversation, ensure_ascii=False))
+                return {
+                    "compressed": True,
+                    "reason": reason,
+                    "summary_version": 1,
+                    "message_range": {"start": 0, "end": len(agent.conversation) - 1},
+                    "step_range": {"start": 1, "end": 1},
+                    "context_tokens_before": 10,
+                    "context_tokens_after": 5,
+                    "context_limit_tokens": 100,
+                }
+
+            orchestrator.tool_executor.execute_shell = _slow_shell  # type: ignore[method-assign]
+            orchestrator.agent_runtime.compress_context = _fake_compress_context  # type: ignore[method-assign]
+
+            result = await orchestrator._execute_agent_actions(
+                session=session,
+                agent=root,
+                actions=[
+                    {"type": "compress_context"},
+                    {"type": "shell", "command": "sleep 1"},
+                ],
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+
+            self.assertIsNone(result.finish_payload)
+            self.assertEqual(execution_order, ["shell", "compress_context"])
+            self.assertEqual(len(compression_snapshots), 1)
+            self.assertIn("final-stdout", compression_snapshots[0])
+            self.assertNotIn('"status": "running"', compression_snapshots[0])
+            self.assertNotIn('"background": true', compression_snapshots[0].lower())
+
+    async def test_execute_agent_actions_runs_compress_before_finish_even_if_finish_is_first(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-finish-before-compress",
+            )
+            root.step_count = 1
+            root.metadata["message_index_to_step"] = [1]
+
+            execution_order: list[str] = []
+
+            async def _fake_shell(  # type: ignore[no-untyped-def]
+                _agent,
+                _action,
+                _workspace_manager,
+                *,
+                stream_listener=None,
+            ):
+                del stream_listener
+                execution_order.append("shell")
+                return {
+                    "exit_code": 0,
+                    "stdout": "shell-done\n",
+                    "stderr": "",
+                    "duration_ms": 1,
+                }
+
+            async def _fake_compress_context(  # type: ignore[no-untyped-def]
+                _agent,
+                *,
+                llm_client,
+                reason,
+                overflow_detail=None,
+            ):
+                del llm_client, reason, overflow_detail
+                execution_order.append("compress_context")
+                return {
+                    "compressed": True,
+                    "reason": "manual",
+                    "summary_version": 1,
+                    "message_range": {"start": 0, "end": 2},
+                    "step_range": {"start": 1, "end": 1},
+                    "context_tokens_before": 10,
+                    "context_tokens_after": 5,
+                    "context_limit_tokens": 100,
+                }
+
+            orchestrator.tool_executor.execute_shell = _fake_shell  # type: ignore[method-assign]
+            orchestrator.agent_runtime.compress_context = _fake_compress_context  # type: ignore[method-assign]
+
+            result = await orchestrator._execute_agent_actions(
+                session=session,
+                agent=root,
+                actions=[
+                    {
+                        "type": "finish",
+                        "status": "completed",
+                        "summary": "done",
+                    },
+                    {"type": "compress_context"},
+                    {"type": "shell", "command": "echo ok"},
+                ],
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+
+            assert result.finish_payload is not None
+            self.assertEqual(result.finish_payload.get("completion_state"), "completed")
+            self.assertEqual(result.finish_payload.get("user_summary"), "done")
+            self.assertEqual(execution_order, ["shell", "compress_context"])
 
     async def test_shell_inline_wait_running_output_is_truncated(self) -> None:
         with TemporaryDirectory() as temp_dir:

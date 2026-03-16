@@ -1268,3 +1268,94 @@ keep_pinned_messages = 3
                     sorted({item["agent_id"] for item in filtered_payload["messages"]}),
                     ["agent-root"],
                 )
+
+    def test_messages_endpoint_annotates_prompt_visibility_with_summary_window(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text(
+                """
+[runtime.context]
+max_context_tokens = 8192
+keep_pinned_messages = 1
+""".strip(),
+                encoding="utf-8",
+            )
+            session_id = "session-message-window"
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+            orchestrator.paths.session_dir(session_id)
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=app_dir,
+                    task="demo",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.RUNNING,
+                )
+            )
+            agent = AgentNode(
+                id="agent-root",
+                session_id=session_id,
+                name="Root",
+                role=AgentRole.ROOT,
+                instruction="demo",
+                workspace_id="root",
+                status=AgentStatus.PAUSED,
+                metadata={
+                    "context_summary": "## Current context summary\n- completed setup",
+                    "summary_version": 2,
+                    "summarized_until_message_index": 2,
+                },
+            )
+            agent.step_count = 1
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "head pinned"},
+            )
+            agent.step_count = 1
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "assistant", "content": "same step but summarized"},
+            )
+            agent.step_count = 2
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "older summarized step"},
+            )
+            agent.step_count = 3
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "context pressure reminder"},
+                None,
+                {"exclude_from_context_compression": True},
+            )
+            agent.step_count = 3
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "assistant", "content": "latest assistant reply"},
+            )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                response = client.get(
+                    f"/api/session/{session_id}/messages?agent_id=agent-root&limit=20"
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                records = payload.get("messages", [])
+                by_index = {
+                    int(record["message_index"]): record
+                    for record in records
+                    if "message_index" in record
+                }
+                self.assertEqual(by_index[0]["prompt_bucket"], "pinned")
+                self.assertTrue(bool(by_index[0]["prompt_visible"]))
+                self.assertEqual(by_index[1]["prompt_bucket"], "hidden_middle")
+                self.assertFalse(bool(by_index[1]["prompt_visible"]))
+                self.assertEqual(by_index[2]["prompt_bucket"], "hidden_middle")
+                self.assertFalse(bool(by_index[2]["prompt_visible"]))
+                self.assertEqual(by_index[3]["prompt_bucket"], "tail")
+                self.assertTrue(bool(by_index[3]["prompt_visible"]))
+                self.assertTrue(bool(by_index[3]["exclude_from_context_compression"]))
+                self.assertEqual(by_index[4]["prompt_bucket"], "tail")
+                self.assertTrue(bool(by_index[4]["prompt_visible"]))

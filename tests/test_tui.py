@@ -56,6 +56,46 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_context_compacted_event_triggers_full_message_reload(self) -> None:
+        try:
+            from opencompany.tui.app import OpenCompanyApp, RuntimeUpdate
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        app.current_session_id = "session-live-1"
+        reloaded: list[str] = []
+        incremental_syncs: list[str] = []
+
+        def fake_reload(session_id: str) -> None:
+            reloaded.append(session_id)
+
+        async def fake_incremental_sync() -> None:
+            incremental_syncs.append("incremental")
+
+        app._reload_session_messages = fake_reload  # type: ignore[method-assign]
+        app._sync_session_messages_incremental = fake_incremental_sync  # type: ignore[method-assign]
+
+        await app.on_runtime_update(
+            RuntimeUpdate(
+                {
+                    "event_type": "context_compacted",
+                    "timestamp": "2026-03-16T21:28:42Z",
+                    "session_id": "session-live-1",
+                    "agent_id": "agent-ctx-1",
+                    "payload": {
+                        "step_range": {"start": 1, "end": 7},
+                        "message_range": {"start": 0, "end": 14},
+                        "summary_version": 1,
+                        "context_latest_summary": "## Context Summary\n- done",
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(reloaded, ["session-live-1"])
+        self.assertEqual(incremental_syncs, [])
+
     async def test_terminal_button_reenables_when_running_session_id_arrives(self) -> None:
         try:
             from textual.widgets import Button
@@ -2537,7 +2577,7 @@ backend = "anthropic"
         self.assertIn(39, state.step_entries)
         self.assertEqual(state.last_message_index, 1)
 
-    def test_apply_message_record_skips_context_pressure_reminder(self) -> None:
+    def test_apply_message_record_keeps_prompt_visible_context_pressure_reminder(self) -> None:
         try:
             from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
         except ImportError:
@@ -2555,6 +2595,8 @@ backend = "anthropic"
                 "message_index": 0,
                 "step_count": 34,
                 "role": "user",
+                "prompt_visible": True,
+                "prompt_bucket": "tail",
                 "exclude_from_context_compression": True,
                 "message": {
                     "content": "context pressure reminder",
@@ -2568,13 +2610,71 @@ backend = "anthropic"
                 "message_index": 1,
                 "step_count": 39,
                 "role": "user",
+                "prompt_visible": True,
+                "prompt_bucket": "tail",
                 "message": {"content": "real user message"},
             }
         )
 
-        self.assertNotIn(34, state.step_entries)
+        self.assertIn(("user_message", "context pressure reminder"), state.step_entries.get(34, []))
         self.assertIn(("user_message", "real user message"), state.step_entries.get(39, []))
         self.assertEqual(state.last_message_index, 1)
+
+    def test_apply_message_record_hides_same_step_hidden_middle_messages(self) -> None:
+        try:
+            from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        state = AgentRuntimeView(
+            id="agent-1",
+            name="Worker",
+            context_latest_summary="## Context Summary\n- done",
+        )
+        app.agent_states = {state.id: state}
+        app.stream_agent_order = [state.id]
+
+        app._apply_message_record(
+            {
+                "timestamp": "2026-03-10T10:00:00Z",
+                "agent_id": state.id,
+                "message_index": 0,
+                "step_count": 34,
+                "role": "user",
+                "prompt_visible": True,
+                "prompt_bucket": "pinned",
+                "message": {"content": "head pinned"},
+            }
+        )
+        app._apply_message_record(
+            {
+                "timestamp": "2026-03-10T10:00:01Z",
+                "agent_id": state.id,
+                "message_index": 1,
+                "step_count": 34,
+                "role": "assistant",
+                "prompt_visible": False,
+                "prompt_bucket": "hidden_middle",
+                "message": {"content": '{"actions":[{"type":"list_agent_runs"}]}'},
+            }
+        )
+        app._apply_message_record(
+            {
+                "timestamp": "2026-03-10T10:00:02Z",
+                "agent_id": state.id,
+                "message_index": 2,
+                "step_count": 35,
+                "role": "assistant",
+                "prompt_visible": True,
+                "prompt_bucket": "tail",
+                "message": {"content": '{"actions":[{"type":"finish","summary":"done"}]}'},
+            }
+        )
+
+        self.assertEqual(state.step_entries.get(34), [("user_message", "head pinned")])
+        self.assertEqual(state.pinned_prompt_steps, {34})
+        self.assertIn(("tool_call", "finish(status=-)"), state.step_entries.get(35, []))
 
     def test_apply_message_record_accumulates_output_tokens_total(self) -> None:
         try:
@@ -2633,7 +2733,7 @@ backend = "anthropic"
 
         self.assertEqual(state.output_tokens_total, 24)
 
-    def test_control_message_event_is_rendered_in_stream(self) -> None:
+    def test_control_message_event_is_not_rendered_in_stream(self) -> None:
         try:
             from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
         except ImportError:
@@ -2653,12 +2753,9 @@ backend = "anthropic"
             },
         )
 
-        self.assertIn(
-            ("control_extra", "[step_limit_summary] Summarize current state before exiting."),
-            state.stream_entries,
-        )
+        self.assertEqual(state.stream_entries, [])
 
-    def test_context_pressure_reminder_event_is_visible_in_stream(self) -> None:
+    def test_context_pressure_reminder_event_is_not_rendered_in_stream(self) -> None:
         try:
             from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
         except ImportError:
@@ -2678,10 +2775,7 @@ backend = "anthropic"
             },
         )
 
-        self.assertIn(
-            ("control", "[context_pressure_reminder] Context usage warning: prompt tokens=9000/10240."),
-            state.stream_entries,
-        )
+        self.assertEqual(state.stream_entries, [])
 
     def test_llm_retry_event_is_rendered_with_http_status(self) -> None:
         try:
@@ -3247,17 +3341,16 @@ keep_pinned_messages = 4
             keep_pinned_messages=2,
             context_latest_summary="## Context Summary\n- done",
             compacted_step_ranges=[(1, 3)],
-            step_order=[1, 2, 3, 4],
+            pinned_prompt_steps={1, 2},
+            step_order=[1, 2, 4],
             step_entries={
                 1: [("reply", "head-1")],
                 2: [("reply", "head-2")],
-                3: [("reply", "summarized")],
                 4: [("reply", "tail")],
             },
         )
         self.assertEqual(app._effective_step_order(state), [1, 2, 0, 4])
         self.assertEqual(app._entries_for_step(state, 0), [("summary", "## Context Summary\n- done")])
-        self.assertEqual(app._entries_for_step(state, 3), [])
         self.assertEqual(app._entries_for_step(state, 1), [("reply", "head-1")])
 
     def test_effective_step_order_without_context_summary_keeps_real_steps_only(self) -> None:

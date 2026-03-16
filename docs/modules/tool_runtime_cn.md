@@ -45,6 +45,7 @@ agent 可见工具返回采用精简投影协议：
 - 输出：`compressed`、`reason`、`summary_version`、`message_range`、`step_range`、`context_tokens_before`、`context_tokens_after`、`context_limit_tokens`
 - 压缩被禁用、配置缺失或无可压缩消息时可返回 `error`
 - 作用域仅限当前 agent（不支持跨 agent 压缩）
+- 工具定义约束：调用 `compress_context` 时应单独调用，不要与其他工具同轮混用；只有运行时为兼容模型输出而兜底时才会处理混用场景
 - `compress_context` 的工具调用/控制痕迹会标记为 internal，不再进入后续 LLM 请求
 - 超时预算可通过 `runtime.tool_timeouts.actions.compress_context` 配置（默认 `180s`）
 
@@ -59,6 +60,7 @@ agent 可见工具返回采用精简投影协议：
 - 消息切片语义：`[messages_start, messages_end)`，其中 `messages_end` 为排他上界
 - `messages_start/messages_end` 支持负数倒序下标（例如 `-1` 表示最后一条消息）
 - 不传切片参数时，默认返回最后 1 条消息
+- 运行时软注入提醒消息（例如上下文使用告警、root/worker 软步数提醒）会在切片前先被忽略，因此返回的下标/数量都是基于过滤后的可见消息列表
 - 单次最多返回 5 条消息（messages 通常较长，避免大量拉取）
 - 非法范围输入会返回明确错误（下标越界，或归一化后 `end < start`）
 - 输出：`agent_run` 概览 + `messages`

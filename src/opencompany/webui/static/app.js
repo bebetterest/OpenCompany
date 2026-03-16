@@ -198,6 +198,8 @@ const state = {
     cursor: null,
     syncing: false,
     timer: null,
+    needsSync: false,
+    reloadAll: false,
   },
   agentPanel: {
     dirty: true,
@@ -1076,6 +1078,9 @@ function appendStepEntry(agent, stepNumber, kind, text, options = {}) {
   }
   const entries = ensureStepEntries(agent, stepNumber);
   const merge = Boolean(options.merge);
+  const promptBucket =
+    typeof options.promptBucket === "string" ? String(options.promptBucket).trim() : "";
+  const messageIndex = coerceNonNegativeInt(options.messageIndex);
   if (!merge && entries.length > 0) {
     const last = entries[entries.length - 1];
     if (last.kind === kind && String(last.text || "") === String(text)) {
@@ -1085,7 +1090,12 @@ function appendStepEntry(agent, stepNumber, kind, text, options = {}) {
   if (merge && entries.length > 0 && entries[entries.length - 1].kind === kind) {
     entries[entries.length - 1].text += text;
   } else {
-    entries.push({ kind, text });
+    entries.push({
+      kind,
+      text,
+      promptBucket,
+      messageIndex,
+    });
   }
 }
 
@@ -1313,39 +1323,7 @@ function contextSummaryText(agent) {
 }
 
 function hasContextSummary(agent) {
-  if (!agent || typeof agent !== "object") {
-    return false;
-  }
-  if (contextSummaryText(agent)) {
-    return true;
-  }
-  const summaryVersion = coerceNonNegativeInt(agent.summaryVersion);
-  return summaryVersion !== null && summaryVersion > 0;
-}
-
-function summarizedStepNumbers(agent) {
-  const summarized = new Set();
-  if (!agent || !Array.isArray(agent.compactedStepRanges)) {
-    return summarized;
-  }
-  for (const rangeValue of agent.compactedStepRanges) {
-    const normalized = normalizeRange(rangeValue);
-    if (!normalized) {
-      continue;
-    }
-    for (let step = normalized.start; step <= normalized.end; step += 1) {
-      summarized.add(step);
-    }
-  }
-  return summarized;
-}
-
-function pinnedStepNumbers(agent, orderedSteps) {
-  const keepCount = coerceNonNegativeInt(agent && agent.keepPinnedMessages);
-  if (keepCount === null || keepCount <= 0 || !Array.isArray(orderedSteps) || orderedSteps.length === 0) {
-    return [];
-  }
-  return orderedSteps.slice(0, Math.min(keepCount, orderedSteps.length));
+  return Boolean(agent && typeof agent === "object" && contextSummaryText(agent));
 }
 
 function usageCacheText(agent) {
@@ -1561,8 +1539,19 @@ function applyMessageRecord(record) {
   if (messageIndex <= Number(agent.lastMessageIndex || -1)) {
     return;
   }
-  const hiddenFromStepView =
-    Boolean(record.internal) || Boolean(record.exclude_from_context_compression);
+  const promptVisible =
+    typeof record.prompt_visible === "boolean"
+      ? record.prompt_visible
+      : !Boolean(record.internal) && !Boolean(record.exclude_from_context_compression);
+  const promptBucket =
+    typeof record.prompt_bucket === "string"
+      ? String(record.prompt_bucket).trim()
+      : Boolean(record.internal)
+        ? "internal"
+        : promptVisible
+          ? "tail"
+          : "hidden_middle";
+  const hiddenFromStepView = !promptVisible || promptBucket === "internal";
   if (hiddenFromStepView) {
     agent.lastMessageIndex = Math.max(Number(agent.lastMessageIndex || -1), messageIndex);
     return;
@@ -1592,7 +1581,10 @@ function applyMessageRecord(record) {
         continue;
       }
       if (!stepHasEntry(agent, stepNumber, kind, text)) {
-        appendStepEntry(agent, stepNumber, kind, text);
+        appendStepEntry(agent, stepNumber, kind, text, {
+          promptBucket,
+          messageIndex,
+        });
       }
     }
     agent.stepCount = Math.max(Number(agent.stepCount || 0), stepNumber);
@@ -1616,13 +1608,19 @@ function applyMessageRecord(record) {
     const toolBody = toolLines.join("\n");
     const normalizedToolBody = toolBody.trim();
     if (normalizedToolBody) {
-      appendStepEntry(agent, stepNumber, "tool_message", normalizedToolBody);
+      appendStepEntry(agent, stepNumber, "tool_message", normalizedToolBody, {
+        promptBucket,
+        messageIndex,
+      });
       agent.stepCount = Math.max(Number(agent.stepCount || 0), stepNumber);
     }
   } else {
     const userBody = String(message.content || "").trim();
     if (userBody) {
-      appendStepEntry(agent, stepNumber, "user_message", userBody);
+      appendStepEntry(agent, stepNumber, "user_message", userBody, {
+        promptBucket,
+        messageIndex,
+      });
       agent.stepCount = Math.max(Number(agent.stepCount || 0), stepNumber);
     }
   }
@@ -2703,14 +2701,10 @@ function consumeRuntimeEvent(record) {
         agent.lastContextWarningLimit = warningLimit;
       }
     }
-    const text = controlMessageText(payload);
-    if (text) {
-      // Make context-pressure reminders visible in step stream; keep other control messages internal-only.
-      const entryKind = controlKind === "context_pressure_reminder" ? "control" : extraKind("control");
-      appendStepEntry(agent, stepNumber, entryKind, text);
-    }
   }
-  if (MESSAGE_SYNC_EVENT_TYPES.has(eventType)) {
+  if (eventType === "context_compacted") {
+    scheduleMessageSync(0, { reloadAll: true });
+  } else if (MESSAGE_SYNC_EVENT_TYPES.has(eventType)) {
     scheduleMessageSync();
   }
   if (
@@ -2783,7 +2777,14 @@ async function syncSessionMessagesIncremental() {
     return;
   }
   state.messages.syncing = true;
+  const reloadAll = Boolean(state.messages.reloadAll);
+  state.messages.reloadAll = false;
+  state.messages.needsSync = false;
   try {
+    if (reloadAll) {
+      await loadSessionMessages(sessionId);
+      return;
+    }
     let cursor = state.messages.cursor;
     for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
       const query = new URLSearchParams({ limit: "500" });
@@ -2813,12 +2814,19 @@ async function syncSessionMessagesIncremental() {
     // Ignore transient sync errors; next event-triggered sync will retry.
   } finally {
     state.messages.syncing = false;
+    if (state.messages.needsSync || state.messages.reloadAll) {
+      scheduleMessageSync(0);
+    }
     markAgentPanelDirty();
     scheduleRender();
   }
 }
 
-function scheduleMessageSync(delayMs = 90) {
+function scheduleMessageSync(delayMs = 90, { reloadAll = false } = {}) {
+  state.messages.needsSync = true;
+  if (reloadAll) {
+    state.messages.reloadAll = true;
+  }
   if (state.messages.timer !== null) {
     return;
   }
@@ -4291,6 +4299,8 @@ function flattenAgentEntries(agent) {
         step,
         kind: String(entry.kind || "reply"),
         text: String(entry.text || ""),
+        promptBucket: String(entry.promptBucket || ""),
+        messageIndex: coerceNonNegativeInt(entry.messageIndex),
       });
     }
   }
@@ -4316,19 +4326,7 @@ function groupedAgentEntries(agent, maxEntries = null) {
     }
     grouped.get(step).push(row);
   }
-  const stepSet = new Set();
-  for (const step of grouped.keys()) {
-    stepSet.add(step);
-  }
-  if (Array.isArray(agent.stepOrder)) {
-    for (const step of agent.stepOrder) {
-      const normalized = Number(step);
-      if (Number.isFinite(normalized) && normalized > 0) {
-        stepSet.add(Math.floor(normalized));
-      }
-    }
-  }
-  const orderedSteps = [...stepSet].sort((a, b) => a - b);
+  const orderedSteps = [...grouped.keys()].sort((a, b) => a - b);
   if (!hasContextSummary(agent)) {
     return orderedSteps.map((step) => ({
       step,
@@ -4336,10 +4334,11 @@ function groupedAgentEntries(agent, maxEntries = null) {
       entries: grouped.get(step) || [],
     }));
   }
-  const pinnedSteps = pinnedStepNumbers(agent, orderedSteps);
+  const pinnedSteps = orderedSteps.filter((step) =>
+    (grouped.get(step) || []).some((row) => String(row.promptBucket || "") === "pinned")
+  );
   const pinnedSet = new Set(pinnedSteps);
-  const summarizedSet = summarizedStepNumbers(agent);
-  const unsummarizedSteps = orderedSteps.filter((step) => !pinnedSet.has(step) && !summarizedSet.has(step));
+  const unsummarizedSteps = orderedSteps.filter((step) => !pinnedSet.has(step));
   const rendered = [];
   for (const step of pinnedSteps) {
     rendered.push({

@@ -14,7 +14,7 @@ from opencompany.orchestration.agent_runtime import (
     usage_output_tokens,
     usage_total_tokens,
 )
-from opencompany.orchestration.context import ContextAssembler
+from opencompany.orchestration.context import ContextAssembler, prompt_window_projection
 from opencompany.prompts import PromptLibrary, default_prompts_dir
 
 
@@ -96,6 +96,62 @@ class ContextAssemblerTests(unittest.TestCase):
         self.assertEqual(messages[3], {"role": "user", "content": "new user message"})
         self.assertEqual(messages[4], {"role": "assistant", "content": "latest assistant reply"})
         self.assertEqual(len(messages), 5)
+
+    def test_prompt_projection_keeps_only_pinned_messages_then_tail_messages(self) -> None:
+        agent = self._agent(
+            [
+                {"role": "user", "content": "first user message"},
+                {"role": "assistant", "content": "same step but summarized"},
+                {"role": "user", "content": "older summarized step"},
+                {"role": "assistant", "content": "latest visible reply"},
+            ],
+            metadata={
+                "context_summary": "latest concise summary",
+                "summary_version": 2,
+                "summarized_until_message_index": 2,
+            },
+        )
+
+        projection = prompt_window_projection(agent, keep_pinned_messages=1)
+
+        self.assertEqual(projection.pinned_message_indices, (0,))
+        self.assertEqual(projection.hidden_message_indices, (1, 2))
+        self.assertEqual(projection.tail_message_indices, (3,))
+        self.assertEqual(projection.bucket_for_message_index(0), "pinned")
+        self.assertEqual(projection.bucket_for_message_index(1), "hidden_middle")
+        self.assertEqual(projection.bucket_for_message_index(3), "tail")
+
+        messages = self.assembler.messages(agent, "SYSTEM")
+        self.assertEqual(messages[0], {"role": "system", "content": "SYSTEM"})
+        self.assertEqual(messages[1], {"role": "user", "content": "first user message"})
+        self.assertEqual(messages[2]["role"], "user")
+        self.assertIn("compressed as follows (v2)", str(messages[2]["content"]))
+        self.assertEqual(messages[3], {"role": "assistant", "content": "latest visible reply"})
+        self.assertEqual(len(messages), 4)
+
+    def test_messages_with_summary_keep_unsummarized_soft_reminders_visible(self) -> None:
+        agent = self._agent(
+            [
+                {"role": "user", "content": "head pinned"},
+                {"role": "user", "content": "context pressure reminder"},
+                {"role": "assistant", "content": "latest assistant reply"},
+            ],
+            metadata={
+                "context_summary": "latest concise summary",
+                "summary_version": 1,
+                "summarized_until_message_index": 0,
+                "compression_excluded_message_indices": [1],
+            },
+        )
+
+        messages = self.assembler.messages(agent, "SYSTEM")
+
+        self.assertEqual(messages[0], {"role": "system", "content": "SYSTEM"})
+        self.assertEqual(messages[1], {"role": "user", "content": "head pinned"})
+        self.assertEqual(messages[2]["role"], "user")
+        self.assertIn("compressed as follows (v1)", str(messages[2]["content"]))
+        self.assertEqual(messages[3], {"role": "user", "content": "context pressure reminder"})
+        self.assertEqual(messages[4], {"role": "assistant", "content": "latest assistant reply"})
 
 
 class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
@@ -285,6 +341,55 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(unsummarized[0].get("message_index", -1)), 0)
         self.assertEqual(str(unsummarized[0].get("content", "")), "task start")
 
+    async def test_compress_context_includes_current_step_internal_compress_request_message(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+        agent.step_count = 2
+        agent.conversation.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-compress-1",
+                        "type": "function",
+                        "function": {
+                            "name": "compress_context",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        )
+        agent.metadata["message_index_to_step"] = [0, 2]
+        agent.metadata["internal_message_indices"] = [1]
+        llm = RecordingLLMClient([ChatResult(content="compressed summary body", raw_events=[])])
+
+        result = await runtime.compress_context(
+            agent,
+            llm_client=llm,
+            reason="manual",
+        )
+
+        self.assertTrue(bool(result.get("compressed")))
+        summary_request = llm.calls[0]["messages"]
+        assert isinstance(summary_request, list)
+        summary_payload = json.loads(str(summary_request[1]["content"]))
+        unsummarized = summary_payload.get("unsummarized_messages", [])
+        self.assertEqual([int(item.get("message_index", -1)) for item in unsummarized], [0, 1])
+        self.assertNotIn("tool_call_id", unsummarized[0])
+        self.assertNotIn("tool_calls", unsummarized[0])
+        self.assertNotIn("content", unsummarized[1])
+        self.assertNotIn("tool_call_id", unsummarized[1])
+        self.assertEqual(
+            str(unsummarized[1].get("tool_calls", [{}])[0].get("name", "")),
+            "compress_context",
+        )
+
     async def test_compress_context_excludes_compression_ignored_control_messages(self) -> None:
         config = OpenCompanyConfig()
         config.runtime.context.enabled = True
@@ -358,6 +463,57 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
         serialized_request = json.dumps(request_messages, ensure_ascii=False)
         self.assertNotIn("context pressure reminder", serialized_request)
         self.assertNotIn("compress_context", serialized_request)
+
+    async def test_manual_compress_tool_result_advances_boundary_past_internal_result_marker(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+        agent.step_count = 2
+        agent.conversation.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-compress-1",
+                        "type": "function",
+                        "function": {
+                            "name": "compress_context",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        )
+        agent.metadata["message_index_to_step"] = [0, 2]
+        agent.metadata["internal_message_indices"] = [1]
+        llm = RecordingLLMClient([ChatResult(content="compressed summary body", raw_events=[])])
+
+        result = await runtime.compress_context(
+            agent,
+            llm_client=llm,
+            reason="manual",
+        )
+        runtime.append_tool_result(
+            agent,
+            {"type": "compress_context", "_tool_call_id": "call-compress-1"},
+            result,
+        )
+
+        self.assertTrue(bool(result.get("compressed")))
+        self.assertEqual(int(agent.metadata.get("summarized_until_message_index", -1)), 2)
+        internal_indices = [int(value) for value in agent.metadata.get("internal_message_indices", [])]
+        self.assertEqual(internal_indices[-2:], [1, 2])
+        request_messages = runtime.context_assembler.messages(
+            agent,
+            runtime.context_assembler.system_prompt(agent),
+        )
+        serialized_request = json.dumps(request_messages, ensure_ascii=False)
+        self.assertNotIn("compress_context", serialized_request)
+        self.assertNotIn("compressed\": true", serialized_request)
 
     def test_context_pressure_reminder_marks_message_for_compression_exclusion(self) -> None:
         config = OpenCompanyConfig()
@@ -444,6 +600,8 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(int(agent.metadata.get("compression_count", 0)), 1)
         self.assertEqual(int(agent.metadata.get("summarized_until_message_index", -1)), 0)
+        internal_indices = [int(value) for value in agent.metadata.get("internal_message_indices", [])]
+        self.assertEqual(internal_indices[-2:], [1, 2])
 
         event_types = [str(entry.get("event_type", "")) for entry in events]
         self.assertIn("context_compacted", event_types)
@@ -483,6 +641,119 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("Context usage warning" in str(message.get("content", "")) for message in agent.conversation)
         )
+
+    async def test_manual_compress_skips_preflight_forced_compress_for_one_turn_only(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        config.runtime.context.max_context_tokens = 1000
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+
+        manual_compress = RecordingLLMClient([ChatResult(content="compressed summary body", raw_events=[])])
+        result = await runtime.compress_context(
+            agent,
+            llm_client=manual_compress,
+            reason="manual",
+        )
+        self.assertTrue(bool(result.get("compressed")))
+        agent.metadata["current_context_tokens"] = 1600
+
+        first_turn = RecordingLLMClient(
+            [
+                ChatResult(content="", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "first turn",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 1600},
+                ),
+            ]
+        )
+        first_actions = await runtime.ask(agent, llm_client=first_turn)
+        self.assertEqual(first_actions[0].get("type"), "finish")
+        self.assertEqual(len(first_turn.calls), 2)
+        self.assertTrue(
+            all(str(call.get("model", "")) != "compress/model" for call in first_turn.calls)
+        )
+
+        second_turn = RecordingLLMClient(
+            [
+                ChatResult(content="compressed summary body 2", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "second turn",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 800},
+                ),
+            ]
+        )
+        second_actions = await runtime.ask(agent, llm_client=second_turn)
+        self.assertEqual(second_actions[0].get("type"), "finish")
+        self.assertEqual(len(second_turn.calls), 2)
+        self.assertEqual(str(second_turn.calls[0].get("model", "")), "compress/model")
+        self.assertEqual(
+            [str(entry.get("event_type", "")) for entry in events].count("context_limit_forced_compress"),
+            1,
+        )
+
+    async def test_forced_compress_preserves_current_step_messages_for_following_step(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        config.runtime.context.keep_pinned_messages = 0
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+        agent.step_count = 3
+        agent.conversation = [
+            {"role": "user", "content": "older context"},
+            {"role": "assistant", "content": "same-step in-progress detail"},
+        ]
+        agent.metadata["message_index_to_step"] = [1, 3]
+        llm = RecordingLLMClient([ChatResult(content="compressed summary body", raw_events=[])])
+
+        result = await runtime._run_forced_compression(  # type: ignore[attr-defined]
+            agent,
+            llm_client=llm,
+            overflow_detail={"error": "forced"},
+        )
+
+        self.assertTrue(bool(result.get("compressed")))
+        summary_request = llm.calls[0]["messages"]
+        assert isinstance(summary_request, list)
+        summary_payload = json.loads(str(summary_request[1]["content"]))
+        unsummarized = summary_payload.get("unsummarized_messages", [])
+        self.assertEqual([int(item.get("message_index", -1)) for item in unsummarized], [0])
+        self.assertEqual(result.get("step_range"), {"start": 1, "end": 1})
+        self.assertEqual(int(agent.metadata.get("summarized_until_message_index", -1)), 0)
+
+        request_messages = runtime.context_assembler.messages(
+            agent,
+            runtime.context_assembler.system_prompt(agent),
+        )
+        serialized_request = json.dumps(request_messages, ensure_ascii=False)
+        self.assertIn("compressed as follows (v1)", serialized_request)
+        self.assertIn("same-step in-progress detail", serialized_request)
 
     async def test_context_limit_exceeded_forces_preflight_compress(self) -> None:
         config = OpenCompanyConfig()
@@ -537,6 +808,11 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("compressed as follows (v1)", serialized_request_after)
         self.assertNotIn("X" * 256, serialized_request_after)
         self.assertEqual(int(agent.metadata.get("compression_count", 0)), 1)
+        self.assertEqual(int(agent.metadata.get("summarized_until_message_index", -1)), 1)
+        internal_indices = [int(value) for value in agent.metadata.get("internal_message_indices", [])]
+        self.assertEqual(internal_indices[-2:], [2, 3])
+        self.assertEqual(str(agent.conversation[2].get("role", "")), "assistant")
+        self.assertEqual(str(agent.conversation[3].get("role", "")), "tool")
         event_types = [str(entry.get("event_type", "")) for entry in events]
         self.assertIn("context_limit_forced_compress", event_types)
         self.assertIn("context_compacted", event_types)
@@ -548,6 +824,145 @@ class AgentRuntimeContextTests(unittest.IsolatedAsyncioTestCase):
                 if str(entry.get("event_type", "")) == "control_message"
             ],
         )
+
+    async def test_forced_preflight_compress_skips_immediate_repeat_even_if_estimate_stays_high(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        config.runtime.context.max_context_tokens = 2000
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+        agent.conversation = [
+            {"role": "user", "content": "head pinned"},
+            {"role": "assistant", "content": "older detail"},
+        ]
+        agent.metadata["message_index_to_step"] = [0, 1]
+        agent.metadata["current_context_tokens"] = 2600
+
+        original_estimate = runtime._estimate_prompt_tokens
+        runtime._estimate_prompt_tokens = lambda _messages: 2600  # type: ignore[method-assign]
+        llm = RecordingLLMClient(
+            [
+                ChatResult(content="compressed summary body", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "done",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 1400},
+                ),
+            ]
+        )
+        try:
+            actions = await runtime.ask(agent, llm_client=llm)
+        finally:
+            runtime._estimate_prompt_tokens = original_estimate  # type: ignore[method-assign]
+
+        self.assertEqual(actions[0].get("type"), "finish")
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(str(llm.calls[0].get("model", "")), "compress/model")
+        self.assertEqual(
+            str(llm.calls[1].get("model", "")),
+            config.llm.openrouter.model_for_role(agent.role.value),
+        )
+        event_types = [str(entry.get("event_type", "")) for entry in events]
+        self.assertEqual(event_types.count("context_limit_forced_compress"), 1)
+        self.assertEqual(event_types.count("context_compacted"), 1)
+
+    async def test_forced_compress_skips_preflight_for_entire_next_step_with_retries(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.context.enabled = True
+        config.runtime.context.compression_model = "compress/model"
+        config.runtime.context.max_context_tokens = 1000
+        events: list[dict[str, Any]] = []
+        runtime = self._build_runtime(config=config, event_sink=events)
+        agent = self._root_agent()
+        agent.metadata["current_context_tokens"] = 1600
+
+        forced_turn = RecordingLLMClient(
+            [
+                ChatResult(content="compressed summary body", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "forced turn",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 1600},
+                ),
+            ]
+        )
+        forced_actions = await runtime.ask(agent, llm_client=forced_turn)
+        self.assertEqual(forced_actions[0].get("type"), "finish")
+        self.assertEqual(str(forced_turn.calls[0].get("model", "")), "compress/model")
+
+        agent.metadata["current_context_tokens"] = 1600
+        skipped_turn = RecordingLLMClient(
+            [
+                ChatResult(content="", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "skipped turn",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 1600},
+                ),
+            ]
+        )
+        skipped_actions = await runtime.ask(agent, llm_client=skipped_turn)
+        self.assertEqual(skipped_actions[0].get("type"), "finish")
+        self.assertEqual(len(skipped_turn.calls), 2)
+        self.assertTrue(
+            all(str(call.get("model", "")) != "compress/model" for call in skipped_turn.calls)
+        )
+
+        third_turn = RecordingLLMClient(
+            [
+                ChatResult(content="compressed summary body 2", raw_events=[]),
+                ChatResult(
+                    content=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "third turn",
+                                }
+                            ]
+                        }
+                    ),
+                    raw_events=[],
+                    usage={"prompt_tokens": 900},
+                ),
+            ]
+        )
+        third_actions = await runtime.ask(agent, llm_client=third_turn)
+        self.assertEqual(third_actions[0].get("type"), "finish")
+        self.assertEqual(str(third_turn.calls[0].get("model", "")), "compress/model")
 
     def test_usage_helpers_extract_output_cache_and_total_tokens(self) -> None:
         usage = {

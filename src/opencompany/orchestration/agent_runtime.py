@@ -80,6 +80,7 @@ class AgentRuntime:
         )
         agent.status = AgentStatus.RUNNING
         agent.step_count += 1
+        current_step = max(0, int(agent.step_count))
         if not isinstance(agent.metadata, dict):
             agent.metadata = {}
         agent.metadata["model"] = selected_model
@@ -131,14 +132,38 @@ class AgentRuntime:
             )
             metadata["context_limit_tokens"] = context_limit_tokens
             metadata["usage_ratio"] = usage_ratio
+            metadata_changed = False
+            legacy_skip_present = "skip_next_forced_compress_check" in metadata
+            skip_until_step = _safe_int(
+                metadata.get("skip_forced_compress_check_until_step"),
+                default=-1,
+            )
+            legacy_skip_flag = bool(metadata.pop("skip_next_forced_compress_check", False))
+            if legacy_skip_present:
+                metadata_changed = True
+            if legacy_skip_flag:
+                skip_until_step = max(skip_until_step, current_step)
+                metadata["skip_forced_compress_check_until_step"] = skip_until_step
+                metadata_changed = True
+            elif (
+                skip_until_step >= 0
+                and skip_until_step < current_step
+                and "skip_forced_compress_check_until_step" in metadata
+            ):
+                metadata.pop("skip_forced_compress_check_until_step", None)
+                skip_until_step = -1
+                metadata_changed = True
+            skip_forced_compress_check = skip_until_step >= current_step
+            if metadata_changed:
+                self.persist_agent(agent)
             if (
                 self.config.runtime.context.enabled
+                and not skip_forced_compress_check
                 and context_tokens > context_limit_tokens
             ):
-                compression_result = await self.compress_context(
+                compression_result = await self._run_forced_compression(
                     agent,
                     llm_client=llm_client,
-                    reason="forced",
                     overflow_detail={
                         "trigger": "previous_usage_exceeded_max_context_tokens",
                         "current_context_tokens": context_tokens,
@@ -246,10 +271,9 @@ class AgentRuntime:
                     and _is_context_overflow_exception(exc)
                 ):
                     overflow_retry_attempt += 1
-                    compression_result = await self.compress_context(
+                    compression_result = await self._run_forced_compression(
                         agent,
                         llm_client=llm_client,
-                        reason="forced",
                         overflow_detail={"error": str(exc)},
                     )
                     self._log_agent_event(
@@ -275,10 +299,9 @@ class AgentRuntime:
                 and _is_context_overflow_response(result)
             ):
                 overflow_retry_attempt += 1
-                compression_result = await self.compress_context(
+                compression_result = await self._run_forced_compression(
                     agent,
                     llm_client=llm_client,
-                    reason="forced",
                     overflow_detail={"response_error": result.response_error},
                 )
                 self._log_agent_event(
@@ -435,6 +458,8 @@ class AgentRuntime:
         llm_client: OpenRouterClient | Any | None,
         reason: str,
         overflow_detail: dict[str, Any] | None = None,
+        include_current_step_messages: bool = True,
+        advance_boundary_to_conversation_tail: bool = True,
     ) -> dict[str, Any]:
         if not llm_client:
             return {"compressed": False, "error": "OPENROUTER_API_KEY is required."}
@@ -452,11 +477,17 @@ class AgentRuntime:
         summarized_until = _safe_int(metadata.get("summarized_until_message_index"), default=-1)
         internal_indices = _internal_message_indices(agent)
         compression_excluded_indices = _compression_excluded_message_indices(agent)
+        current_step = max(0, int(agent.step_count))
         unsummarized_rows: list[tuple[int, dict[str, Any]]] = []
         for message_index, message in enumerate(agent.conversation):
             if message_index <= summarized_until:
                 continue
-            if message_index in internal_indices:
+            is_current_step_message = (
+                current_step > 0 and _message_step_number(agent, message_index) == current_step
+            )
+            if is_current_step_message and not include_current_step_messages:
+                continue
+            if message_index in internal_indices and not is_current_step_message:
                 continue
             if message_index in compression_excluded_indices:
                 continue
@@ -493,12 +524,7 @@ class AgentRuntime:
                     {
                         "previous_summary": previous_summary,
                         "unsummarized_messages": [
-                            {
-                                "message_index": idx,
-                                "role": str(message.get("role", "")),
-                                "content": str(message.get("content", "")),
-                                "tool_call_id": str(message.get("tool_call_id", "")),
-                            }
+                            _compression_message_payload(idx, message)
                             for idx, message in unsummarized_rows
                         ],
                     }
@@ -543,15 +569,22 @@ class AgentRuntime:
         summary_version = previous_version + 1
         metadata["context_summary"] = latest_summary
         metadata["summary_version"] = summary_version
-        summarized_until_message_index = max(
-            int(message_range["end"]),
-            len(agent.conversation) - 1,
-        )
+        summarized_until_message_index = int(message_range["end"])
+        if advance_boundary_to_conversation_tail:
+            summarized_until_message_index = max(
+                summarized_until_message_index,
+                len(agent.conversation) - 1,
+            )
         metadata["summarized_until_message_index"] = summarized_until_message_index
         metadata["compression_count"] = self._compression_count(agent) + 1
         metadata["last_compacted_message_range"] = message_range
         metadata["last_compacted_step_range"] = step_range
         metadata["skip_next_context_pressure_reminder"] = True
+        metadata.pop("skip_next_forced_compress_check", None)
+        metadata["skip_forced_compress_check_until_step"] = max(
+            _safe_int(metadata.get("skip_forced_compress_check_until_step"), default=-1),
+            max(0, int(agent.step_count)) + 1,
+        )
         context_limit_tokens = self._resolved_context_limit_tokens()
         context_tokens_before = self._last_prompt_tokens(agent)
         next_request_messages = self.context_assembler.messages(
@@ -615,6 +648,62 @@ class AgentRuntime:
             "context_tokens_after": context_tokens_after,
             "context_limit_tokens": context_limit_tokens,
         }
+
+    async def _run_forced_compression(
+        self,
+        agent: AgentNode,
+        *,
+        llm_client: OpenRouterClient | Any | None,
+        overflow_detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        compression_result = await self.compress_context(
+            agent,
+            llm_client=llm_client,
+            reason="forced",
+            overflow_detail=overflow_detail,
+            include_current_step_messages=False,
+            advance_boundary_to_conversation_tail=False,
+        )
+        if bool(compression_result.get("compressed")):
+            self._append_forced_compression_trace(agent, compression_result)
+        return compression_result
+
+    def _append_forced_compression_trace(
+        self,
+        agent: AgentNode,
+        compression_result: dict[str, Any],
+    ) -> None:
+        tool_call_id = (
+            f"forced-compress-{max(1, int(agent.step_count))}-{max(0, len(agent.conversation))}"
+        )
+        request_message = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "compress_context",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        }
+        self.context_store.append_message(
+            agent,
+            request_message,
+            None,
+            {"internal": True, "source": "runtime", "compression_reason": "forced"},
+        )
+        self._mark_latest_conversation_message_internal(agent)
+        self.append_tool_result(
+            agent,
+            {"type": "compress_context", "_tool_call_id": tool_call_id},
+            compression_result,
+            advance_compression_boundary_to_tail=False,
+        )
+        self.persist_agent(agent)
 
     def _compression_count(self, agent: AgentNode) -> int:
         return _safe_int(_context_metadata(agent).get("compression_count"), default=0)
@@ -787,8 +876,7 @@ class AgentRuntime:
                 if step_value > 0:
                     step_values.append(step_value)
         if not step_values:
-            step = max(1, int(agent.step_count))
-            return {"start": step, "end": step}
+            return None
         return {
             "start": min(step_values),
             "end": max(step_values),
@@ -799,6 +887,8 @@ class AgentRuntime:
         agent: AgentNode,
         action: dict[str, Any],
         result: dict[str, Any],
+        *,
+        advance_compression_boundary_to_tail: bool = True,
     ) -> None:
         internal = str(action.get("type", "")).strip() == "compress_context"
         self.context_store.append_message(
@@ -814,6 +904,12 @@ class AgentRuntime:
         )
         if internal:
             self._mark_latest_conversation_message_internal(agent)
+            if bool(result.get("compressed")) and advance_compression_boundary_to_tail:
+                metadata = _context_metadata(agent)
+                metadata["summarized_until_message_index"] = max(
+                    _safe_int(metadata.get("summarized_until_message_index"), default=-1),
+                    len(agent.conversation) - 1,
+                )
         self.persist_agent(agent)
 
 
@@ -876,6 +972,57 @@ def _actions_are_internal_compress(actions: list[dict[str, Any]]) -> bool:
         if str(action.get("type", "")).strip() != "compress_context":
             return False
     return True
+
+
+def _message_step_number(agent: AgentNode, message_index: int) -> int:
+    metadata = _context_metadata(agent)
+    raw_step_map = metadata.get("message_index_to_step")
+    if not isinstance(raw_step_map, list):
+        return 0
+    if message_index < 0 or message_index >= len(raw_step_map):
+        return 0
+    return max(0, _safe_int(raw_step_map[message_index], default=0))
+
+
+def _compression_message_payload(message_index: int, message: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {"message_index": int(message_index)}
+    role = str(message.get("role", "")).strip()
+    if role:
+        payload["role"] = role
+    content = str(message.get("content", ""))
+    if content:
+        payload["content"] = content
+    tool_call_id = str(message.get("tool_call_id", "")).strip()
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+    raw_tool_calls = message.get("tool_calls", [])
+    tool_calls: list[dict[str, Any]] = []
+    if isinstance(raw_tool_calls, list):
+        for tool_call in raw_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            normalized = _compression_tool_call_payload(tool_call)
+            if normalized:
+                tool_calls.append(normalized)
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    return payload
+
+
+def _compression_tool_call_payload(tool_call: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    tool_call_id = str(tool_call.get("id", "")).strip()
+    if tool_call_id:
+        payload["id"] = tool_call_id
+    function_payload = tool_call.get("function", {})
+    function = function_payload if isinstance(function_payload, dict) else {}
+    name = str(function.get("name", "")).strip()
+    if name:
+        payload["name"] = name
+    arguments = str(function.get("arguments", ""))
+    if arguments:
+        payload["arguments"] = arguments
+    return payload
 
 
 def _safe_int(value: Any, *, default: int) -> int:

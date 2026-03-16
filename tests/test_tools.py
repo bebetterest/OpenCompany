@@ -88,6 +88,24 @@ class ToolDefinitionTests(unittest.TestCase):
             "仅 worker 使用的建议字段。worker 在 status 为 'partial' 或 'failed' 时必须提供；root 会忽略该字段。",
         )
 
+        compress_tool = _tool_by_name(tools, "compress_context")
+        compress_function = compress_tool["function"]
+        assert isinstance(compress_function, dict)
+        self.assertEqual(
+            compress_function["description"],
+            "当上下文较多且任务进入新阶段、适合对之前上下文减负时使用。压缩会抹除具体轨迹细节，因此应尽量在可分割节点调用。调用 compress_context 时不要在同一轮同时调用其他工具，以免造成干扰。",
+        )
+
+    def test_compress_context_tool_definition_warns_against_mixing_other_tools(self) -> None:
+        tools = tool_definitions_for_role(AgentRole.ROOT, "en")
+        compress_tool = _tool_by_name(tools, "compress_context")
+        function = compress_tool["function"]
+        assert isinstance(function, dict)
+        self.assertEqual(
+            function["description"],
+            "Use this when context is long and work has entered a new phase where earlier history can be compacted. Compression removes fine-grained trajectory details, so call it at a clean split point whenever possible. Do not call other tools in the same response as compress_context; use it alone to avoid interference.",
+        )
+
     def test_tool_locales_share_the_same_schema_shape(self) -> None:
         english_tools = tool_definitions_for_role(AgentRole.WORKER, "en")
         chinese_tools = tool_definitions_for_role(AgentRole.WORKER, "zh")

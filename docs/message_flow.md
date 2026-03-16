@@ -31,20 +31,26 @@ Live `Agents` views (TUI/Web UI) should rebuild primary conversation content fro
 Every `AgentRuntime.ask()` call assembles:
 
 ```python
-messages = [
-    {"role": "system", "content": system_prompt},
-    *agent.conversation,
-]
+messages = [{"role": "system", "content": system_prompt}, *prompt_window]
 ```
 
 Where:
 
 - `system_prompt` is selected by role (`root` or `worker`) and locale.
+- `prompt_window` always excludes internal compression traces.
+- Without summary: `prompt_window = all non-internal messages`.
+- With summary: `prompt_window = pinned head messages + synthetic summary + non-internal messages after summarized_until_message_index`.
 - `tools` is selected by role from configurable runtime tool registry.
 - Both roles share the same terminal tool name: `finish`.
 - `agent_prompt` runtime events expose both views from the same snapshot:
   - `request_messages`: exact payload sent to the LLM API
   - `messages`: conversation-only view (`request_messages` without the leading `system` message)
+
+Live message pagination mirrors the same prompt window:
+
+- `/api/session/{id}/messages` and `orchestrator.list_session_messages(...)` annotate each message with `prompt_visible` and `prompt_bucket`.
+- `prompt_bucket` is one of `pinned`, `tail`, `hidden_middle`, `internal`.
+- UI live panels render only `prompt_visible=true` messages, then insert the synthetic summary row between the last `pinned` message and the first `tail` message.
 
 ## Tool runs as first-class state
 

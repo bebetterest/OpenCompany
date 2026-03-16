@@ -45,6 +45,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 - output: `compressed`, `reason`, `summary_version`, `message_range`, `step_range`, `context_tokens_before`, `context_tokens_after`, `context_limit_tokens`
 - output may include `error` when compression is disabled, misconfigured, or no-op
 - execution scope is current agent only (no cross-agent compression)
+- tool definition guidance: call `compress_context` alone in that response; do not mix it with other tool calls unless runtime has to recover from model output
 - tool-call/control traces from `compress_context` are marked internal and excluded from later LLM requests
 - timeout budget is configurable via `runtime.tool_timeouts.actions.compress_context` (default `180s`)
 
@@ -59,6 +60,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 - message slice semantics: `[messages_start, messages_end)` where `messages_end` is exclusive
 - `messages_start/messages_end` support negative indexes from the tail (e.g. `-1` means the last message)
 - when slice params are omitted, defaults to the last 1 message
+- soft-injected runtime reminder messages (for example context-pressure warnings and root/worker soft-step reminders) are omitted before slicing, so returned indexes/counts are based on the filtered visible message list
 - max returned messages per call: 5 (messages can be long; avoid large fetches)
 - invalid range inputs return explicit errors (out-of-range index, or normalized `end < start`)
 - output: `agent_run` overview + `messages`

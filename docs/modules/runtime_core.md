@@ -52,11 +52,12 @@ Behavioral effects:
 Runtime context compression is controlled by `[runtime.context]`:
 
 - `reminder_ratio` (default `0.8`): when latest prompt usage crosses this ratio, runtime injects a per-turn compression reminder.
-- `keep_pinned_messages` (default `1`): preserved head messages when summary mode is active.
+- `keep_pinned_messages` (default `1`): preserved head message count when summary mode is active; this is a message count, not a step count.
 - `max_context_tokens` (required, `> 0`): the single source of truth for context window size.
 - `compression_model` (required at compression time): fixed model used only for compression.
 - `overflow_retry_attempts` (default `1`): number of forced-compress + retry attempts after overflow detection.
 - preflight enforcement: before each LLM call, runtime checks previous real input usage (`current_context_tokens`) and forces `compress_context` when it exceeds `max_context_tokens` (even if provider has not returned an overflow error yet).
+- after any successful manual or forced compression, runtime skips that preflight forced-compress check for the entire next agent step; if that next step retries internally, all retries in that step keep skipping the preflight check.
 - compression-call timeout: uses `runtime.tool_timeouts.actions.compress_context` (default `180s`).
 
 Context-limit source:
@@ -68,6 +69,11 @@ Compression algorithm is replacement-based:
 - input: `previous_summary + unsummarized_messages`
 - output: `latest_summary` (overwrites previous summary, no summary concatenation)
 - soft-threshold reminder messages (`root_loop_force_finalize`, worker step-limit reminders) and context-pressure reminder messages are excluded from compression input
+- the current step's compression-request message is still included in compression input, even though it remains internal for normal prompt/UI assembly
+- forced compression excludes the current in-flight step from compression input/range, because runtime continues that same step after compressing and the next step still needs those in-flight messages in prompt context
+- if a step emits `compress_context` together with other tools, runtime executes compression after the other tools finish so their final tool results are already present in compression input
+- if a step incorrectly emits `finish` together with tools, runtime still defers `finish` until after the non-terminal tools and any `compress_context` complete, so compression is not skipped by action order
+- successful forced compression also writes back internal request/result trace markers; `summarized_until_message_index` stays at the last actually summarized non-current-step message so the in-flight step remains available to the following step
 - metadata persistence: `context_summary`, `summary_version`, `summarized_until_message_index`, `compression_count`, `last_compacted_message_range`, `last_compacted_step_range`
 - derived logs: `<agent_id>_summaries.jsonl`
 

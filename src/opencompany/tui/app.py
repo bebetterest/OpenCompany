@@ -159,6 +159,7 @@ class AgentRuntimeView:
     summarized_until_message_index: int | None = None
     last_compacted_step_range: str = ""
     compacted_step_ranges: list[tuple[int, int]] = field(default_factory=list)
+    pinned_prompt_steps: set[int] = field(default_factory=set)
     model: str = ""
     next_message_step: int = 1
     last_message_index: int = -1
@@ -2874,7 +2875,11 @@ class OpenCompanyApp(App):
                 activity_log = self._query_optional("#activity_log", RichLog)
                 if activity_log is not None:
                     activity_log.write(self._format_event(record))
-            if self._should_sync_messages_for_event(record):
+            if self._should_reload_messages_for_event(record):
+                session_id = self._active_session_id()
+                if session_id:
+                    self._reload_session_messages(session_id)
+            elif self._should_sync_messages_for_event(record):
                 await self._sync_session_messages_incremental()
         except asyncio.CancelledError:
             self._log_diagnostic("runtime_update_cancelled", level="warning")
@@ -2910,6 +2915,13 @@ class OpenCompanyApp(App):
             "child_summaries_received",
             "agent_completed",
         }
+
+    def _should_reload_messages_for_event(self, record: dict[str, Any]) -> bool:
+        if self._history_replay_in_progress:
+            return False
+        if not self._active_session_id():
+            return False
+        return str(record.get("event_type", "")) == "context_compacted"
 
     def on_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
         self._remember_collapsible_toggle(event.collapsible, expanded=True)
@@ -4763,6 +4775,7 @@ class OpenCompanyApp(App):
             state.step_entries = {}
             state.step_order = []
             state.stream_entries = []
+            state.pinned_prompt_steps = set()
             state.next_message_step = 1
             state.last_message_index = -1
             state.output_tokens_total = 0
@@ -4812,9 +4825,24 @@ class OpenCompanyApp(App):
         message_index = self._safe_int(record.get("message_index"), default=-1)
         if message_index <= state.last_message_index:
             return
-        hidden_from_step_view = bool(record.get("internal", False)) or bool(
-            record.get("exclude_from_context_compression", False)
+        prompt_visible = (
+            record.get("prompt_visible")
+            if isinstance(record.get("prompt_visible"), bool)
+            else None
         )
+        if prompt_visible is None:
+            prompt_visible = not bool(record.get("internal", False)) and not bool(
+                record.get("exclude_from_context_compression", False)
+            )
+        prompt_bucket = str(record.get("prompt_bucket", "")).strip()
+        if not prompt_bucket:
+            if bool(record.get("internal", False)):
+                prompt_bucket = "internal"
+            elif prompt_visible:
+                prompt_bucket = "tail"
+            else:
+                prompt_bucket = "hidden_middle"
+        hidden_from_step_view = (not prompt_visible) or prompt_bucket == "internal"
         if hidden_from_step_view:
             state.last_message_index = max(state.last_message_index, message_index)
             return
@@ -4878,6 +4906,8 @@ class OpenCompanyApp(App):
             if user_body:
                 self._append_step_stream_entry(state, step_number, "user_message", user_body)
                 state.step_count = max(state.step_count, step_number)
+        if prompt_bucket == "pinned":
+            state.pinned_prompt_steps.add(step_number)
         state.last_message_index = message_index
 
     def _non_message_entries(self, state: AgentRuntimeView) -> list[tuple[int, str, str]]:
@@ -5133,43 +5163,8 @@ class OpenCompanyApp(App):
             )
             return
         if event_type == "control_message":
-            control_text = self._control_message_stream_text(details)
-            if control_text:
-                control_kind = str(details.get("kind", "")).strip()
-                entry_kind = (
-                    "control"
-                    if control_kind == "context_pressure_reminder"
-                    else self._extra_kind("control")
-                )
-                self._append_step_stream_entry(
-                    state,
-                    step_number,
-                    entry_kind,
-                    control_text,
-                )
             return
         if event_type == "context_compacted":
-            compacted = self._normalize_step_range(details.get("step_range"))
-            if compacted is not None:
-                start_step, end_step = compacted
-                if end_step > start_step:
-                    body = (
-                        f"{self.translator.text('compressed_block_label')} "
-                        f"({self.translator.text('step_label')} {start_step}-{end_step})"
-                    )
-                else:
-                    body = (
-                        f"{self.translator.text('compressed_block_label')} "
-                        f"({self.translator.text('step_label')} {start_step})"
-                    )
-            else:
-                body = self.translator.text("compressed_block_label")
-            self._append_step_stream_entry(
-                state,
-                step_number,
-                self._extra_kind("summary"),
-                body,
-            )
             return
         if event_type == "protocol_error":
             self._append_step_stream_entry(
@@ -8372,20 +8367,21 @@ class OpenCompanyApp(App):
         real_steps = self._real_step_order(state)
         if not self._has_context_summary(state):
             return real_steps
-        pinned_steps = self._pinned_head_steps(state, real_steps)
+        pinned_steps = [
+            step_number
+            for step_number in real_steps
+            if step_number in state.pinned_prompt_steps
+        ]
         pinned_set = set(pinned_steps)
-        summarized_steps = self._summarized_step_numbers(state)
         unsummarized_steps = [
             step_number
             for step_number in real_steps
-            if step_number not in pinned_set and step_number not in summarized_steps
+            if step_number not in pinned_set
         ]
         return [*pinned_steps, 0, *unsummarized_steps]
 
     def _has_context_summary(self, state: AgentRuntimeView) -> bool:
-        if str(state.context_latest_summary or "").strip():
-            return True
-        return max(0, int(state.summary_version)) > 0
+        return bool(str(state.context_latest_summary or "").strip())
 
     def _real_step_order(self, state: AgentRuntimeView) -> list[int]:
         candidates: list[int] = []
@@ -8407,28 +8403,6 @@ class OpenCompanyApp(App):
             candidates.append(max(state.step_count, 1))
         return sorted(set(candidates))
 
-    def _pinned_head_steps(
-        self,
-        state: AgentRuntimeView,
-        real_steps: list[int] | None = None,
-    ) -> list[int]:
-        ordered = real_steps if real_steps is not None else self._real_step_order(state)
-        if not ordered:
-            return []
-        keep_count = max(0, int(state.keep_pinned_messages))
-        if keep_count <= 0:
-            return []
-        return ordered[: min(keep_count, len(ordered))]
-
-    def _summarized_step_numbers(self, state: AgentRuntimeView) -> set[int]:
-        summarized: set[int] = set()
-        for start_step, end_step in sorted(state.compacted_step_ranges):
-            if start_step <= 0 or end_step < start_step:
-                continue
-            for step_number in range(start_step, end_step + 1):
-                summarized.add(step_number)
-        return summarized
-
     def _entries_for_step(self, state: AgentRuntimeView, step_number: int) -> list[tuple[str, str]]:
         def _visible(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
             return [
@@ -8449,14 +8423,6 @@ class OpenCompanyApp(App):
                 step_entries = _visible(list(state.stream_entries))
             else:
                 step_entries = []
-        if not self._has_context_summary(state):
-            return step_entries
-        pinned_set = set(self._pinned_head_steps(state))
-        if step_number in pinned_set:
-            return step_entries
-        summarized_steps = self._summarized_step_numbers(state)
-        if step_number in summarized_steps:
-            return []
         return step_entries
 
     def _is_live_step_collapsed(self, agent_id: str, step_number: int, latest_step: int) -> bool:
