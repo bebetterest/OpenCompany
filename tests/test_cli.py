@@ -60,6 +60,9 @@ class CliParserTests(unittest.TestCase):
         args = build_parser().parse_args(["run", "inspect repo"])
         self.assertEqual(args.project_dir, ".")
         self.assertIsNone(args.workspace_mode)
+        self.assertIsNone(args.sandbox_backend)
+        self.assertIsNone(args.model)
+        self.assertIsNone(args.root_agent_name)
         self.assertFalse(args.debug)
         self.assertEqual(args.preview_chars, 256)
 
@@ -71,6 +74,23 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(run_args.workspace_mode, "staged")
         self.assertEqual(tui_args.workspace_mode, "direct")
         self.assertEqual(ui_args.workspace_mode, "staged")
+
+    def test_run_accepts_sandbox_backend_model_and_root_agent_name(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--sandbox-backend",
+                "none",
+                "--model",
+                "fake/model",
+                "--root-agent-name",
+                "Demo Root",
+                "inspect repo",
+            ]
+        )
+        self.assertEqual(args.sandbox_backend, "none")
+        self.assertEqual(args.model, "fake/model")
+        self.assertEqual(args.root_agent_name, "Demo Root")
 
     def test_run_tui_and_ui_accept_remote_flags(self) -> None:
         run_args = build_parser().parse_args(
@@ -202,6 +222,21 @@ class CliParserTests(unittest.TestCase):
         )
         self.assertEqual(run_args.preview_chars, 512)
         self.assertEqual(resume_args.preview_chars, 512)
+
+    def test_resume_accepts_sandbox_backend_and_model(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "resume",
+                "session-123",
+                "continue from latest status",
+                "--sandbox-backend",
+                "anthropic",
+                "--model",
+                "fake/model",
+            ]
+        )
+        self.assertEqual(args.sandbox_backend, "anthropic")
+        self.assertEqual(args.model, "fake/model")
 
     def test_resume_requires_instruction(self) -> None:
         with self.assertRaises(SystemExit):
@@ -1024,45 +1059,224 @@ class CliRunResumePanelTests(unittest.TestCase):
         self.assertNotIn("goal=", rendered)
         self.assertNotIn("\x1b[?25l", rendered)
 
-    def test_run_passes_workspace_mode_when_explicitly_requested(self) -> None:
+    def test_run_passes_workspace_mode_model_root_agent_name_and_backend(self) -> None:
         captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
 
-        class _FakeOrchestrator:
-            def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
-                del project_dir, locale, app_dir, debug
-                self.locale = "en"
-                self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
-
-            async def run_task(self, task: str, workspace_mode: str | None = None):  # type: ignore[no-untyped-def]
-                captured["task"] = task
-                captured["workspace_mode"] = workspace_mode
-                return SimpleNamespace(
-                    id="session-123",
-                    root_agent_id="agent-root",
-                    status=SimpleNamespace(value="completed"),
-                    completion_state="completed",
-                    final_summary="done",
-                )
-
-            def project_sync_status(self, _session_id: str):  # type: ignore[no-untyped-def]
-                return {"status": "disabled"}
-
-        with patch.object(cli, "Orchestrator", _FakeOrchestrator):
-            output = io.StringIO()
-            with redirect_stdout(output):
-                asyncio.run(
-                    cli._run_task(
-                        project_dir=Path("."),
-                        app_dir=None,
-                        locale="en",
-                        task="inspect repo",
-                        debug=False,
-                        workspace_mode="staged",
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.locale = "en"
+                    self.app_dir = (
+                        Path(app_dir).resolve()
+                        if app_dir is not None
+                        else Path(temp_dir).resolve()
                     )
-                )
+                    self.config = SimpleNamespace(sandbox=SimpleNamespace(backend="anthropic"))
+                    self.tool_executor = SimpleNamespace(
+                        sandbox_backend_cls="backend::anthropic",
+                        _shell_backend_instance="cached",
+                    )
+                    self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
+                    captured["orchestrator"] = self
+
+                async def run_task(self, task: str, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["task"] = task
+                    captured["run_kwargs"] = dict(kwargs)
+                    return SimpleNamespace(
+                        id="session-123",
+                        root_agent_id="agent-root",
+                        status=SimpleNamespace(value="completed"),
+                        completion_state="completed",
+                        final_summary="done",
+                    )
+
+                def project_sync_status(self, _session_id: str):  # type: ignore[no-untyped-def]
+                    return {"status": "disabled"}
+
+            with (
+                patch.object(cli, "Orchestrator", _FakeOrchestrator),
+                patch.object(
+                    cli,
+                    "resolve_sandbox_backend_cls",
+                    side_effect=lambda sandbox: f"backend::{sandbox.backend}",
+                ),
+            ):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._run_task(
+                            project_dir=Path("."),
+                            app_dir=app_dir,
+                            locale="en",
+                            task="inspect repo",
+                            debug=False,
+                            workspace_mode="staged",
+                            model="fake/model",
+                            root_agent_name="Demo Root",
+                            sandbox_backend="none",
+                        )
+                    )
 
         self.assertEqual(captured["task"], "inspect repo")
-        self.assertEqual(captured["workspace_mode"], "staged")
+        self.assertEqual(
+            captured["run_kwargs"],
+            {
+                "model": "fake/model",
+                "root_agent_name": "Demo Root",
+                "workspace_mode": "staged",
+            },
+        )
+        orchestrator = captured["orchestrator"]
+        self.assertEqual(orchestrator.config.sandbox.backend, "none")
+        self.assertEqual(orchestrator.tool_executor.sandbox_backend_cls, "backend::none")
+        self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
+
+    def test_run_defaults_sandbox_backend_from_config_when_omitted(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text(
+                '[sandbox]\nbackend = "none"\n',
+                encoding="utf-8",
+            )
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.locale = "en"
+                    self.app_dir = (
+                        Path(app_dir).resolve()
+                        if app_dir is not None
+                        else Path(temp_dir).resolve()
+                    )
+                    self.config = SimpleNamespace(sandbox=SimpleNamespace(backend="anthropic"))
+                    self.tool_executor = SimpleNamespace(
+                        sandbox_backend_cls="backend::anthropic",
+                        _shell_backend_instance="cached",
+                    )
+                    self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
+                    captured["orchestrator"] = self
+
+                async def run_task(self, task: str, **kwargs):  # type: ignore[no-untyped-def]
+                    del task, kwargs
+                    return SimpleNamespace(
+                        id="session-123",
+                        root_agent_id="agent-root",
+                        status=SimpleNamespace(value="completed"),
+                        completion_state="completed",
+                        final_summary="done",
+                    )
+
+                def project_sync_status(self, _session_id: str):  # type: ignore[no-untyped-def]
+                    return {"status": "disabled"}
+
+            with (
+                patch.object(cli, "Orchestrator", _FakeOrchestrator),
+                patch.object(
+                    cli,
+                    "resolve_sandbox_backend_cls",
+                    side_effect=lambda sandbox: f"backend::{sandbox.backend}",
+                ),
+            ):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._run_task(
+                            project_dir=Path("."),
+                            app_dir=app_dir,
+                            locale="en",
+                            task="inspect repo",
+                            debug=False,
+                        )
+                    )
+
+        orchestrator = captured["orchestrator"]
+        self.assertEqual(orchestrator.config.sandbox.backend, "none")
+        self.assertEqual(orchestrator.tool_executor.sandbox_backend_cls, "backend::none")
+        self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
+
+    def test_resume_passes_model_and_applies_sandbox_backend_before_load(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.locale = "en"
+                    self.app_dir = (
+                        Path(app_dir).resolve()
+                        if app_dir is not None
+                        else Path(temp_dir).resolve()
+                    )
+                    self.config = SimpleNamespace(sandbox=SimpleNamespace(backend="anthropic"))
+                    self.tool_executor = SimpleNamespace(
+                        sandbox_backend_cls="backend::anthropic",
+                        _shell_backend_instance="cached",
+                    )
+                    self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
+                    captured["orchestrator"] = self
+
+                def load_session_context(self, session_id: str):  # type: ignore[no-untyped-def]
+                    captured["loaded_session_id"] = session_id
+                    captured["load_backend"] = self.config.sandbox.backend
+                    captured["load_backend_cls"] = self.tool_executor.sandbox_backend_cls
+                    return SimpleNamespace(id="session-copy-123")
+
+                async def resume(self, session_id: str, instruction: str, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["resumed_session_id"] = session_id
+                    captured["instruction"] = instruction
+                    captured["resume_kwargs"] = dict(kwargs)
+                    captured["resume_backend"] = self.config.sandbox.backend
+                    captured["resume_backend_cls"] = self.tool_executor.sandbox_backend_cls
+                    return SimpleNamespace(
+                        id=session_id,
+                        root_agent_id="agent-root",
+                        status=SimpleNamespace(value="completed"),
+                        completion_state="completed",
+                        final_summary="Session resumed.",
+                    )
+
+                def project_sync_status(self, _session_id: str):  # type: ignore[no-untyped-def]
+                    return {"status": "disabled"}
+
+            with (
+                patch.object(cli, "Orchestrator", _FakeOrchestrator),
+                patch.object(
+                    cli,
+                    "resolve_sandbox_backend_cls",
+                    side_effect=lambda sandbox: f"backend::{sandbox.backend}",
+                ),
+                patch.object(cli, "_maybe_prompt_remote_password_for_session", return_value=None),
+            ):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._resume(
+                            app_dir=app_dir,
+                            locale="en",
+                            session_id="session-123",
+                            instruction="continue from latest status",
+                            debug=False,
+                            model="fake/model",
+                            sandbox_backend="none",
+                        )
+                    )
+
+        self.assertEqual(captured["loaded_session_id"], "session-123")
+        self.assertEqual(captured["resumed_session_id"], "session-copy-123")
+        self.assertEqual(captured["instruction"], "continue from latest status")
+        self.assertEqual(captured["resume_kwargs"], {"model": "fake/model"})
+        self.assertEqual(captured["load_backend"], "none")
+        self.assertEqual(captured["resume_backend"], "none")
+        self.assertEqual(captured["load_backend_cls"], "backend::none")
+        self.assertEqual(captured["resume_backend_cls"], "backend::none")
+        orchestrator = captured["orchestrator"]
+        self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
 
     def test_run_tty_panel_includes_agent_fields(self) -> None:
         output = self._TTYBuffer()

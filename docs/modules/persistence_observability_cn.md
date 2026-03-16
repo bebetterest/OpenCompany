@@ -66,6 +66,8 @@ CLI：
 
 - `opencompany run <task>` / `opencompany resume <session_id> "<instruction>"`（交互式终端显示简洁动态状态面板；非交互输出保持纯文本）
   - 可选 `--preview-chars N` 用于限制各字段实时预览长度（默认 `256`）
+  - 可选 `--sandbox-backend <name>` 仅覆盖本次调用的 `[sandbox].backend`
+  - `run` 还支持 `--model <model>` 与 `--root-agent-name <name>`；`resume` 还支持 `--model <model>`
 - `opencompany export-logs <session_id>`
 - `opencompany export-logs <session_id> --export-path /tmp/session-export.json`
 - `opencompany messages <session_id> ...`

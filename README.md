@@ -137,6 +137,16 @@ Run in staged mode:
 opencompany run --workspace-mode staged "Inspect this repository and propose next engineering steps."
 ```
 
+Run with an explicit sandbox backend, model, and root agent name:
+
+```bash
+opencompany run \
+  --sandbox-backend none \
+  --model openai/gpt-4.1-mini \
+  --root-agent-name "Planner Root" \
+  "Inspect this repository and propose next engineering steps."
+```
+
 Run in direct mode against remote SSH workspace:
 
 ```bash
@@ -153,6 +163,7 @@ Continue an existing session:
 
 ```bash
 opencompany resume <session_id> "new instruction"
+opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
 ```
 
 Apply / undo staged project sync:
@@ -207,6 +218,8 @@ Notes:
 - `opencompany run` and `opencompany resume` show a live status panel in interactive terminals.
 - Panel supports auto pagination every `5s`; press `=` / `+` / `-` for manual page switching.
 - Use `--preview-chars N` to adjust per-field preview width (default `256`).
+- Use `--sandbox-backend <name>` on `run` / `resume` to override `[sandbox].backend` for that invocation only.
+- `opencompany run` also accepts `--model <model>` and `--root-agent-name <name>`; `opencompany resume` also accepts `--model <model>`.
 
 ## ⚙️ Configuration and debugging
 

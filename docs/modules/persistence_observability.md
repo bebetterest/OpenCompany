@@ -66,6 +66,8 @@ CLI exposes:
 
 - `opencompany run <task>` / `opencompany resume <session_id> "<instruction>"` (interactive terminals render a compact live panel; non-interactive output remains plain text)
   - optional `--preview-chars N` limits per-field live preview length (default `256`)
+  - optional `--sandbox-backend <name>` overrides `[sandbox].backend` for that invocation only
+  - `run` also accepts `--model <model>` and `--root-agent-name <name>`; `resume` also accepts `--model <model>`
 - `opencompany export-logs <session_id>`
 - `opencompany export-logs <session_id> --export-path /tmp/session-export.json`
 - `opencompany messages <session_id> ...`
