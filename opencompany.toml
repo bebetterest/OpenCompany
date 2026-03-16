@@ -28,8 +28,8 @@ worker_model = ""
 # 单次请求超时（秒）
 # Per-request timeout in seconds
 timeout_seconds = 120
-# OpenRouter 请求失败时的最大重试次数（可重试网络错误/限流 429/瞬时 5xx）
-# Max retries for failed OpenRouter requests (retryable network errors/429/transient 5xx)
+# OpenRouter 请求失败时的最大重试次数（可重试网络错误 + 全部 HTTP 错误状态码）
+# Max retries for failed OpenRouter requests (retryable network errors + all HTTP error status codes)
 max_retries = 8
 # 重试退避基线秒数（第 n 次重试等待 retry_backoff_seconds * 2^(n-1)）
 # Retry backoff base seconds (nth retry waits retry_backoff_seconds * 2^(n-1))

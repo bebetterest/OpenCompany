@@ -27,7 +27,7 @@
     "type": "function",
     "function": {
       "name": "compress_context",
-      "description": "当上下文较多且任务进入新阶段、适合对之前上下文减负时使用。压缩会抹除具体轨迹细节，因此应尽量在可分割节点调用。",
+      "description": "当上下文较多且任务进入新阶段、适合对之前上下文减负时使用。压缩会抹除具体轨迹细节，因此应尽量在可分割节点调用。调用 compress_context 时不要在同一轮同时调用其他工具，以免造成干扰。",
       "parameters": {
         "type": "object",
         "properties": {},

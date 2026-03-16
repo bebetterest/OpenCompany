@@ -27,7 +27,7 @@
     "type": "function",
     "function": {
       "name": "compress_context",
-      "description": "Use this when context is long and work has entered a new phase where earlier history can be compacted. Compression removes fine-grained trajectory details, so call it at a clean split point whenever possible.",
+      "description": "Use this when context is long and work has entered a new phase where earlier history can be compacted. Compression removes fine-grained trajectory details, so call it at a clean split point whenever possible. Do not call other tools in the same response as compress_context; use it alone to avoid interference.",
       "parameters": {
         "type": "object",
         "properties": {},

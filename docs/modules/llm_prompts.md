@@ -25,8 +25,13 @@ The SSE parser merges:
 
 Retry behavior exists for:
 
-- transport/API failures before the first streamed event (`max_retries`, exponential backoff + jitter; includes rate-limit `429`, transient 5xx such as `520`, and respects server retry hints like `Retry-After`/`RateLimit-Reset` when present)
+- transport/API failures before the first streamed event (`max_retries`, exponential backoff + jitter; retries all HTTP error status codes `4xx/5xx`, plus retryable transport errors, and respects server retry hints like `Retry-After`/`RateLimit-Reset` when present)
 - empty stream responses under guarded conditions
+
+Runtime event logging for observability:
+
+- `llm_retry`: emitted when OpenRouter retries, including `status_code`, `status_text`, attempt counters, delay, and retry reason
+- `llm_request_error`: emitted when an OpenRouter request fails and bubbles up, including HTTP status metadata when available
 
 ## Protocol Normalization
 

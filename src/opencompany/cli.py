@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
     termios = None  # type: ignore[assignment]
     tty = None  # type: ignore[assignment]
 
+from opencompany.config import OpenCompanyConfig
 from opencompany.logging import DiagnosticLogger, diagnostics_path_for_app
 from opencompany.models import RemoteSessionConfig, WorkspaceMode
 from opencompany.orchestrator import Orchestrator, default_app_dir
@@ -34,6 +35,7 @@ from opencompany.remote import (
     load_remote_session_password,
     normalize_remote_session_config,
 )
+from opencompany.sandbox.registry import available_sandbox_backends, resolve_sandbox_backend_cls
 
 
 def _cli_diagnostics(app_dir: Path | None) -> tuple[Path, DiagnosticLogger]:
@@ -41,9 +43,64 @@ def _cli_diagnostics(app_dir: Path | None) -> tuple[Path, DiagnosticLogger]:
     return resolved_app_dir, DiagnosticLogger(diagnostics_path_for_app(resolved_app_dir))
 
 
+def _available_sandbox_backend_names() -> tuple[str, ...]:
+    backends = tuple(
+        str(name).strip().lower()
+        for name in available_sandbox_backends()
+        if str(name).strip()
+    )
+    if backends:
+        return backends
+    return ("anthropic", "none")
+
+
+def _normalize_sandbox_backend(
+    backend: str | None,
+    *,
+    fallback: str | None = None,
+) -> str:
+    candidate = str(backend or "").strip().lower()
+    available = _available_sandbox_backend_names()
+    if candidate in available:
+        return candidate
+    fallback_candidate = str(fallback or "").strip().lower()
+    if fallback_candidate in available:
+        return fallback_candidate
+    return available[0]
+
+
+def _default_sandbox_backend_from_config(app_dir: Path | None) -> str:
+    try:
+        configured = str(OpenCompanyConfig.load((app_dir or default_app_dir()).resolve()).sandbox.backend).strip()
+    except Exception:
+        configured = ""
+    return _normalize_sandbox_backend(configured, fallback="anthropic")
+
+
+def _apply_sandbox_backend(
+    orchestrator: Orchestrator,
+    backend: str | None,
+) -> str:
+    default_backend = _default_sandbox_backend_from_config(
+        getattr(orchestrator, "app_dir", None)
+    )
+    backend_name = _normalize_sandbox_backend(backend, fallback=default_backend)
+    config = getattr(orchestrator, "config", None)
+    tool_executor = getattr(orchestrator, "tool_executor", None)
+    if config is not None and hasattr(config, "sandbox"):
+        config.sandbox.backend = backend_name
+        backend_cls = resolve_sandbox_backend_cls(config.sandbox)
+        if tool_executor is not None and hasattr(tool_executor, "sandbox_backend_cls"):
+            tool_executor.sandbox_backend_cls = backend_cls
+    if tool_executor is not None and hasattr(tool_executor, "_shell_backend_instance"):
+        tool_executor._shell_backend_instance = None
+    return backend_name
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="opencompany")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    sandbox_backend_choices = _available_sandbox_backend_names()
 
     def add_remote_options(target_parser: argparse.ArgumentParser) -> None:
         target_parser.add_argument(
@@ -86,8 +143,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace mode for new sessions (defaults to direct).",
     )
+    run_parser.add_argument(
+        "--sandbox-backend",
+        choices=sandbox_backend_choices,
+        default=None,
+        help="Override sandbox backend for this run only (defaults to [sandbox].backend).",
+    )
     run_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
     run_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    run_parser.add_argument("--model", default=None, help="Override model for this run")
+    run_parser.add_argument(
+        "--root-agent-name",
+        default=None,
+        help="Optional custom display name for the root coordinator in this run.",
+    )
     run_parser.add_argument(
         "--preview-chars",
         type=int,
@@ -112,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("instruction", help="New instruction appended as a root user message")
     resume_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
     resume_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    resume_parser.add_argument(
+        "--sandbox-backend",
+        choices=sandbox_backend_choices,
+        default=None,
+        help="Override sandbox backend for this resume only (defaults to [sandbox].backend).",
+    )
+    resume_parser.add_argument("--model", default=None, help="Override model for this resume")
     resume_parser.add_argument(
         "--preview-chars",
         type=int,
@@ -1696,9 +1772,15 @@ async def _run_task(
     workspace_mode: str | None = None,
     remote_config: RemoteSessionConfig | None = None,
     remote_password: str | None = None,
+    model: str | None = None,
+    root_agent_name: str | None = None,
+    sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
     orchestrator = Orchestrator(project_dir, locale=locale, app_dir=app_dir, debug=debug)
+    resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
+    resolved_model = str(model or "").strip() or None
+    resolved_root_agent_name = str(root_agent_name or "").strip() or None
     panel: _RunStatusPanel | None = None
     if _run_status_panel_enabled():
         panel = _RunStatusPanel(
@@ -1711,11 +1793,22 @@ async def _run_task(
     orchestrator.diagnostics.log(
         component="cli",
         event_type="run_command_started",
-        payload={"project_dir": str(project_dir), "task": task, "locale": locale},
+        payload={
+            "project_dir": str(project_dir),
+            "task": task,
+            "locale": locale,
+            "sandbox_backend": resolved_sandbox_backend,
+            "model": resolved_model,
+            "root_agent_name": resolved_root_agent_name,
+        },
     )
     session = None
     try:
         run_kwargs: dict[str, Any] = {}
+        if resolved_model:
+            run_kwargs["model"] = resolved_model
+        if resolved_root_agent_name:
+            run_kwargs["root_agent_name"] = resolved_root_agent_name
         if workspace_mode:
             run_kwargs["workspace_mode"] = workspace_mode
         if remote_config is not None:
@@ -1751,10 +1844,14 @@ async def _resume(
     session_id: str,
     instruction: str,
     debug: bool,
+    model: str | None = None,
+    sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
     normalized_session_id = _normalize_session_id_or_exit(session_id)
     orchestrator = Orchestrator(Path("."), locale=locale, app_dir=app_dir, debug=debug)
+    resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
+    resolved_model = str(model or "").strip() or None
     resumed_from = orchestrator.load_session_context(normalized_session_id)
     resumed_session_id = resumed_from.id
     panel: _RunStatusPanel | None = None
@@ -1776,6 +1873,8 @@ async def _resume(
             "locale": locale,
             "instruction": instruction,
             "source_session_id": normalized_session_id,
+            "sandbox_backend": resolved_sandbox_backend,
+            "model": resolved_model,
         },
     )
     session = None
@@ -1784,14 +1883,16 @@ async def _resume(
             orchestrator,
             resumed_session_id,
         )
+        resume_kwargs: dict[str, Any] = {}
+        if resolved_model:
+            resume_kwargs["model"] = resolved_model
         if remote_password:
-            session = await orchestrator.resume(
-                resumed_session_id,
-                instruction,
-                remote_password=remote_password,
-            )
-        else:
-            session = await orchestrator.resume(resumed_session_id, instruction)
+            resume_kwargs["remote_password"] = remote_password
+        session = await orchestrator.resume(
+            resumed_session_id,
+            instruction,
+            **resume_kwargs,
+        )
     finally:
         if panel is not None:
             await panel.stop(
@@ -2399,6 +2500,9 @@ def main() -> None:
                     workspace_mode=workspace_mode,
                     remote_config=remote_config,
                     remote_password=remote_password,
+                    model=getattr(args, "model", None),
+                    root_agent_name=getattr(args, "root_agent_name", None),
+                    sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)),
                 )
             )
@@ -2410,7 +2514,11 @@ def main() -> None:
                     args.session_id,
                     args.instruction,
                     bool(args.debug),
-                    int(getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)),
+                    model=getattr(args, "model", None),
+                    sandbox_backend=getattr(args, "sandbox_backend", None),
+                    preview_chars=int(
+                        getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)
+                    ),
                 )
             )
         elif args.command == "export-logs":

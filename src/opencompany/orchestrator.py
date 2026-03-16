@@ -60,6 +60,7 @@ from opencompany.orchestration import (
     session_state,
     worker_initial_message,
 )
+from opencompany.orchestration.context import prompt_window_projection
 from opencompany.orchestration.messages import (
     step_limit_summary_message,
 )
@@ -131,6 +132,13 @@ def default_app_dir(start: Path | None = None) -> Path:
     raise RuntimeError(
         "Could not determine OpenCompany app directory. Pass app_dir explicitly or run from the OpenCompany repository."
     )
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 PROJECT_SYNC_STATE_VERSION = 1
@@ -2046,12 +2054,148 @@ class Orchestrator:
     ) -> dict[str, Any]:
         normalized_session_id = self._normalize_session_id(session_id)
         self._sync_session_messages_from_checkpoint(normalized_session_id)
-        return self._get_message_logger(normalized_session_id).list_records(
+        page = self._get_message_logger(normalized_session_id).list_records(
             agent_id=agent_id,
             cursor=cursor,
             limit=limit,
             tail=tail,
         )
+        raw_messages = page.get("messages", [])
+        if not isinstance(raw_messages, list) or not raw_messages:
+            return page
+        page["messages"] = self._annotate_prompt_visibility_for_records(
+            normalized_session_id,
+            raw_messages,
+        )
+        return page
+
+    def _annotate_prompt_visibility_for_records(
+        self,
+        session_id: str,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        relevant_agent_ids = sorted(
+            {
+                str(record.get("agent_id", "")).strip()
+                for record in records
+                if isinstance(record, dict) and str(record.get("agent_id", "")).strip()
+            }
+        )
+        projections = self._message_prompt_projections(
+            session_id,
+            agent_ids=relevant_agent_ids,
+        )
+        annotated: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            agent_id = str(record.get("agent_id", "")).strip()
+            message_index = _safe_int(record.get("message_index"), default=-1)
+            projection = projections.get(agent_id)
+            if projection is None:
+                bucket = "internal" if bool(record.get("internal", False)) else "tail"
+            else:
+                bucket = projection.bucket_for_message_index(message_index)
+            prompt_visible = bucket in {"pinned", "tail"}
+            payload = dict(record)
+            payload["prompt_visible"] = prompt_visible
+            payload["prompt_bucket"] = bucket
+            annotated.append(payload)
+        return annotated
+
+    def _message_prompt_projections(
+        self,
+        session_id: str,
+        *,
+        agent_ids: list[str],
+    ) -> dict[str, Any]:
+        if not agent_ids:
+            return {}
+        keep_count = max(0, int(self.config.runtime.context.keep_pinned_messages))
+        rows_by_agent = {
+            str(row.get("id", "")).strip(): row
+            for row in self.storage.load_agents(session_id)
+            if isinstance(row, dict) and str(row.get("id", "")).strip()
+        }
+        logger = self._get_message_logger(session_id)
+        projections: dict[str, Any] = {}
+        for agent_id in agent_ids:
+            full_records = logger.read(agent_id)
+            if not full_records:
+                continue
+            agent_row = rows_by_agent.get(agent_id, {})
+            metadata = self._message_projection_metadata(agent_row)
+            internal_indices = {
+                _safe_int(record.get("message_index"), default=-1)
+                for record in full_records
+                if isinstance(record, dict) and bool(record.get("internal", False))
+            }
+            internal_indices = {index for index in internal_indices if index >= 0}
+            if internal_indices:
+                merged_internal = {
+                    _safe_int(value, default=-1)
+                    for value in metadata.get("internal_message_indices", [])
+                    if _safe_int(value, default=-1) >= 0
+                }
+                merged_internal.update(internal_indices)
+                metadata = dict(metadata)
+                metadata["internal_message_indices"] = sorted(merged_internal)
+            conversation = self._conversation_from_message_records(full_records)
+            if not conversation:
+                continue
+            role_text = str(agent_row.get("role", AgentRole.WORKER.value)).strip().lower()
+            try:
+                role = AgentRole(role_text)
+            except ValueError:
+                role = AgentRole.WORKER
+            agent = AgentNode(
+                id=agent_id,
+                session_id=session_id,
+                name=str(agent_row.get("name", agent_id) or agent_id),
+                role=role,
+                instruction=str(agent_row.get("instruction", "")),
+                workspace_id=str(agent_row.get("workspace_id", "workspace")),
+                metadata=metadata,
+                conversation=conversation,
+            )
+            projections[agent_id] = prompt_window_projection(
+                agent,
+                keep_pinned_messages=keep_count,
+            )
+        return projections
+
+    @staticmethod
+    def _conversation_from_message_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        conversation: list[dict[str, Any]] = []
+        for record in sorted(
+            records,
+            key=lambda item: _safe_int(item.get("message_index"), default=-1),
+        ):
+            message_index = _safe_int(record.get("message_index"), default=-1)
+            if message_index < 0:
+                continue
+            while len(conversation) <= message_index:
+                conversation.append({"role": "assistant", "content": ""})
+            message = record.get("message")
+            if isinstance(message, dict):
+                conversation[message_index] = message
+            else:
+                conversation[message_index] = {
+                    "role": str(record.get("role", "")).strip() or "assistant",
+                    "content": str(message or ""),
+                }
+        return conversation
+
+    @staticmethod
+    def _message_projection_metadata(agent_row: dict[str, Any]) -> dict[str, Any]:
+        raw_metadata = agent_row.get("metadata_json")
+        if not isinstance(raw_metadata, str) or not raw_metadata.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_metadata)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def export_logs(self, session_id: str, export_path: Path | None = None) -> Path:
         normalized_session_id = self._normalize_session_id(session_id)
@@ -4450,11 +4594,18 @@ class Orchestrator:
             remaining = self._consume_finished_child_summaries(agent, tracked_pending_ids, agents)
             tracked_pending_ids[:] = remaining
 
-        for action in actions:
+        ordered_actions = self._order_actions_for_execution(actions)
+        has_deferred_compress = any(
+            str(action.get("type", "")).strip() == "compress_context"
+            for action in ordered_actions
+        )
+
+        for action in ordered_actions:
             if self.interrupt_requested:
                 break
             if agent.role == AgentRole.WORKER and not self._is_active_agent(agent):
                 break
+            action_type = str(action.get("type", "")).strip()
             submit_result = await self._submit_tool_run(
                 session=session,
                 agent=agent,
@@ -4463,6 +4614,7 @@ class Orchestrator:
                 workspace_manager=workspace_manager,
                 root_loop=root_loop,
                 tracked_pending_ids=tracked_pending_ids,
+                force_wait=has_deferred_compress and action_type not in {"compress_context", "finish"},
             )
             agent_result = submit_result.get("agent_result")
             if not isinstance(agent_result, dict):
@@ -4473,6 +4625,22 @@ class Orchestrator:
                 finish_payload = maybe_finish
                 break
         return ActionBatchResult(finish_payload=finish_payload)
+
+    @staticmethod
+    def _order_actions_for_execution(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ordered: list[dict[str, Any]] = []
+        deferred_compress: list[dict[str, Any]] = []
+        deferred_finish: list[dict[str, Any]] = []
+        for action in actions:
+            action_type = str(action.get("type", "")).strip()
+            if action_type == "compress_context":
+                deferred_compress.append(action)
+                continue
+            if action_type == "finish":
+                deferred_finish.append(action)
+                continue
+            ordered.append(action)
+        return [*ordered, *deferred_compress, *deferred_finish]
 
     async def _ask_agent(self, agent: AgentNode) -> list[dict[str, Any]]:
         self._consume_waiting_steers_for_agent(agent)
@@ -4575,6 +4743,7 @@ class Orchestrator:
         workspace_manager: WorkspaceManager,
         root_loop: int,
         tracked_pending_ids: list[str] | None = None,
+        force_wait: bool = False,
     ) -> dict[str, Any]:
         action_type = str(action.get("type", "")).strip()
         if not action_type:
@@ -4646,38 +4815,41 @@ class Orchestrator:
         self._active_tool_run_tasks[run.id] = task
         try:
             if action_type == "shell":
-                inline_wait_seconds = max(
-                    0.0,
-                    float(self.config.runtime.tools.shell_inline_wait_seconds),
-                )
-                try:
-                    raw_result = await asyncio.wait_for(
-                        asyncio.shield(task),
-                        timeout=inline_wait_seconds,
+                if force_wait:
+                    raw_result = await task
+                else:
+                    inline_wait_seconds = max(
+                        0.0,
+                        float(self.config.runtime.tools.shell_inline_wait_seconds),
                     )
-                except asyncio.TimeoutError:
-                    self._log_diagnostic(
-                        "shell_inline_wait_exceeded",
-                        level="warning",
-                        session_id=session.id,
-                        agent_id=agent.id,
-                        payload={
-                            "tool_run_id": run.id,
-                            "inline_wait_seconds": inline_wait_seconds,
-                        },
-                    )
-                    running_result = self._shell_background_running_result(
-                        run=run,
-                        inline_wait_seconds=inline_wait_seconds,
-                    )
-                    return {
-                        "agent_result": self._project_tool_result(
-                            action=action,
-                            raw_result=running_result,
-                            run_id=run.id,
-                        ),
-                        "finish_payload": None,
-                    }
+                    try:
+                        raw_result = await asyncio.wait_for(
+                            asyncio.shield(task),
+                            timeout=inline_wait_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        self._log_diagnostic(
+                            "shell_inline_wait_exceeded",
+                            level="warning",
+                            session_id=session.id,
+                            agent_id=agent.id,
+                            payload={
+                                "tool_run_id": run.id,
+                                "inline_wait_seconds": inline_wait_seconds,
+                            },
+                        )
+                        running_result = self._shell_background_running_result(
+                            run=run,
+                            inline_wait_seconds=inline_wait_seconds,
+                        )
+                        return {
+                            "agent_result": self._project_tool_result(
+                                action=action,
+                                raw_result=running_result,
+                                run_id=run.id,
+                            ),
+                            "finish_payload": None,
+                        }
             else:
                 raw_result = await task
         except asyncio.CancelledError:

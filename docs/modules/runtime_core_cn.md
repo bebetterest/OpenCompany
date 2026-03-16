@@ -52,11 +52,12 @@ Agent 状态：
 运行时上下文压缩由 `[runtime.context]` 控制：
 
 - `reminder_ratio`（默认 `0.8`）：当最近一次 prompt 使用率超过该阈值时，每轮注入压缩提醒。
-- `keep_pinned_messages`（默认 `1`）：进入 summary 模式后仍保留的头部消息数量。
+- `keep_pinned_messages`（默认 `1`）：进入 summary 模式后仍保留的头部消息数量；这里按 message 计数，不按 step 计数。
 - `max_context_tokens`（必填，且 `> 0`）：上下文窗口长度的唯一来源。
 - `compression_model`（压缩时必填）：仅用于压缩的固定模型。
 - `overflow_retry_attempts`（默认 `1`）：超窗后“强制压缩 + 重试”的最大次数。
 - 请求前强制预检：每次调用 LLM 前，运行时会基于上一轮真实输入 usage（`current_context_tokens`）判断；若其超过 `max_context_tokens`，即使 provider 尚未报超窗错误，也会先强制执行 `compress_context`。
+- 无论手动压缩还是强制压缩，只要压缩成功，运行时都会把这条“请求前强制预检压缩”判断在下一整个 agent step 内都跳过；如果下一步里发生了内部重试，该步内的所有重试也都会继续跳过这条预检。
 - 压缩调用超时：使用 `runtime.tool_timeouts.actions.compress_context`（默认 `180s`）。
 
 上下文上限来源：
@@ -68,6 +69,11 @@ Agent 状态：
 - 输入：`previous_summary + unsummarized_messages`
 - 输出：`latest_summary`（覆盖旧 summary，不做 summary 拼接）
 - 软阈值提醒消息（`root_loop_force_finalize`、worker 步数提醒）与上下文压力提醒消息不会进入压缩输入
+- 当前 step 的压缩请求消息仍会进入压缩输入；但它在普通 prompt/UI 组装里依旧保持 internal
+- 强制压缩不会把当前正在进行的 step 纳入压缩输入/压缩范围，因为 runtime 在压缩后还会继续这个 step，下一步也仍需要看到这个进行中的 step 信息
+- 如果同一步同时发出了 `compress_context` 和其他工具，runtime 会先等其他工具完成，再执行压缩，这样压缩输入里拿到的是这些工具的最终返回结果
+- 如果同一步错误地同时发出了 `finish` 和其他工具，runtime 也会把 `finish` 延后到普通工具和 `compress_context` 之后，避免压缩因 action 顺序被直接跳过
+- 强制压缩成功后，runtime 仍会补写 internal 的请求/结果 marker；但 `summarized_until_message_index` 只会停在“实际被总结的最后一条非当前 step 消息”上，这样当前进行中的 step 还能留给后续一步继续使用
 - metadata 持久化：`context_summary`、`summary_version`、`summarized_until_message_index`、`compression_count`、`last_compacted_message_range`、`last_compacted_step_range`
 - 派生日志：`<agent_id>_summaries.jsonl`
 

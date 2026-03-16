@@ -698,7 +698,12 @@ class ToolExecutor:
                 target = agents.get(target_id)
                 if target is None:
                     return {"error": f"Agent {target_id} was not found."}
-                messages = [dict(item) for item in target.conversation if isinstance(item, dict)]
+                excluded_indices = _agent_run_excluded_message_indices(target)
+                messages = [
+                    dict(item)
+                    for index, item in enumerate(target.conversation)
+                    if isinstance(item, dict) and index not in excluded_indices
+                ]
                 messages_count = len(messages)
                 start_raw = action.get("messages_start")
                 end_raw = action.get("messages_end")
@@ -1093,6 +1098,21 @@ def _project_agent_run_message(message: dict[str, Any]) -> dict[str, Any]:
         for key in GET_AGENT_RUN_VISIBLE_MESSAGE_FIELDS
         if key in message
     }
+
+
+def _agent_run_excluded_message_indices(agent: AgentNode) -> set[int]:
+    raw_indices = agent.metadata.get("compression_excluded_message_indices")
+    if not isinstance(raw_indices, list):
+        return set()
+    normalized: set[int] = set()
+    for value in raw_indices:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if index >= 0:
+            normalized.add(index)
+    return normalized
 
 
 def _shell_result_for_stream(

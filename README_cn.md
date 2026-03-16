@@ -137,6 +137,16 @@ opencompany run --project-dir /path/to/target "Inspect this repository and propo
 opencompany run --workspace-mode staged "Inspect this repository and propose next engineering steps."
 ```
 
+显式指定 sandbox backend、模型和 root agent 名称：
+
+```bash
+opencompany run \
+  --sandbox-backend none \
+  --model openai/gpt-4.1-mini \
+  --root-agent-name "Planner Root" \
+  "Inspect this repository and propose next engineering steps."
+```
+
 在 direct 模式下连接远程 SSH 工作区执行：
 
 ```bash
@@ -153,6 +163,7 @@ opencompany run \
 
 ```bash
 opencompany resume <session_id> "new instruction"
+opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
 ```
 
 应用 / 撤销 staged 写回：
@@ -207,6 +218,8 @@ opencompany terminal <session_id> --self-check
 - `opencompany run` 与 `opencompany resume` 在交互终端会显示动态状态面板。
 - 面板默认每 `5s` 自动分页；可按 `=` / `+` / `-` 手动切页。
 - 用 `--preview-chars N` 调整各字段预览宽度（默认 `256`）。
+- 在 `run` / `resume` 中可用 `--sandbox-backend <name>` 仅覆盖本次调用的 `[sandbox].backend`。
+- `opencompany run` 还支持 `--model <model>` 与 `--root-agent-name <name>`；`opencompany resume` 还支持 `--model <model>`。
 
 ## ⚙️ 配置与调试
 
