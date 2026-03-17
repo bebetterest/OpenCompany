@@ -56,7 +56,18 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-`uv` 只负责安装 Python 包。请确保系统 PATH 中可用 `ripgrep`；如果使用默认的 Anthropic sandbox 后端，也请确保 `node`/`npm` 可用。
+`uv` 只负责安装 Python 包。继续之前，请先安装所需的系统工具：
+
+```bash
+# macOS 本机（Homebrew）
+brew install ripgrep node
+
+# Debian/Ubuntu Linux 主机（包含 Anthropic sandbox 的完整依赖集）
+sudo apt-get update
+sudo apt-get install -y ripgrep bubblewrap socat nodejs npm
+```
+
+`npm` 通常会随 Node.js 一起安装。若使用默认的 Anthropic sandbox 后端，Linux 执行主机还需要安装 `bubblewrap`（`bwrap`）和 `socat`；继续前请先确认 `node --version` 输出为 `18` 或更高版本。
 
 2. 配置 OpenRouter API Key：
 

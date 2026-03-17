@@ -56,7 +56,18 @@ source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-`uv` installs Python packages only. Ensure `ripgrep` is available on your system PATH; if you use the default Anthropic sandbox backend, also ensure `node`/`npm` is available.
+`uv` installs Python packages only. Install the required system tools before continuing:
+
+```bash
+# macOS local machine (Homebrew)
+brew install ripgrep node
+
+# Debian/Ubuntu Linux host (includes the full Anthropic sandbox dependency set)
+sudo apt-get update
+sudo apt-get install -y ripgrep bubblewrap socat nodejs npm
+```
+
+`npm` is usually bundled with Node.js. For the default Anthropic sandbox backend, the Linux execution host also needs `bubblewrap` (`bwrap`) and `socat`; verify `node --version` reports `18` or newer before continuing.
 
 2. Configure your OpenRouter API key:
 
