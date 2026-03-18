@@ -60,7 +60,7 @@ from opencompany.orchestration import (
     session_state,
     worker_initial_message,
 )
-from opencompany.orchestration.context import prompt_window_projection
+from opencompany.orchestration.context import prompt_window_projection_from_metadata
 from opencompany.orchestration.messages import (
     step_limit_summary_message,
 )
@@ -77,7 +77,7 @@ from opencompany.status_machine import (
     normalize_session_completion_state,
     validate_agent_status_transition,
 )
-from opencompany.storage import Storage
+from opencompany.storage import Storage, TOOL_RUN_TIMELINE_EVENT_TYPES
 from opencompany.tools import ToolExecutor, child_limit_details, child_summaries, is_descendant
 from opencompany.tools.runtime import (
     KNOWN_STEER_RUN_STATUSES,
@@ -108,6 +108,8 @@ from opencompany.utils import (
     utc_now,
 )
 from opencompany.workspace import WorkspaceChangeSet, WorkspaceManager
+
+SESSION_HISTORY_STREAM_EVENT_TYPES = frozenset({"llm_token", "llm_reasoning", "shell_stream"})
 
 
 def _looks_like_app_dir(path: Path) -> bool:
@@ -395,6 +397,7 @@ class Orchestrator:
         )
         session.root_agent_id = root_agent.id
         self.storage.upsert_session(session)
+        self.storage.mark_tool_run_timeline_backfilled(session.id, now)
         logger = self._get_logger(session_id)
         self._log_diagnostic(
             "session_run_requested",
@@ -916,12 +919,66 @@ class Orchestrator:
 
     def load_session_context(self, session_id: str) -> RunSession:
         normalized_session_id = self._normalize_session_id(session_id)
+        stored_session = self.storage.load_session(normalized_session_id)
+        checkpoint = self.storage.latest_checkpoint(normalized_session_id)
+        fallback: RunSession | None = None
+        if checkpoint is not None:
+            state = checkpoint.get("state")
+            if isinstance(state, dict):
+                session_payload = state.get("session")
+                if isinstance(session_payload, dict):
+                    fallback = self._session_from_state(session_payload)
+        if stored_session is not None:
+            if fallback is None:
+                raw_status = str(
+                    stored_session.get("status", SessionStatus.INTERRUPTED.value)
+                ).strip().lower()
+                try:
+                    stored_status = SessionStatus(raw_status)
+                except ValueError:
+                    stored_status = SessionStatus.INTERRUPTED
+                fallback = RunSession(
+                    id=str(stored_session.get("id", normalized_session_id) or normalized_session_id),
+                    project_dir=Path(str(stored_session.get("project_dir", "."))),
+                    task=str(stored_session.get("task", "") or ""),
+                    locale=str(stored_session.get("locale", self.locale) or self.locale),
+                    root_agent_id=str(stored_session.get("root_agent_id", "") or ""),
+                    workspace_mode=normalize_workspace_mode(
+                        stored_session.get("workspace_mode", WorkspaceMode.STAGED.value)
+                    ),
+                    status=stored_status,
+                    status_reason=(
+                        str(stored_session.get("status_reason"))
+                        if stored_session.get("status_reason") is not None
+                        else None
+                    ),
+                    created_at=str(stored_session.get("created_at", utc_now()) or utc_now()),
+                    updated_at=str(stored_session.get("updated_at", utc_now()) or utc_now()),
+                    loop_index=int(stored_session.get("loop_index", 0) or 0),
+                    final_summary=(
+                        str(stored_session.get("final_summary"))
+                        if stored_session.get("final_summary") is not None
+                        else None
+                    ),
+                    completion_state=normalize_session_completion_state(
+                        session_status=stored_status,
+                        completion_state=stored_session.get("completion_state"),
+                    ),
+                    follow_up_needed=bool(int(stored_session.get("follow_up_needed", 0) or 0)),
+                    config_snapshot={},
+                )
+            return self._session_from_storage_row(stored_session, fallback=fallback)
+        if fallback is not None:
+            return fallback
+        raise ValueError(f"No checkpoint found for session {normalized_session_id}")
+
+    def clone_session(self, session_id: str) -> RunSession:
+        normalized_session_id = self._normalize_session_id(session_id)
+        source_session = self.load_session_context(normalized_session_id)
+        if source_session.status == SessionStatus.RUNNING:
+            raise ValueError(f"Cannot clone running session {normalized_session_id}.")
         cloned_session_id = self._clone_session_context(normalized_session_id)
-        session, _, _, _, _, _ = self._import_session_context(
-            cloned_session_id,
-            source="reconfigure",
-        )
-        return session
+        return self.load_session_context(cloned_session_id)
 
     async def resume(
         self,
@@ -1108,7 +1165,10 @@ class Orchestrator:
         if cloned_session_dir.exists():
             shutil.rmtree(cloned_session_dir)
         shutil.copytree(source_session_dir, cloned_session_dir)
-        self._rewrite_cloned_message_logs(cloned_session_dir, cloned_session_id)
+        self._clone_session_remote_config(
+            source_session_id=normalized_source_session_id,
+            cloned_session_id=cloned_session_id,
+        )
 
         now = utc_now()
         source_config_snapshot = (
@@ -1151,6 +1211,12 @@ class Orchestrator:
             tool_run_id_map=tool_run_id_map,
             steer_run_id_map=steer_run_id_map,
         )
+        self._rewrite_cloned_event_log(
+            cloned_session_dir,
+            cloned_session_id,
+            tool_run_id_map=tool_run_id_map,
+            steer_run_id_map=steer_run_id_map,
+        )
         source_checkpoints = self.storage.load_checkpoints(normalized_source_session_id)
         if not source_checkpoints:
             raise ValueError(f"No checkpoint found for session {normalized_source_session_id}")
@@ -1158,6 +1224,7 @@ class Orchestrator:
             rewritten_state = self._rewrite_checkpoint_for_cloned_session(
                 state=checkpoint.get("state", {}),
                 source_session_id=normalized_source_session_id,
+                source_checkpoint_seq=int(source_checkpoint["seq"]),
                 cloned_session_id=cloned_session_id,
                 source_session_dir=source_session_dir,
                 cloned_session_dir=cloned_session_dir,
@@ -1167,39 +1234,41 @@ class Orchestrator:
             checkpoint_created_at = str(checkpoint.get("created_at", "")).strip() or now
             self.storage.save_checkpoint(cloned_session_id, checkpoint_created_at, rewritten_state)
 
-        for row in self.storage.load_events(normalized_source_session_id):
-            payload = row.get("payload_json", {})
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
+        with self.storage.batched_writes():
+            for row in self.storage.load_events(normalized_source_session_id):
+                payload = row.get("payload_json", {})
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                if not isinstance(payload, dict):
                     payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            payload = self._rewrite_run_ids_in_payload(
-                payload,
-                tool_run_id_map=tool_run_id_map,
-                steer_run_id_map=steer_run_id_map,
-            )
-            self.storage.append_event(
-                EventRecord(
-                    timestamp=str(row.get("timestamp", "")).strip() or now,
-                    session_id=cloned_session_id,
-                    agent_id=(
-                        str(row.get("agent_id", "")).strip() or None
-                    ),
-                    parent_agent_id=(
-                        str(row.get("parent_agent_id", "")).strip() or None
-                    ),
-                    event_type=str(row.get("event_type", "")),
-                    phase=str(row.get("phase", "runtime")),
-                    payload=payload,
-                    workspace_id=(
-                        str(row.get("workspace_id", "")).strip() or None
-                    ),
-                    checkpoint_seq=int(row.get("checkpoint_seq", 0) or 0),
+                payload = self._rewrite_run_ids_in_payload(
+                    payload,
+                    tool_run_id_map=tool_run_id_map,
+                    steer_run_id_map=steer_run_id_map,
                 )
-            )
+                self.storage.append_event(
+                    EventRecord(
+                        timestamp=str(row.get("timestamp", "")).strip() or now,
+                        session_id=cloned_session_id,
+                        agent_id=(
+                            str(row.get("agent_id", "")).strip() or None
+                        ),
+                        parent_agent_id=(
+                            str(row.get("parent_agent_id", "")).strip() or None
+                        ),
+                        event_type=str(row.get("event_type", "")),
+                        phase=str(row.get("phase", "runtime")),
+                        payload=payload,
+                        workspace_id=(
+                            str(row.get("workspace_id", "")).strip() or None
+                        ),
+                        checkpoint_seq=int(row.get("checkpoint_seq", 0) or 0),
+                    )
+                )
+        self._backfill_tool_run_timeline_projection(cloned_session_id)
 
         self._log_diagnostic(
             "session_context_cloned",
@@ -1211,6 +1280,66 @@ class Orchestrator:
             },
         )
         return cloned_session_id
+
+    def _clone_session_remote_config(
+        self,
+        *,
+        source_session_id: str,
+        cloned_session_id: str,
+    ) -> None:
+        source_remote_config = self._session_remote_config(source_session_id)
+        if source_remote_config is None:
+            return
+        cloned_remote_config = normalize_remote_session_config(asdict(source_remote_config))
+        source_password_ref = str(source_remote_config.password_ref or "").strip()
+        if cloned_remote_config.auth_mode != "password":
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        if not source_password_ref:
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        try:
+            source_password = str(load_remote_session_password(source_password_ref) or "").strip()
+        except Exception as exc:
+            self._log_diagnostic(
+                "remote_password_clone_load_failed",
+                level="warning",
+                session_id=cloned_session_id,
+                payload={
+                    "source_session_id": source_session_id,
+                    "password_ref": source_password_ref,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        if not source_password:
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        cloned_password_ref = build_remote_password_ref(cloned_session_id, cloned_remote_config)
+        try:
+            save_remote_session_password(cloned_password_ref, source_password)
+        except Exception as exc:
+            self._log_diagnostic(
+                "remote_password_clone_persist_failed",
+                level="warning",
+                session_id=cloned_session_id,
+                payload={
+                    "source_session_id": source_session_id,
+                    "password_ref": cloned_password_ref,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        cloned_remote_config.password_ref = cloned_password_ref
+        self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
 
     def _clone_tool_runs_for_cloned_session(
         self,
@@ -1379,50 +1508,81 @@ class Orchestrator:
         tool_run_id_map: dict[str, str] | None = None,
         steer_run_id_map: dict[str, str] | None = None,
     ) -> None:
+        for path in sorted(session_dir.glob("*_messages.jsonl")):
+            self._rewrite_cloned_jsonl_records(
+                path,
+                session_id=session_id,
+                tool_run_id_map=tool_run_id_map,
+                steer_run_id_map=steer_run_id_map,
+            )
+
+    def _rewrite_cloned_event_log(
+        self,
+        session_dir: Path,
+        session_id: str,
+        *,
+        tool_run_id_map: dict[str, str] | None = None,
+        steer_run_id_map: dict[str, str] | None = None,
+    ) -> None:
+        self._rewrite_cloned_jsonl_records(
+            session_dir / self.config.logging.jsonl_filename,
+            session_id=session_id,
+            tool_run_id_map=tool_run_id_map,
+            steer_run_id_map=steer_run_id_map,
+        )
+
+    def _rewrite_cloned_jsonl_records(
+        self,
+        path: Path,
+        *,
+        session_id: str,
+        tool_run_id_map: dict[str, str] | None = None,
+        steer_run_id_map: dict[str, str] | None = None,
+    ) -> None:
+        if not path.exists() or not path.is_file():
+            return
         normalized_tool_map = tool_run_id_map or {}
         normalized_steer_map = steer_run_id_map or {}
-        for path in sorted(session_dir.glob("*_messages.jsonl")):
-            rewritten_lines: list[str] = []
-            changed = False
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    raw_line = line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        record = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        rewritten_lines.append(raw_line)
-                        continue
-                    if not isinstance(record, dict):
-                        rewritten_lines.append(raw_line)
-                        continue
-                    if str(record.get("session_id", "")).strip() != session_id:
-                        record["session_id"] = session_id
-                        changed = True
-                    if normalized_tool_map or normalized_steer_map:
-                        rewritten_record = self._rewrite_run_ids_in_payload(
-                            record,
-                            tool_run_id_map=normalized_tool_map,
-                            steer_run_id_map=normalized_steer_map,
-                        )
-                        if rewritten_record != record:
-                            changed = True
-                            record = rewritten_record
-                    rewritten_lines.append(
-                        json.dumps(json_ready(record), ensure_ascii=False)
+        rewritten_lines: list[str] = []
+        changed = False
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                raw_line = line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    rewritten_lines.append(raw_line)
+                    continue
+                if not isinstance(record, dict):
+                    rewritten_lines.append(raw_line)
+                    continue
+                if str(record.get("session_id", "")).strip() != session_id:
+                    record["session_id"] = session_id
+                    changed = True
+                if normalized_tool_map or normalized_steer_map:
+                    rewritten_record = self._rewrite_run_ids_in_payload(
+                        record,
+                        tool_run_id_map=normalized_tool_map,
+                        steer_run_id_map=normalized_steer_map,
                     )
-            if changed:
-                payload = "\n".join(rewritten_lines)
-                if payload:
-                    payload += "\n"
-                path.write_text(payload, encoding="utf-8")
+                    if rewritten_record != record:
+                        changed = True
+                        record = rewritten_record
+                rewritten_lines.append(json.dumps(json_ready(record), ensure_ascii=False))
+        if changed:
+            payload = "\n".join(rewritten_lines)
+            if payload:
+                payload += "\n"
+            path.write_text(payload, encoding="utf-8")
 
     def _rewrite_checkpoint_for_cloned_session(
         self,
         *,
         state: dict[str, Any],
         source_session_id: str,
+        source_checkpoint_seq: int,
         cloned_session_id: str,
         source_session_dir: Path,
         cloned_session_dir: Path,
@@ -1445,6 +1605,7 @@ class Orchestrator:
                 config_snapshot = {}
                 session_payload["config_snapshot"] = config_snapshot
             config_snapshot["continued_from_session_id"] = source_session_id
+            config_snapshot["continued_from_checkpoint_seq"] = source_checkpoint_seq
             rewritten_workspace_mode = normalize_workspace_mode(
                 session_payload.get("workspace_mode")
             )
@@ -1833,37 +1994,141 @@ class Orchestrator:
                 )
             used.add(candidate.casefold())
 
+    def _event_record_from_storage_row(
+        self,
+        row: dict[str, Any],
+        *,
+        default_session_id: str,
+    ) -> dict[str, Any]:
+        payload = row.get("payload_json", {})
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "timestamp": str(row.get("timestamp", "")),
+            "session_id": str(row.get("session_id", default_session_id)),
+            "agent_id": row.get("agent_id"),
+            "parent_agent_id": row.get("parent_agent_id"),
+            "event_type": str(row.get("event_type", "")),
+            "phase": str(row.get("phase", "runtime")),
+            "payload": payload,
+            "workspace_id": row.get("workspace_id"),
+            "checkpoint_seq": int(row.get("checkpoint_seq", 0) or 0),
+            "id": int(row.get("id", 0) or 0),
+        }
+
     def load_session_events(self, session_id: str) -> list[dict[str, Any]]:
         normalized_session_id = self._normalize_session_id(session_id)
-        records: list[dict[str, Any]] = []
-        for row in self.storage.load_events(normalized_session_id):
-            payload = row.get("payload_json", {})
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            records.append(
-                {
-                    "timestamp": str(row.get("timestamp", "")),
-                    "session_id": str(row.get("session_id", normalized_session_id)),
-                    "agent_id": row.get("agent_id"),
-                    "parent_agent_id": row.get("parent_agent_id"),
-                    "event_type": str(row.get("event_type", "")),
-                    "phase": str(row.get("phase", "runtime")),
-                    "payload": payload,
-                    "workspace_id": row.get("workspace_id"),
-                    "checkpoint_seq": int(row.get("checkpoint_seq", 0) or 0),
-                }
+        return [
+            self._event_record_from_storage_row(
+                row,
+                default_session_id=normalized_session_id,
             )
-        return records
+            for row in self.storage.load_events(normalized_session_id)
+        ]
+
+    def list_session_events_page(
+        self,
+        session_id: str,
+        *,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+    ) -> dict[str, Any]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        try:
+            bounded_limit = max(1, min(5000, int(limit if limit is not None else 200)))
+        except (TypeError, ValueError):
+            bounded_limit = 200
+        before_id: int | None = None
+        if before is not None:
+            before_text = str(before).strip()
+            if before_text:
+                try:
+                    before_id = int(before_text)
+                except ValueError as exc:
+                    raise ValueError("Invalid events before cursor.") from exc
+        rows = self.storage.list_events_page(
+            session_id=normalized_session_id,
+            before_id=before_id,
+            limit=bounded_limit + 1,
+            exclude_event_types=(
+                list(SESSION_HISTORY_STREAM_EVENT_TYPES) if activity_only else None
+            ),
+        )
+        has_more_before = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        page_rows.reverse()
+        events = [
+            self._event_record_from_storage_row(
+                row,
+                default_session_id=normalized_session_id,
+            )
+            for row in page_rows
+        ]
+        before_cursor = str(events[0]["id"]) if has_more_before and events else None
+        return {
+            "events": events,
+            "before_cursor": before_cursor,
+            "has_more_before": has_more_before,
+        }
+
+    def _storage_row_from_agent(self, agent: AgentNode) -> dict[str, Any]:
+        return {
+            "id": agent.id,
+            "session_id": agent.session_id,
+            "name": agent.name,
+            "role": agent.role.value,
+            "instruction": agent.instruction,
+            "workspace_id": agent.workspace_id,
+            "parent_agent_id": agent.parent_agent_id,
+            "status": agent.status.value,
+            "status_reason": agent.status_reason,
+            "children_json": json.dumps(list(agent.children), ensure_ascii=False),
+            "summary": agent.summary,
+            "next_recommendation": agent.next_recommendation,
+            "diff_artifact": agent.diff_artifact,
+            "completion_status": agent.completion_status,
+            "step_count": agent.step_count,
+            "metadata_json": json.dumps(json_ready(agent.metadata), ensure_ascii=False),
+        }
+
+    def _session_agent_rows(self, session_id: str) -> list[dict[str, Any]]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        stored_rows = self.storage.load_agents(normalized_session_id)
+        if stored_rows:
+            return stored_rows
+        checkpoint = self.storage.latest_checkpoint(normalized_session_id)
+        if checkpoint is None:
+            return []
+        state = checkpoint.get("state", {})
+        if not isinstance(state, dict):
+            return []
+        agent_payloads = state.get("agents", {})
+        if not isinstance(agent_payloads, dict):
+            return []
+        fallback_rows: list[dict[str, Any]] = []
+        for payload in sorted(
+            agent_payloads.values(),
+            key=lambda item: str(item.get("id", "")) if isinstance(item, dict) else "",
+        ):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                agent = self._agent_from_state(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            fallback_rows.append(self._storage_row_from_agent(agent))
+        return fallback_rows
 
     def load_session_agents(self, session_id: str) -> list[dict[str, Any]]:
         normalized_session_id = self._normalize_session_id(session_id)
         agents: list[dict[str, Any]] = []
-        for row in self.storage.load_agents(normalized_session_id):
+        for row in self._session_agent_rows(normalized_session_id):
             children: list[str] = []
             raw_children = row.get("children_json")
             if isinstance(raw_children, str):
@@ -2051,14 +2316,25 @@ class Orchestrator:
         cursor: str | None = None,
         limit: int = 500,
         tail: int | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         normalized_session_id = self._normalize_session_id(session_id)
-        self._sync_session_messages_from_checkpoint(normalized_session_id)
-        page = self._get_message_logger(normalized_session_id).list_records(
+        logger = self._get_message_logger(normalized_session_id)
+        normalized_agent_id = str(agent_id or "").strip() or None
+        if normalized_agent_id is not None:
+            if not logger.has_records_file(normalized_agent_id):
+                self._sync_session_messages_from_checkpoint(
+                    normalized_session_id,
+                    agent_ids={normalized_agent_id},
+                )
+        elif not logger.agent_ids():
+            self._sync_session_messages_from_checkpoint(normalized_session_id)
+        page = logger.list_records(
             agent_id=agent_id,
             cursor=cursor,
             limit=limit,
             tail=tail,
+            before=before,
         )
         raw_messages = page.get("messages", [])
         if not isinstance(raw_messages, list) or not raw_messages:
@@ -2068,6 +2344,137 @@ class Orchestrator:
             raw_messages,
         )
         return page
+
+    def get_tool_run_detail(
+        self,
+        session_id: str,
+        tool_run_id: str,
+        *,
+        timeline_limit: int = 300,
+    ) -> dict[str, Any]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        normalized_tool_run_id = str(tool_run_id or "").strip()
+        if not normalized_tool_run_id:
+            raise ValueError("tool_run_id is required")
+        record = self.storage.load_tool_run(normalized_tool_run_id)
+        if not isinstance(record, dict):
+            raise ValueError(f"Tool run {normalized_tool_run_id} was not found.")
+        if str(record.get("session_id", "")).strip() != normalized_session_id:
+            raise ValueError(f"Tool run {normalized_tool_run_id} is outside the current session.")
+        detail = dict(record)
+        if str(detail.get("tool_name", "")).strip() == "shell":
+            stdout, stderr = self._shell_outputs_for_tool_run(detail)
+            detail["stdout"] = stdout
+            detail["stderr"] = stderr
+        if not self.storage.has_tool_run_timeline_backfill(normalized_session_id):
+            self._backfill_tool_run_timeline_projection(normalized_session_id)
+        timeline = self.storage.load_tool_run_timeline(
+            session_id=normalized_session_id,
+            tool_run_id=normalized_tool_run_id,
+            limit=timeline_limit,
+        )
+        detail["timeline"] = self._dedupe_tool_run_timeline_entries(timeline)
+        return detail
+
+    def _backfill_tool_run_timeline_projection(
+        self,
+        session_id: str,
+    ) -> None:
+        rows = self.storage.load_events(
+            session_id,
+            event_types=list(TOOL_RUN_TIMELINE_EVENT_TYPES),
+        )
+        call_id_to_run_id = self._collect_tool_run_timeline_call_map(session_id, rows)
+        with self.storage.batched_writes():
+            for row in rows:
+                source_event_id = int(row.get("id", 0) or 0)
+                if source_event_id <= 0:
+                    continue
+                record = self._event_record_from_storage_row(
+                    row,
+                    default_session_id=session_id,
+                )
+                resolved_tool_run_id = self._resolve_tool_run_timeline_run_id(
+                    record,
+                    call_id_to_run_id=call_id_to_run_id,
+                )
+                if not resolved_tool_run_id:
+                    continue
+                raw_payload = record.get("payload", {})
+                payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+                payload.setdefault("tool_run_id", resolved_tool_run_id)
+                self.storage.append_tool_run_timeline_event(
+                    source_event_id=source_event_id,
+                    session_id=session_id,
+                    tool_run_id=resolved_tool_run_id,
+                    timestamp=str(record.get("timestamp", "")),
+                    event_type=str(record.get("event_type", "")),
+                    phase=str(record.get("phase", "")),
+                    agent_id=str(record.get("agent_id", "") or "") or None,
+                    payload=payload if isinstance(payload, dict) else {},
+                )
+        self.storage.mark_tool_run_timeline_backfilled(session_id, utc_now())
+
+    def _collect_tool_run_timeline_call_map(
+        self,
+        session_id: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        call_id_to_run_id: dict[str, str] = {}
+        for row in rows:
+            record = self._event_record_from_storage_row(
+                row,
+                default_session_id=session_id,
+            )
+            payload = record.get("payload", {})
+            payload = payload if isinstance(payload, dict) else {}
+            action = payload.get("action")
+            action = action if isinstance(action, dict) else {}
+            call_id = str(action.get("_tool_call_id", "")).strip()
+            tool_run_id = str(payload.get("tool_run_id", "")).strip() or str(
+                action.get("tool_run_id", "")
+            ).strip()
+            if call_id and tool_run_id:
+                call_id_to_run_id[call_id] = tool_run_id
+        return call_id_to_run_id
+
+    def _resolve_tool_run_timeline_run_id(
+        self,
+        record: dict[str, Any],
+        *,
+        call_id_to_run_id: dict[str, str],
+    ) -> str:
+        payload = record.get("payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        action = payload.get("action")
+        action = action if isinstance(action, dict) else {}
+        call_id = str(action.get("_tool_call_id", "")).strip()
+        event_type = str(record.get("event_type", "")).strip()
+        resolved_tool_run_id = str(payload.get("tool_run_id", "")).strip()
+        if event_type == "tool_run_submitted" and resolved_tool_run_id and call_id:
+            call_id_to_run_id[call_id] = resolved_tool_run_id
+        if not resolved_tool_run_id and call_id:
+            resolved_tool_run_id = call_id_to_run_id.get(call_id, "")
+        if not resolved_tool_run_id and event_type in {"tool_call_started", "tool_call"}:
+            resolved_tool_run_id = str(action.get("tool_run_id", "")).strip()
+        return resolved_tool_run_id
+
+    def _dedupe_tool_run_timeline_entries(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        for entry in entries:
+            last = deduped[-1] if deduped else None
+            if (
+                last
+                and last.get("timestamp") == entry["timestamp"]
+                and last.get("event_type") == entry["event_type"]
+                and last.get("phase") == entry["phase"]
+            ):
+                continue
+            deduped.append(entry)
+        return deduped
 
     def _annotate_prompt_visibility_for_records(
         self,
@@ -2112,79 +2519,27 @@ class Orchestrator:
         if not agent_ids:
             return {}
         keep_count = max(0, int(self.config.runtime.context.keep_pinned_messages))
+        stored_agent_rows = self.storage.load_agents(session_id)
+        source_rows = stored_agent_rows if stored_agent_rows else self._session_agent_rows(session_id)
         rows_by_agent = {
             str(row.get("id", "")).strip(): row
-            for row in self.storage.load_agents(session_id)
+            for row in source_rows
             if isinstance(row, dict) and str(row.get("id", "")).strip()
         }
         logger = self._get_message_logger(session_id)
         projections: dict[str, Any] = {}
         for agent_id in agent_ids:
-            full_records = logger.read(agent_id)
-            if not full_records:
+            message_count = logger.count(agent_id)
+            if message_count <= 0:
                 continue
             agent_row = rows_by_agent.get(agent_id, {})
             metadata = self._message_projection_metadata(agent_row)
-            internal_indices = {
-                _safe_int(record.get("message_index"), default=-1)
-                for record in full_records
-                if isinstance(record, dict) and bool(record.get("internal", False))
-            }
-            internal_indices = {index for index in internal_indices if index >= 0}
-            if internal_indices:
-                merged_internal = {
-                    _safe_int(value, default=-1)
-                    for value in metadata.get("internal_message_indices", [])
-                    if _safe_int(value, default=-1) >= 0
-                }
-                merged_internal.update(internal_indices)
-                metadata = dict(metadata)
-                metadata["internal_message_indices"] = sorted(merged_internal)
-            conversation = self._conversation_from_message_records(full_records)
-            if not conversation:
-                continue
-            role_text = str(agent_row.get("role", AgentRole.WORKER.value)).strip().lower()
-            try:
-                role = AgentRole(role_text)
-            except ValueError:
-                role = AgentRole.WORKER
-            agent = AgentNode(
-                id=agent_id,
-                session_id=session_id,
-                name=str(agent_row.get("name", agent_id) or agent_id),
-                role=role,
-                instruction=str(agent_row.get("instruction", "")),
-                workspace_id=str(agent_row.get("workspace_id", "workspace")),
+            projections[agent_id] = prompt_window_projection_from_metadata(
+                message_count=message_count,
                 metadata=metadata,
-                conversation=conversation,
-            )
-            projections[agent_id] = prompt_window_projection(
-                agent,
                 keep_pinned_messages=keep_count,
             )
         return projections
-
-    @staticmethod
-    def _conversation_from_message_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        conversation: list[dict[str, Any]] = []
-        for record in sorted(
-            records,
-            key=lambda item: _safe_int(item.get("message_index"), default=-1),
-        ):
-            message_index = _safe_int(record.get("message_index"), default=-1)
-            if message_index < 0:
-                continue
-            while len(conversation) <= message_index:
-                conversation.append({"role": "assistant", "content": ""})
-            message = record.get("message")
-            if isinstance(message, dict):
-                conversation[message_index] = message
-            else:
-                conversation[message_index] = {
-                    "role": str(record.get("role", "")).strip() or "assistant",
-                    "content": str(message or ""),
-                }
-        return conversation
 
     @staticmethod
     def _message_projection_metadata(agent_row: dict[str, Any]) -> dict[str, Any]:
@@ -2371,7 +2726,7 @@ class Orchestrator:
 
     def _agent_name_index_for_session(self, session_id: str) -> dict[str, str]:
         index: dict[str, str] = {}
-        for row in self.storage.load_agents(session_id):
+        for row in self._session_agent_rows(session_id):
             agent_id = str(row.get("id", "")).strip()
             if not agent_id:
                 continue
@@ -5020,6 +5375,7 @@ class Orchestrator:
                 action=action,
                 agents=agents,
                 workspace_manager=workspace_manager,
+                tool_run_id=run.id,
             )
             await self._apply_cancel_agent_side_effects(
                 session=session,
@@ -5045,6 +5401,7 @@ class Orchestrator:
                 action=action,
                 agents=agents,
                 workspace_manager=workspace_manager,
+                tool_run_id=run.id,
             )
 
         refreshed = self.storage.load_tool_run(run.id)
@@ -6020,7 +6377,7 @@ class Orchestrator:
         normalized_agent_id = str(agent_id or "").strip()
         if not normalized_agent_id:
             return None
-        for row in self.storage.load_agents(normalized_session_id):
+        for row in self._session_agent_rows(normalized_session_id):
             if str(row.get("id", "")).strip() == normalized_agent_id:
                 return row
         return None
@@ -6778,14 +7135,26 @@ class Orchestrator:
         action: dict[str, Any],
         agents: dict[str, AgentNode],
         workspace_manager: WorkspaceManager,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         self.tool_executor.set_project_dir(self.project_dir)
-        return self.tool_executor.execute_read_only(
-            agent=agent,
-            action=action,
-            agents=agents,
-            workspace_manager=workspace_manager,
-        )
+        try:
+            return self.tool_executor.execute_read_only(
+                agent=agent,
+                action=action,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                tool_run_id=tool_run_id,
+            )
+        except TypeError as exc:
+            if "tool_run_id" not in str(exc):
+                raise
+            return self.tool_executor.execute_read_only(
+                agent=agent,
+                action=action,
+                agents=agents,
+                workspace_manager=workspace_manager,
+            )
 
     async def _execute_read_only_action_with_timeout(
         self,
@@ -6794,6 +7163,7 @@ class Orchestrator:
         action: dict[str, Any],
         agents: dict[str, AgentNode],
         workspace_manager: WorkspaceManager,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         action_type = str(action.get("type", "tool"))
         timeout_seconds = self.tool_executor.timeout_seconds_for_action(action_type)
@@ -6805,6 +7175,7 @@ class Orchestrator:
             action=action,
             agents=agents,
             workspace_manager=workspace_manager,
+            tool_run_id=tool_run_id,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         if duration_ms > timeout_budget_ms:
@@ -6864,12 +7235,23 @@ class Orchestrator:
                 text=text,
             )
 
-        return await self.tool_executor.execute_shell(
-            agent,
-            action,
-            workspace_manager,
-            stream_listener=_on_stream if normalized_tool_run_id else None,
-        )
+        try:
+            return await self.tool_executor.execute_shell(
+                agent,
+                action,
+                workspace_manager,
+                stream_listener=_on_stream if normalized_tool_run_id else None,
+                tool_run_id=normalized_tool_run_id or None,
+            )
+        except TypeError as exc:
+            if "tool_run_id" not in str(exc):
+                raise
+            return await self.tool_executor.execute_shell(
+                agent,
+                action,
+                workspace_manager,
+                stream_listener=_on_stream if normalized_tool_run_id else None,
+            )
 
     def _append_tool_result(
         self,
@@ -6944,12 +7326,24 @@ class Orchestrator:
     def _sync_agent_messages(self, agent: AgentNode) -> None:
         self._get_message_logger(agent.session_id).sync_conversation(agent)
 
-    def _sync_session_messages_from_checkpoint(self, session_id: str) -> None:
+    def _sync_session_messages_from_checkpoint(
+        self,
+        session_id: str,
+        *,
+        agent_ids: set[str] | None = None,
+    ) -> None:
         normalized_session_id = self._normalize_session_id(session_id)
         checkpoint = self.storage.latest_checkpoint(normalized_session_id)
         if not checkpoint:
             return
-        for payload in checkpoint["state"].get("agents", {}).values():
+        normalized_agent_ids = (
+            {str(agent_id).strip() for agent_id in agent_ids if str(agent_id).strip()}
+            if agent_ids is not None
+            else None
+        )
+        for agent_id, payload in checkpoint["state"].get("agents", {}).items():
+            if normalized_agent_ids is not None and str(agent_id).strip() not in normalized_agent_ids:
+                continue
             self._sync_agent_messages(self._agent_from_state(payload))
 
     def _restore_agent_conversations_from_messages(

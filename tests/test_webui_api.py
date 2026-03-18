@@ -12,6 +12,7 @@ from opencompany.models import (
     AgentNode,
     AgentRole,
     AgentStatus,
+    EventRecord,
     RunSession,
     SessionStatus,
     SteerRun,
@@ -821,6 +822,89 @@ keep_pinned_messages = 3
                 response = client.post("/api/resume", json={"session_id": "any", "instruction": "continue"})
                 self.assertIn(response.status_code, {404, 405})
 
+    def test_events_endpoint_supports_recent_activity_window_and_before_cursor(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-events-window"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            project_dir = app_dir / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=project_dir,
+                    task="events",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.INTERRUPTED,
+                )
+            )
+            orchestrator.storage.upsert_agent(
+                AgentNode(
+                    id="agent-root",
+                    session_id=session_id,
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="events",
+                    workspace_id="root",
+                    status=AgentStatus.PAUSED,
+                )
+            )
+            for timestamp, event_type, payload in [
+                ("2026-03-11T12:00:00Z", "session_started", {"task": "events"}),
+                ("2026-03-11T12:00:01Z", "llm_reasoning", {"token": "thinking"}),
+                ("2026-03-11T12:00:02Z", "agent_prompt", {"step_count": 1, "agent_name": "Root"}),
+                ("2026-03-11T12:00:03Z", "shell_stream", {"stream": "stdout", "chunk": "hi"}),
+                ("2026-03-11T12:00:04Z", "agent_completed", {"summary": "done"}),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session_id,
+                        agent_id="agent-root",
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="runtime",
+                        payload=payload,
+                        workspace_id="root",
+                        checkpoint_seq=0,
+                    )
+                )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                first = client.get(
+                    f"/api/session/{session_id}/events?limit=2&activity_only=true"
+                )
+                self.assertEqual(first.status_code, 200)
+                first_payload = first.json()
+                self.assertEqual(
+                    [item["event_type"] for item in first_payload["events"]],
+                    ["agent_prompt", "agent_completed"],
+                )
+                self.assertEqual(
+                    [item["id"] for item in first_payload["agents"]],
+                    ["agent-root"],
+                )
+                self.assertTrue(first_payload["has_more_before"])
+                self.assertTrue(first_payload["before_cursor"])
+
+                second = client.get(
+                    f"/api/session/{session_id}/events?limit=2&activity_only=true&include_agents=false&before={first_payload['before_cursor']}"
+                )
+                self.assertEqual(second.status_code, 200)
+                second_payload = second.json()
+                self.assertEqual(
+                    [item["event_type"] for item in second_payload["events"]],
+                    ["session_started"],
+                )
+                self.assertEqual(second_payload["agents"], [])
+                self.assertFalse(second_payload["has_more_before"])
+
     def test_tool_run_endpoints_return_rows_and_metrics(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -935,6 +1019,83 @@ keep_pinned_messages = 3
                 self.assertEqual(run["status"], ToolRunStatus.RUNNING.value)
                 self.assertEqual(run["stdout"], "line-1\nline-2\n")
                 self.assertEqual(run["stderr"], "warn-1\n")
+                self.assertEqual(run["timeline"], [])
+
+    def test_tool_run_detail_endpoint_includes_timeline(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-tool-run-timeline"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id="toolrun-1",
+                    session_id=session_id,
+                    agent_id="agent-root",
+                    tool_name="shell",
+                    arguments={"type": "shell", "command": "pwd"},
+                    status=ToolRunStatus.COMPLETED,
+                    blocking=True,
+                    created_at="2026-03-14T12:00:00Z",
+                    started_at="2026-03-14T12:00:01Z",
+                    completed_at="2026-03-14T12:00:02Z",
+                    result={"stdout": "/tmp/demo\n"},
+                )
+            )
+            for timestamp, event_type, payload in [
+                (
+                    "2026-03-14T12:00:00Z",
+                    "tool_call_started",
+                    {
+                        "action": {
+                            "type": "shell",
+                            "command": "pwd",
+                            "_tool_call_id": "call-1",
+                            "tool_run_id": "toolrun-1",
+                        }
+                    },
+                ),
+                (
+                    "2026-03-14T12:00:01Z",
+                    "tool_run_submitted",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "shell",
+                        "action": {"_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-14T12:00:02Z",
+                    "tool_run_updated",
+                    {"tool_run_id": "toolrun-1", "status": ToolRunStatus.COMPLETED.value},
+                ),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session_id,
+                        agent_id="agent-root",
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="runtime",
+                        payload=payload,
+                        workspace_id="root",
+                        checkpoint_seq=0,
+                    )
+                )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                detail = client.get(f"/api/session/{session_id}/tool-runs/toolrun-1")
+                self.assertEqual(detail.status_code, 200)
+                timeline = detail.json()["tool_run"]["timeline"]
+                self.assertEqual(
+                    [item["event_type"] for item in timeline],
+                    ["tool_call_started", "tool_run_submitted", "tool_run_updated"],
+                )
 
     def test_steer_run_endpoints_submit_list_metrics_and_cancel(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1268,6 +1429,85 @@ keep_pinned_messages = 3
                     sorted({item["agent_id"] for item in filtered_payload["messages"]}),
                     ["agent-root"],
                 )
+
+    def test_messages_endpoint_supports_tail_and_before_cursor(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-messages-before"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            root_path = session_dir / "agent-root_messages.jsonl"
+            root_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:00Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 0,
+                                "role": "user",
+                                "message": {"role": "user", "content": "first"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:01Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 1,
+                                "role": "assistant",
+                                "message": {"role": "assistant", "content": "second"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:02Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 2,
+                                "role": "assistant",
+                                "message": {"role": "assistant", "content": "third"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                tail = client.get(f"/api/session/{session_id}/messages?limit=2&tail=2")
+                self.assertEqual(tail.status_code, 200)
+                tail_payload = tail.json()
+                self.assertEqual(
+                    [item["message"]["content"] for item in tail_payload["messages"]],
+                    ["second", "third"],
+                )
+                self.assertFalse(tail_payload["has_more"])
+                self.assertTrue(tail_payload["next_cursor"])
+                self.assertTrue(tail_payload["has_more_before"])
+                self.assertTrue(tail_payload["before_cursor"])
+
+                previous = client.get(
+                    f"/api/session/{session_id}/messages?limit=2&before={tail_payload['before_cursor']}"
+                )
+                self.assertEqual(previous.status_code, 200)
+                previous_payload = previous.json()
+                self.assertEqual(
+                    [item["message"]["content"] for item in previous_payload["messages"]],
+                    ["first"],
+                )
+                self.assertFalse(previous_payload["has_more_before"])
 
     def test_messages_endpoint_annotates_prompt_visibility_with_summary_window(self) -> None:
         with TemporaryDirectory() as temp_dir:

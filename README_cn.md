@@ -127,6 +127,7 @@ opencompany tui --remote-target demo@example.com --remote-dir /home/demo/workspa
 - 不要将远程参数与 `--session-id` 同时使用。
 - 不要将 `--workspace-mode` 与 `--session-id` 同时使用。
 - `staged` 模式不支持远程工作区。
+- 使用 `--session-id` 加载已有会话时，会直接绑定原 session，不会再隐式 clone。
 
 ## 💻 CLI 常用命令
 
@@ -175,6 +176,13 @@ opencompany run \
 ```bash
 opencompany resume <session_id> "new instruction"
 opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
+```
+
+若希望先分叉出一个副本，再继续执行：
+
+```bash
+opencompany clone <session_id>
+opencompany clone <session_id> --app-dir /path/to/app
 ```
 
 应用 / 撤销 staged 写回：
@@ -227,6 +235,7 @@ opencompany terminal <session_id> --self-check
 补充说明：
 
 - `opencompany run` 与 `opencompany resume` 在交互终端会显示动态状态面板。
+- `opencompany resume <session_id> ...` 会直接在原 session 上继续；若要保留原 session 并创建分支副本，请先执行 `opencompany clone <session_id>`。
 - 面板默认每 `5s` 自动分页；可按 `=` / `+` / `-` 手动切页。
 - 用 `--preview-chars N` 调整各字段预览宽度（默认 `256`）。
 - 在 `run` / `resume` 中可用 `--sandbox-backend <name>` 仅覆盖本次调用的 `[sandbox].backend`。

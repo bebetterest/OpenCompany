@@ -3908,7 +3908,12 @@ class OpenCompanyApp(App):
         normalized_agent_id = str(agent_id or "").strip()
         if not normalized_agent_id:
             return ""
-        for row in orchestrator.storage.load_agents(session_id):
+        load_agents = getattr(orchestrator, "load_session_agents", None)
+        if callable(load_agents):
+            rows = load_agents(session_id)
+        else:
+            rows = orchestrator.storage.load_agents(session_id)
+        for row in rows:
             if str(row.get("id", "")).strip() != normalized_agent_id:
                 continue
             return str(row.get("role", "")).strip().lower()

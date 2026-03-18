@@ -15,6 +15,8 @@ Primary tables:
 - `sessions`: session metadata, status, summaries, config snapshot
 - `agents`: agent graph nodes, lineage, completion fields
 - `events`: structured runtime events
+- `tool_run_timeline_events`: write-time projected tool-run lifecycle rows keyed by source event id
+- `tool_run_timeline_backfills`: per-session marker for one-time legacy timeline projection backfill
 - `checkpoints`: serialized runtime snapshots
 - `pending_actions`: pending agent queue markers
 - `tool_runs`: persisted tool execution lifecycle
@@ -42,6 +44,9 @@ Runtime events complement message logs with:
 
 - stream previews (`llm_token`, `llm_reasoning`) for telemetry/logging (not shown in live agent panels)
 - tool-run lifecycle transitions for Tool Runs views
+  - new sessions project `tool_call_started` / `tool_call` / `tool_run_submitted` / `tool_run_updated` into `tool_run_timeline_events` at event-write time
+  - legacy sessions lazily backfill that projection once on first tool-run detail read, then serve detail timelines from the projection table instead of rescanning session-wide events
+  - explicit session clone rebuilds the same projection from cloned events up front, so cloned sessions do not pay a second first-detail backfill
 - steer-run lifecycle transitions (`steer_run_submitted`, `steer_run_updated`) for Steer Runs views
 - shell/protocol/control/sandbox diagnostics
 

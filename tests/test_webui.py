@@ -126,7 +126,7 @@ class WebUIStateTests(unittest.TestCase):
                 def load_session_context(self, session_id: str) -> RunSession:
                     del session_id
                     return RunSession(
-                        id="session-copy-1",
+                        id="session-1",
                         project_dir=project_dir,
                         task="loaded task",
                         locale="en",
@@ -137,8 +137,8 @@ class WebUIStateTests(unittest.TestCase):
 
             state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
             state.set_launch_config(project_dir=None, session_id="session-1")
-            self.assertEqual(state.configured_resume_session_id, "session-copy-1")
-            self.assertEqual(state.current_session_id, "session-copy-1")
+            self.assertEqual(state.configured_resume_session_id, "session-1")
+            self.assertEqual(state.current_session_id, "session-1")
             self.assertEqual(state.project_dir, project_dir.resolve())
             self.assertTrue(state.launch_config().can_resume())
             self.assertEqual(state.launch_config().session_mode, WorkspaceMode.DIRECT)

@@ -165,6 +165,7 @@ class AgentMessageLogger:
     def __init__(self, session_dir: Path) -> None:
         self.session_dir = ensure_directory(session_dir)
         self._message_counts: dict[str, int] = {}
+        self._line_offsets: dict[str, list[int]] = {}
 
     def messages_path(self, agent_id: str) -> Path:
         return self.session_dir / f"{agent_id}_messages.jsonl"
@@ -189,8 +190,12 @@ class AgentMessageLogger:
         }
         if metadata:
             record.update(json_ready(metadata))
-        append_jsonl(self.messages_path(agent.id), record)
+        message_path = self.messages_path(agent.id)
+        existing_size = message_path.stat().st_size if message_path.exists() else 0
+        append_jsonl(message_path, record)
         self._message_counts[agent.id] = message_index + 1
+        if agent.id in self._line_offsets:
+            self._line_offsets[agent.id].append(existing_size)
         return record
 
     def sync_conversation(self, agent: AgentNode) -> None:
@@ -199,17 +204,16 @@ class AgentMessageLogger:
             self.append(agent, message)
 
     def read(self, agent_id: str) -> list[dict[str, Any]]:
-        path = self.messages_path(agent_id)
-        if not path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                records.append(json.loads(line))
-        return records
+        return self._read_range(agent_id, 0, self._message_count(agent_id))
+
+    def count(self, agent_id: str) -> int:
+        return self._message_count(agent_id)
+
+    def has_records_file(self, agent_id: str) -> bool:
+        return self.messages_path(agent_id).exists()
+
+    def agent_ids(self) -> list[str]:
+        return self._agent_ids()
 
     def read_all(self) -> dict[str, list[dict[str, Any]]]:
         records: dict[str, list[dict[str, Any]]] = {}
@@ -225,6 +229,7 @@ class AgentMessageLogger:
         cursor: str | None = None,
         limit: int = 500,
         tail: int | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         try:
             normalized_limit = max(1, min(5000, int(limit)))
@@ -238,28 +243,163 @@ class AgentMessageLogger:
             except (TypeError, ValueError):
                 normalized_tail = 500
 
-        offsets = self._decode_cursor_offsets(cursor)
         candidate_agent_ids = (
             [normalized_agent_id] if normalized_agent_id is not None else self._agent_ids()
         )
-        records: list[dict[str, Any]] = []
-        for current_agent_id in candidate_agent_ids:
-            last_index = offsets.get(current_agent_id, -1)
-            for record in self.read(current_agent_id):
-                message_index = self._message_index(record)
-                if message_index <= last_index:
-                    continue
-                records.append(record)
-
-        records.sort(key=self._message_sort_key)
+        if before is not None:
+            return self._list_records_before(
+                candidate_agent_ids=candidate_agent_ids,
+                before=before,
+                limit=normalized_limit,
+            )
         if normalized_tail is not None and cursor is None:
-            records = records[-normalized_tail:]
-            has_more = False
-        else:
-            has_more = len(records) > normalized_limit
-            if has_more:
-                records = records[:normalized_limit]
+            return self._list_records_tail(
+                candidate_agent_ids=candidate_agent_ids,
+                tail=normalized_tail,
+            )
+        return self._list_records_after(
+            candidate_agent_ids=candidate_agent_ids,
+            cursor=cursor,
+            limit=normalized_limit,
+        )
 
+    def _message_count(self, agent_id: str) -> int:
+        offsets = self._line_offsets.get(agent_id)
+        if offsets is not None:
+            return len(offsets)
+        count = self._message_counts.get(agent_id)
+        if count is not None:
+            return count
+        return len(self._line_offsets_for(agent_id))
+
+    def _line_offsets_for(self, agent_id: str) -> list[int]:
+        cached = self._line_offsets.get(agent_id)
+        if cached is not None:
+            return cached
+        path = self.messages_path(agent_id)
+        if not path.exists():
+            self._line_offsets[agent_id] = []
+            self._message_counts[agent_id] = 0
+            return self._line_offsets[agent_id]
+        offsets: list[int] = []
+        with path.open("rb") as handle:
+            while True:
+                position = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip():
+                    offsets.append(position)
+        self._line_offsets[agent_id] = offsets
+        self._message_counts[agent_id] = len(offsets)
+        return offsets
+
+    def _read_range(
+        self,
+        agent_id: str,
+        start_index: int,
+        end_index: int | None,
+    ) -> list[dict[str, Any]]:
+        offsets = self._line_offsets_for(agent_id)
+        count = len(offsets)
+        if count <= 0:
+            return []
+        normalized_start = max(0, int(start_index))
+        normalized_end = count if end_index is None else max(0, min(count, int(end_index)))
+        if normalized_start >= normalized_end:
+            return []
+        path = self.messages_path(agent_id)
+        records: list[dict[str, Any]] = []
+        with path.open("rb") as handle:
+            for index in range(normalized_start, normalized_end):
+                handle.seek(offsets[index])
+                line = handle.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8").strip()
+                if not text:
+                    continue
+                records.append(json.loads(text))
+        return records
+
+    def _iter_records_forward(self, agent_id: str, start_index: int):
+        offsets = self._line_offsets_for(agent_id)
+        count = len(offsets)
+        normalized_start = max(0, int(start_index))
+        if normalized_start >= count:
+            return
+        path = self.messages_path(agent_id)
+        with path.open("rb") as handle:
+            for index in range(normalized_start, count):
+                handle.seek(offsets[index])
+                line = handle.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8").strip()
+                if not text:
+                    continue
+                yield json.loads(text)
+
+    def _iter_records_backward(self, agent_id: str, start_index: int):
+        offsets = self._line_offsets_for(agent_id)
+        count = len(offsets)
+        if count <= 0:
+            return
+        normalized_start = min(count - 1, max(0, int(start_index)))
+        path = self.messages_path(agent_id)
+        with path.open("rb") as handle:
+            for index in range(normalized_start, -1, -1):
+                handle.seek(offsets[index])
+                line = handle.readline()
+                if not line:
+                    continue
+                text = line.decode("utf-8").strip()
+                if not text:
+                    continue
+                yield json.loads(text)
+
+    def _list_records_after(
+        self,
+        *,
+        candidate_agent_ids: list[str],
+        cursor: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        offsets = self._decode_cursor_offsets(cursor)
+        next_indices: dict[str, int] = {}
+        current_records: dict[str, dict[str, Any]] = {}
+        streams: dict[str, Any] = {}
+        for current_agent_id in candidate_agent_ids:
+            count = self._message_count(current_agent_id)
+            start_index = min(
+                count,
+                max(0, offsets.get(current_agent_id, -1) + 1),
+            )
+            if start_index >= count:
+                continue
+            stream = self._iter_records_forward(current_agent_id, start_index)
+            record = next(stream, None)
+            if record is None:
+                continue
+            current_records[current_agent_id] = record
+            streams[current_agent_id] = stream
+            next_indices[current_agent_id] = start_index + 1
+        records: list[dict[str, Any]] = []
+        while len(records) < limit and current_records:
+            selected_agent_id = min(
+                current_records,
+                key=lambda agent_id: self._message_sort_key(current_records[agent_id]),
+            )
+            records.append(current_records[selected_agent_id])
+            next_record = next(streams[selected_agent_id], None)
+            next_indices[selected_agent_id] = next_indices.get(selected_agent_id, 0) + 1
+            if next_record is None:
+                current_records.pop(selected_agent_id, None)
+                next_indices.pop(selected_agent_id, None)
+                streams.pop(selected_agent_id, None)
+                continue
+            current_records[selected_agent_id] = next_record
+        has_more = bool(current_records)
         next_offsets = dict(offsets)
         for record in records:
             current_agent_id = str(record.get("agent_id", "")).strip()
@@ -273,20 +413,128 @@ class AgentMessageLogger:
             "messages": records,
             "next_cursor": next_cursor,
             "has_more": has_more,
+            "before_cursor": None,
+            "has_more_before": False,
         }
 
-    def _message_count(self, agent_id: str) -> int:
-        count = self._message_counts.get(agent_id)
-        if count is not None:
-            return count
-        path = self.messages_path(agent_id)
-        if not path.exists():
-            self._message_counts[agent_id] = 0
-            return 0
-        with path.open("r", encoding="utf-8") as handle:
-            count = sum(1 for line in handle if line.strip())
-        self._message_counts[agent_id] = count
-        return count
+    def _list_records_tail(
+        self,
+        *,
+        candidate_agent_ids: list[str],
+        tail: int,
+    ) -> dict[str, Any]:
+        upper_bounds: dict[str, int] = {}
+        frontier_offsets: dict[str, int] = {}
+        for current_agent_id in candidate_agent_ids:
+            count = self._message_count(current_agent_id)
+            if count <= 0:
+                continue
+            upper_bounds[current_agent_id] = count
+            frontier_offsets[current_agent_id] = count - 1
+        records, has_more_before = self._collect_descending_window(
+            agent_upper_bounds=upper_bounds,
+            limit=tail,
+        )
+        before_offsets = self._before_offsets_for_page(
+            candidate_agent_ids=candidate_agent_ids,
+            records=records,
+            fallback_offsets=upper_bounds,
+        )
+        return {
+            "messages": records,
+            "next_cursor": self._encode_cursor_offsets(frontier_offsets),
+            "has_more": False,
+            "before_cursor": (
+                self._encode_cursor_offsets(before_offsets) if has_more_before else None
+            ),
+            "has_more_before": has_more_before,
+        }
+
+    def _list_records_before(
+        self,
+        *,
+        candidate_agent_ids: list[str],
+        before: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        upper_bounds = self._decode_cursor_offsets(before)
+        fallback_offsets: dict[str, int] = {}
+        for current_agent_id in candidate_agent_ids:
+            count = self._message_count(current_agent_id)
+            upper_bound = min(count, max(0, upper_bounds.get(current_agent_id, count)))
+            fallback_offsets[current_agent_id] = upper_bound
+        records, has_more_before = self._collect_descending_window(
+            agent_upper_bounds=fallback_offsets,
+            limit=limit,
+        )
+        before_offsets = self._before_offsets_for_page(
+            candidate_agent_ids=candidate_agent_ids,
+            records=records,
+            fallback_offsets=fallback_offsets,
+        )
+        return {
+            "messages": records,
+            "next_cursor": None,
+            "has_more": False,
+            "before_cursor": (
+                self._encode_cursor_offsets(before_offsets) if records and has_more_before else None
+            ),
+            "has_more_before": bool(records) and has_more_before,
+        }
+
+    def _collect_descending_window(
+        self,
+        *,
+        agent_upper_bounds: dict[str, int],
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        current_records: dict[str, dict[str, Any]] = {}
+        streams: dict[str, Any] = {}
+        for agent_id, upper_bound in agent_upper_bounds.items():
+            if upper_bound <= 0:
+                continue
+            stream = self._iter_records_backward(agent_id, upper_bound - 1)
+            record = next(stream, None)
+            if record is None:
+                continue
+            current_records[agent_id] = record
+            streams[agent_id] = stream
+        selected_desc: list[dict[str, Any]] = []
+        while len(selected_desc) < limit and current_records:
+            selected_agent_id = max(
+                current_records,
+                key=lambda agent_id: self._message_sort_key(current_records[agent_id]),
+            )
+            selected_desc.append(current_records[selected_agent_id])
+            next_record = next(streams[selected_agent_id], None)
+            if next_record is None:
+                current_records.pop(selected_agent_id, None)
+                streams.pop(selected_agent_id, None)
+                continue
+            current_records[selected_agent_id] = next_record
+        return list(reversed(selected_desc)), bool(current_records)
+
+    def _before_offsets_for_page(
+        self,
+        *,
+        candidate_agent_ids: list[str],
+        records: list[dict[str, Any]],
+        fallback_offsets: dict[str, int],
+    ) -> dict[str, int]:
+        page_offsets = dict(fallback_offsets)
+        for record in records:
+            current_agent_id = str(record.get("agent_id", "")).strip()
+            if not current_agent_id:
+                continue
+            message_index = self._message_index(record)
+            current = page_offsets.get(current_agent_id)
+            if current is None or message_index < current:
+                page_offsets[current_agent_id] = message_index
+        return {
+            agent_key: int(page_offsets.get(agent_key, fallback_offsets.get(agent_key, 0)))
+            for agent_key in candidate_agent_ids
+            if int(page_offsets.get(agent_key, fallback_offsets.get(agent_key, 0))) >= 0
+        }
 
     def _agent_ids(self) -> list[str]:
         return [

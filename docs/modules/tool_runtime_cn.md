@@ -136,6 +136,9 @@ agent 可见工具返回采用精简投影协议：
 - 状态：`queued` -> `running` -> `completed|failed|cancelled`
 - 时间戳：`created_at`、`started_at`、`completed_at`
 - 负载：arguments、原始 result、error
+- 详情时间线：按 `tool_run_id` 读取投影后的生命周期行（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
+  - 新 session 会在 event 追加时增量写入这些投影行
+  - 旧 session 会在首次打开详情时做一次投影回填
 
 ## 执行语义
 

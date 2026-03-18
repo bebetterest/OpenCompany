@@ -127,6 +127,7 @@ Rules:
 - Do not combine remote flags with `--session-id`.
 - Do not combine `--workspace-mode` with `--session-id`.
 - `staged` mode does not support remote workspace.
+- Loading an existing session with `--session-id` binds the original session directly; it does not create an implicit clone.
 
 ## 💻 CLI command cheat sheet
 
@@ -175,6 +176,13 @@ Continue an existing session:
 ```bash
 opencompany resume <session_id> "new instruction"
 opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
+```
+
+Clone an existing session first when you want a branch copy:
+
+```bash
+opencompany clone <session_id>
+opencompany clone <session_id> --app-dir /path/to/app
 ```
 
 Apply / undo staged project sync:
@@ -227,6 +235,7 @@ opencompany terminal <session_id> --self-check
 Notes:
 
 - `opencompany run` and `opencompany resume` show a live status panel in interactive terminals.
+- `opencompany resume <session_id> ...` continues the original session in place; use `opencompany clone <session_id>` first if you want a forked copy.
 - Panel supports auto pagination every `5s`; press `=` / `+` / `-` for manual page switching.
 - Use `--preview-chars N` to adjust per-field preview width (default `256`).
 - Use `--sandbox-backend <name>` on `run` / `resume` to override `[sandbox].backend` for that invocation only.

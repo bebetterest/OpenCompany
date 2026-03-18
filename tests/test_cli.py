@@ -242,6 +242,15 @@ class CliParserTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["resume", "session-123"])
 
+    def test_clone_accepts_session_id_and_common_flags(self) -> None:
+        args = build_parser().parse_args(
+            ["clone", "session-123", "--app-dir", "/tmp/app", "--locale", "zh", "--debug"]
+        )
+        self.assertEqual(args.session_id, "session-123")
+        self.assertEqual(args.app_dir, "/tmp/app")
+        self.assertEqual(args.locale, "zh")
+        self.assertTrue(args.debug)
+
     def test_apply_and_undo_commands_are_available(self) -> None:
         apply_args = build_parser().parse_args(["apply", "session-123", "--yes"])
         undo_args = build_parser().parse_args(["undo", "session-123", "--yes"])
@@ -924,8 +933,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                 self._subscriber = callback
 
             def load_session_context(self, session_id: str):  # type: ignore[no-untyped-def]
-                del session_id
-                return SimpleNamespace(id="session-copy-123")
+                return SimpleNamespace(id=str(session_id))
 
             async def run_task(self, _task: str):  # type: ignore[no-untyped-def]
                 self.latest_session_id = "session-123"
@@ -1198,7 +1206,7 @@ class CliRunResumePanelTests(unittest.TestCase):
         self.assertEqual(orchestrator.tool_executor.sandbox_backend_cls, "backend::none")
         self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
 
-    def test_resume_passes_model_and_applies_sandbox_backend_before_load(self) -> None:
+    def test_resume_passes_model_and_applies_sandbox_backend(self) -> None:
         captured: dict[str, object] = {}
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -1220,12 +1228,6 @@ class CliRunResumePanelTests(unittest.TestCase):
                     )
                     self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
                     captured["orchestrator"] = self
-
-                def load_session_context(self, session_id: str):  # type: ignore[no-untyped-def]
-                    captured["loaded_session_id"] = session_id
-                    captured["load_backend"] = self.config.sandbox.backend
-                    captured["load_backend_cls"] = self.tool_executor.sandbox_backend_cls
-                    return SimpleNamespace(id="session-copy-123")
 
                 async def resume(self, session_id: str, instruction: str, **kwargs):  # type: ignore[no-untyped-def]
                     captured["resumed_session_id"] = session_id
@@ -1267,16 +1269,53 @@ class CliRunResumePanelTests(unittest.TestCase):
                         )
                     )
 
-        self.assertEqual(captured["loaded_session_id"], "session-123")
-        self.assertEqual(captured["resumed_session_id"], "session-copy-123")
+        self.assertEqual(captured["resumed_session_id"], "session-123")
         self.assertEqual(captured["instruction"], "continue from latest status")
         self.assertEqual(captured["resume_kwargs"], {"model": "fake/model"})
-        self.assertEqual(captured["load_backend"], "none")
         self.assertEqual(captured["resume_backend"], "none")
-        self.assertEqual(captured["load_backend_cls"], "backend::none")
         self.assertEqual(captured["resume_backend_cls"], "backend::none")
         orchestrator = captured["orchestrator"]
         self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
+
+    def test_clone_command_calls_explicit_clone_and_prints_ids(self) -> None:
+        captured: dict[str, object] = {"events": []}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.app_dir = Path(app_dir).resolve() if app_dir is not None else Path(temp_dir).resolve()
+                    self.diagnostics = SimpleNamespace(log=lambda **kwargs: captured["events"].append(kwargs))
+
+                def clone_session(self, session_id: str):  # type: ignore[no-untyped-def]
+                    captured["cloned_from"] = session_id
+                    return SimpleNamespace(
+                        id="session-clone-456",
+                        status=SimpleNamespace(value="interrupted"),
+                    )
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    cli._clone_session(
+                        app_dir=app_dir,
+                        locale="en",
+                        session_id="session-123",
+                        debug=False,
+                    )
+
+        rendered = output.getvalue()
+        self.assertEqual(captured["cloned_from"], "session-123")
+        self.assertIn("source_session_id=session-123", rendered)
+        self.assertIn("session_id=session-clone-456", rendered)
+        self.assertIn("session_status=interrupted", rendered)
+        event_types = [str(item.get("event_type", "")) for item in captured["events"]]
+        self.assertEqual(
+            event_types,
+            ["clone_command_started", "clone_command_finished"],
+        )
 
     def test_run_tty_panel_includes_agent_fields(self) -> None:
         output = self._TTYBuffer()
@@ -1425,9 +1464,9 @@ class CliRunResumePanelTests(unittest.TestCase):
                     )
         rendered = output.getvalue()
         self.assertIn("mode=resume", rendered)
-        self.assertIn("session=session-copy-123", rendered)
+        self.assertIn("session=session-123", rendered)
         self.assertIn("Session resumed.", rendered)
-        self.assertIn("session_id=session-copy-123", rendered)
+        self.assertIn("session_id=session-123", rendered)
 
     def test_detail_lines_wrap_long_goal_and_summary(self) -> None:
         panel = cli._RunStatusPanel(

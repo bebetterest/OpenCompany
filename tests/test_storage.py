@@ -1,10 +1,10 @@
 from __future__ import annotations
-
 import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from opencompany.models import EventRecord
 from opencompany.storage import Storage
 
 
@@ -59,3 +59,105 @@ class StorageTests(unittest.TestCase):
 
             assert row is not None
             self.assertEqual(row["workspace_mode"], "staged")
+
+    def test_tool_run_timeline_projection_is_idempotent_and_returns_tail_in_order(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "opencompany.db")
+
+            storage.append_tool_run_timeline_event(
+                source_event_id=2,
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                timestamp="2026-03-18T10:00:02Z",
+                event_type="tool_run_submitted",
+                phase="tool",
+                agent_id="agent-root",
+                payload={"tool_run_id": "toolrun-1", "status": "running"},
+            )
+            storage.append_tool_run_timeline_event(
+                source_event_id=1,
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                timestamp="2026-03-18T10:00:01Z",
+                event_type="tool_call_started",
+                phase="tool",
+                agent_id="agent-root",
+                payload={"tool_run_id": "toolrun-1"},
+            )
+            storage.append_tool_run_timeline_event(
+                source_event_id=2,
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                timestamp="2026-03-18T10:00:02Z",
+                event_type="tool_run_submitted",
+                phase="tool",
+                agent_id="agent-root",
+                payload={"tool_run_id": "toolrun-1", "status": "running"},
+            )
+            storage.append_tool_run_timeline_event(
+                source_event_id=3,
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                timestamp="2026-03-18T10:00:03Z",
+                event_type="tool_run_updated",
+                phase="tool",
+                agent_id="agent-root",
+                payload={"tool_run_id": "toolrun-1", "status": "completed"},
+            )
+
+            timeline = storage.load_tool_run_timeline(
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                limit=2,
+            )
+
+            self.assertEqual(
+                [entry["event_type"] for entry in timeline],
+                ["tool_run_submitted", "tool_run_updated"],
+            )
+            self.assertEqual(
+                [entry["source_event_id"] for entry in timeline],
+                [2, 3],
+            )
+
+    def test_append_event_projects_tool_run_timeline_from_top_level_tool_run_id(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "opencompany.db")
+
+            storage.append_event(
+                EventRecord(
+                    timestamp="2026-03-18T10:00:00Z",
+                    session_id="session-1",
+                    agent_id="agent-root",
+                    parent_agent_id=None,
+                    event_type="tool_call_started",
+                    phase="tool",
+                    payload={
+                        "tool_run_id": "toolrun-1",
+                        "action": {"type": "shell", "_tool_call_id": "call-1"},
+                    },
+                    workspace_id="root",
+                    checkpoint_seq=0,
+                )
+            )
+
+            timeline = storage.load_tool_run_timeline(
+                session_id="session-1",
+                tool_run_id="toolrun-1",
+                limit=10,
+            )
+
+            self.assertEqual(len(timeline), 1)
+            self.assertEqual(timeline[0]["event_type"], "tool_call_started")
+            self.assertEqual(timeline[0]["payload"]["tool_run_id"], "toolrun-1")
+
+    def test_tool_run_timeline_backfill_marker_round_trip(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "opencompany.db")
+
+            self.assertFalse(storage.has_tool_run_timeline_backfill("session-1"))
+            storage.mark_tool_run_timeline_backfilled(
+                "session-1",
+                "2026-03-18T10:00:00Z",
+            )
+            self.assertTrue(storage.has_tool_run_timeline_backfill("session-1"))

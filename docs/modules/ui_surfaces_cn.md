@@ -32,12 +32,12 @@ OpenCompany 当前提供两套本地界面：
 - 远程工作目录仅在 `session_mode=direct` 时可用；`staged + remote` 会被拒绝。
 - 对 password auth 会话，请求态 `remote_password` 会用于 `/api/run`、`/api/terminal/open` 与 `/api/remote/validate`。
 - 当 launch config 提供 `session_id` 时，`/api/run` 会在已有会话内执行：先重新激活该会话，再为这次运行追加一个全新的 root agent。
-- 加载已有会话时，Web UI 会解析其持久化的 workspace mode，并以锁定只读方式展示；外部 mode 覆盖会被忽略。
+- 加载已有会话时，Web UI 会直接绑定原始 `session_id`，解析其持久化的 workspace mode，并以锁定只读方式展示；外部 mode 覆盖会被忽略。
 - 在 setup/reconfigure 加载已有远程会话时，若当前选择 backend 为 `anthropic`，Web UI 会先执行远程运行时校验；backend 为 `none` 时跳过该预校验。
 - 当会话已在运行中时再次提交 `/api/run`，runtime 会立刻在该 live session 里追加一个新的 root agent，并与当前活跃 agents 一起调度执行。
 - 对运行中会话追加 root 时，Web UI 会保留当前内存中的 agent 图并只消费 WebSocket 增量事件；不会全量重放 `/api/session/{id}/events`，以避免父子关系与 cancelled 状态被瞬时覆盖。
 - 对活跃会话，`/api/session/{id}/steers` 仍是正常排队语义；用户 steer 会带上用户来源 actor，并与 agent 工具 steer 共用同一条持久化 steer-run 流程。当目标会话非活跃且当前没有其他运行中会话时，Web UI 会自动继续该会话，并在进入调度前请求 runtime 重新激活被 steer 的 agent。
-- 在 setup/reconfigure 中选择 session 只导入上下文，不会自动运行。
+- 在 setup/reconfigure 中选择 session 时，只会加载持久化的 session 元数据（不会隐式 clone，也不会自动运行）。
 - 在 setup/reconfigure 中选择项目目录会切换到“新会话”模式，并清空易失运行视图（`Overview`/`Agents` 实时流、tool-run 时间线），避免继续显示上一个已加载 session 的旧数据。
 - 在 `direct` 模式下，`Diff` 会被禁用，`Apply` / `Undo` 也不可用，因为改动已经直接写入目标项目。
 
@@ -55,6 +55,8 @@ Web UI 特性：
   - 每次运行/继续前可覆盖；提交值会透传到 runtime，并在该次执行中同时作用于 root/worker 的 LLM 调用
 - 控制栏提供可选 root-agent-name 输入框；非空时 `/api/run` 会透传该值，runtime 以它作为 root agent 命名基底（仍保留会话内去重）
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
+- session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
+- 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示
 - `Agents` 视图（Web/TUI）会显示每个 agent 的上下文压缩运行指标：
   - `compression_count`
   - `current_context_tokens/context_limit_tokens`
@@ -70,6 +72,7 @@ Web UI 特性：
   - agent 状态 KPI 现拆分 `cancelled` 与 `terminated`，不再保留 agent `waiting` 统计桶
 - `Tool Runs` 每行支持详情弹窗，可查看生命周期时间线（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）和 payload
   - 详情数据通过 `/api/session/{id}/tool-runs/{tool_run_id}` 拉取，弹窗打开时持续轮询；因此运行中的 `shell` 可实时查看累计 `stdout/stderr`
+  - 持久化详情时间线现在来自投影化的 tool-run detail API；旧 session 仅在首次打开详情时做一次懒回填，不会每次都重新扫描整段 session events
 - 实时 agent 卡片提供整行 `Steer` 按钮，并使用界面内引导弹框（不再使用系统 prompt/confirm；点击提交即确认），并新增 `Steer Runs` 面板（过滤/分组/统计/搜索）
 - `Steer Runs` 行与相关事件文本优先展示 steer 来源 actor（`from`），原始 source 通道作为次级信息（`via`）
 - `Steer Runs` 行改为多行卡片式展示：目标、来源、通道、创建时间与消息内容分开展示，成功送达的 run 会明确显示插入到哪个步骤
@@ -107,7 +110,7 @@ TUI 提供 run/interrupt、基于 setup 的会话加载、project sync 操作和
 新建会话在 setup 中默认使用 `direct` 模式；在选择项目目录前可切换为 `staged`。
 在 `direct` 模式 setup 中可选择本地目录或远程 SSH 工作目录（target/dir/auth/known-hosts）；`staged` 会禁用远程选择。
 远程 SSH setup 下点击“校验连接并创建”会执行远程校验（SSH 目标/目录/依赖检查），校验通过后立即创建启动配置。
-已加载会话会保留并锁定原始 workspace mode。
+已加载会话会保留原始 `session_id`，并锁定原始 workspace mode。
 当在已有（非活跃）会话上点击 `运行` 时，runtime 会为本次执行追加一个全新的 root agent，而不是复用旧 root，并将该会话切回活跃态。
 当同一会话仍在运行时再次点击 `运行`，runtime 会立刻追加新的 root agent，并与当前活跃 agents 一起调度执行。
 同时在控制栏提供 `终端` 动作，直接拉起系统终端窗口，复用与 agent `shell` 调用一致的 sandbox backend/config，且工作目录固定到当前活动 session workspace。终端改动与 agent 改动一样会被 workspace diff/project sync 跟踪。
@@ -132,7 +135,7 @@ TUI `Tool Runs` 现支持：
 - 分组列表展示，并可在列表内选中 run（`上一条` / `下一条`）
 - 对当前选中 run 打开 `详情` 弹窗
 - 详情字段：概览、arguments、result、error、生命周期时间线
-- 生命周期时间线基于 runtime 事件增量构建（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
+- 持久化详情时间线由投影化的 tool-run detail 读取提供；实时更新仍会按 runtime 事件增量追加（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
 - 详情弹窗打开期间，相关 run 新事件到达会自动刷新详情
 
 TUI `Steer Runs` 现支持：

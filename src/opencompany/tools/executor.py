@@ -269,13 +269,18 @@ class ToolExecutor:
         action: dict[str, Any],
         agents: dict[str, AgentNode],
         workspace_manager: WorkspaceManager,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         action_type = action["type"]
+        normalized_tool_run_id = str(tool_run_id or "").strip()
         self._log_agent_event(
             agent,
             event_type="tool_call_started",
             phase="tool",
-            payload={"action": json_ready(_public_action(action))},
+            payload={
+                "action": json_ready(_public_action(action)),
+                **({"tool_run_id": normalized_tool_run_id} if normalized_tool_run_id else {}),
+            },
         )
         result = self._execute_read_only_result(
             agent=agent,
@@ -291,6 +296,7 @@ class ToolExecutor:
                 "action": json_ready(_public_action(action)),
                 "result": json_ready(result),
                 "result_preview": truncate_text(stable_json_dumps(result), 1200),
+                **({"tool_run_id": normalized_tool_run_id} if normalized_tool_run_id else {}),
             },
         )
         return result
@@ -302,8 +308,10 @@ class ToolExecutor:
         workspace_manager: WorkspaceManager,
         *,
         stream_listener: Callable[[str, str], Any] | None = None,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         workspace = workspace_manager.workspace(agent.workspace_id)
+        normalized_tool_run_id = str(tool_run_id or "").strip()
         try:
             command = self.require_action_string(action, "command")
         except InvalidActionArgumentsError as exc:
@@ -315,7 +323,11 @@ class ToolExecutor:
                 agent,
                 event_type="tool_call",
                 phase="shell",
-                payload={"action": json_ready(_public_action(action)), "result": result},
+                payload={
+                    "action": json_ready(_public_action(action)),
+                    "result": result,
+                    **({"tool_run_id": normalized_tool_run_id} if normalized_tool_run_id else {}),
+                },
             )
             return result
         try:
@@ -375,6 +387,7 @@ class ToolExecutor:
             payload={
                 "action": json_ready(_public_action_for_stream(action)),
                 "cwd": str(cwd),
+                **({"tool_run_id": normalized_tool_run_id} if normalized_tool_run_id else {}),
             },
         )
 
@@ -486,6 +499,7 @@ class ToolExecutor:
             payload={
                 "action": json_ready(_public_action_for_stream(action)),
                 "result": _shell_result_for_stream(action, result_payload),
+                **({"tool_run_id": normalized_tool_run_id} if normalized_tool_run_id else {}),
             },
         )
         return result_payload

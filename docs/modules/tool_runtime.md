@@ -136,6 +136,9 @@ Every accepted tool action becomes a persisted `tool_run` with:
 - status: `queued` -> `running` -> `completed|failed|cancelled`
 - timestamps: `created_at`, `started_at`, `completed_at`
 - payload: arguments, raw result, error
+- detail timeline: read from projected lifecycle rows (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`) keyed by `tool_run_id`
+  - new sessions write these rows incrementally as events are appended
+  - legacy sessions rebuild the projection once on first detail access
 
 ## Execution Semantics
 

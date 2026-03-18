@@ -32,12 +32,12 @@ Execution semantics:
 - Remote workspace is accepted only when `session_mode=direct`; `staged + remote` is rejected.
 - For password auth sessions, request-time `remote_password` is used on `/api/run`, `/api/terminal/open`, and `/api/remote/validate`.
 - `/api/run` runs inside an existing session when launch config provides `session_id`, reactivates that session, and appends a fresh root agent for the new run.
-- When an existing session is loaded, Web UI resolves its persisted workspace mode, shows it as locked, and ignores any mode override attempts.
+- When an existing session is loaded, Web UI binds the original `session_id` directly, resolves its persisted workspace mode, shows it as locked, and ignores any mode override attempts.
 - When setup/reconfigure loads an existing remote session, Web UI validates remote runtime first if selected backend is `anthropic`; backend `none` skips this pre-check.
 - When `/api/run` is submitted while that session is already running, runtime immediately appends a fresh root agent to the live session and schedules it alongside existing active agents.
 - For live-session root append, Web UI keeps the current in-memory agent graph and consumes incremental WebSocket updates; it avoids full `/api/session/{id}/events` replay so parent/child links and cancelled states are not transiently overwritten.
 - `/api/session/{id}/steers` keeps normal enqueue semantics for active sessions; user steer submissions are tagged with a user source actor and share the same persisted steer-run path as agent-tool steering. When the target session is inactive and no other session is running, Web UI auto-continues that session and asks runtime to reactivate the steered agent before loop scheduling.
-- selecting session in setup/reconfigure triggers context import only (no auto-run).
+- selecting session in setup/reconfigure loads persisted session metadata only (no implicit clone, no auto-run).
 - selecting project in setup/reconfigure switches to new-session mode and clears volatile runtime views (`Overview`/`Agents` live stream/tool-run timelines) so stale data from the previously loaded session is not shown.
 - in `direct` mode, `Diff` is disabled and `Apply` / `Undo` controls are unavailable because changes are already live in the target project.
 
@@ -55,6 +55,8 @@ Web UI-specific capabilities:
   - user can override it per run/continue; submitted value is forwarded to runtime and applied to root/worker LLM calls for that execution
 - control-bar exposes an optional root-agent-name input; when non-empty, `/api/run` forwards it and runtime uses it as the base root agent name (still deduplicated in-session)
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
+- session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
+- initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active
 - `Agents` views (Web/TUI) now show context-compression runtime metrics per agent:
   - `compression_count`
   - `current_context_tokens/context_limit_tokens`
@@ -70,6 +72,7 @@ Web UI-specific capabilities:
   - agent status KPIs now split `cancelled` and `terminated`; no `waiting` agent bucket
 - per-row `Tool Runs` detail dialog with lifecycle timeline (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`) and payload inspection
   - detail fetch uses `/api/session/{id}/tool-runs/{tool_run_id}` and keeps polling while the modal is open, so running `shell` runs show live accumulated `stdout/stderr`
+  - persisted detail timelines come from the projection-backed tool-run detail API; old sessions are lazily backfilled once instead of rescanning session-wide events on every open
 - per-agent full-row `Steer` button on live agent cards with a built-in compose overlay (no system prompt/confirm dialog; submit acts as confirmation) and a `Steer Runs` panel with filter/group/metrics/search
 - `Steer Runs` rows and related event text prioritize showing the steer source actor (`from`) and keep the raw source channel (`via`) as secondary detail
 - `Steer Runs` rows are rendered as multi-line cards: target/source/channel/created time are separated from message content, and successful runs show the inserted delivery step
@@ -107,7 +110,7 @@ TUI exposes run/interrupt, setup-based session loading, project sync actions, an
 New sessions default to `direct` mode in setup; users can switch to `staged` before choosing the project directory.
 In `direct` mode setup, users can choose local workspace or remote SSH workspace (target/dir/auth/known-hosts); `staged` disables remote selection.
 For remote SSH setup, clicking `Validate & Create` performs remote validation (SSH target/dir/dependency checks) and immediately creates the launch config if validation succeeds.
-Loaded sessions keep their original workspace mode locked.
+Loaded sessions keep their original `session_id` and workspace mode locked.
 When `Run` is used on an existing (non-active) session, runtime appends a fresh root agent for that run rather than reusing the previous root, then switches the session back to active.
 When `Run` is pressed again while the same session is running, runtime immediately appends another fresh root agent to the live session and schedules it with existing active agents.
 It also provides a `Terminal` action from the control row that directly launches a system terminal window using the same sandbox backend/config as agent `shell` calls, with workspace root fixed to the active session workspace. Edits made there are tracked by workspace diff/project sync just like agent edits.
@@ -132,7 +135,7 @@ TUI `Tool Runs` capabilities now include:
 - grouped list rendering with run selection (`Previous` / `Next`)
 - `Detail` modal for the selected run
 - detail fields: overview, arguments, result, error, lifecycle timeline
-- lifecycle timeline built incrementally from runtime events (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`)
+- lifecycle timeline in persisted detail views is served by projection-backed tool-run detail reads; live updates still append incrementally from runtime events (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`)
 - auto-refresh while detail modal is open when related run events arrive
 
 TUI `Steer Runs` capabilities now include:

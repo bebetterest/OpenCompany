@@ -244,13 +244,38 @@ def create_webui_app(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/session/{session_id}/events")
-    async def api_session_events(session_id: str) -> dict[str, Any]:
+    async def api_session_events(
+        session_id: str,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+        include_agents: bool = True,
+    ) -> dict[str, Any]:
         try:
-            records = state.load_session_events(session_id)
-            agents = state.load_session_agents(session_id)
+            if limit is None and before is None and not activity_only:
+                records = state.load_session_events(session_id)
+                before_cursor = None
+                has_more_before = False
+            else:
+                page = state.list_session_events_page(
+                    session_id,
+                    limit=limit,
+                    before=before,
+                    activity_only=activity_only,
+                )
+                records = page.get("events", [])
+                before_cursor = page.get("before_cursor")
+                has_more_before = bool(page.get("has_more_before", False))
+            agents = state.load_session_agents(session_id) if include_agents else []
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"session_id": session_id, "events": records, "agents": agents}
+        return {
+            "session_id": session_id,
+            "events": records,
+            "agents": agents,
+            "before_cursor": before_cursor,
+            "has_more_before": has_more_before,
+        }
 
     @app.get("/api/session/{session_id}/messages")
     async def api_session_messages(
@@ -259,6 +284,7 @@ def create_webui_app(
         limit: int = 500,
         cursor: str | None = None,
         tail: int | None = None,
+        before: str | None = None,
     ) -> JSONResponse:
         try:
             page = state.list_session_messages_page(
@@ -267,6 +293,7 @@ def create_webui_app(
                 cursor=cursor,
                 limit=limit,
                 tail=tail,
+                before=before,
             )
             return JSONResponse(
                 {
@@ -274,6 +301,8 @@ def create_webui_app(
                     "messages": page.get("messages", []),
                     "next_cursor": page.get("next_cursor"),
                     "has_more": bool(page.get("has_more", False)),
+                    "before_cursor": page.get("before_cursor"),
+                    "has_more_before": bool(page.get("has_more_before", False)),
                 }
             )
         except ValueError as exc:

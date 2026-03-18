@@ -42,7 +42,9 @@ const TASK_INPUT_MIN_ROWS = 1;
 const TASK_INPUT_MAX_ROWS = 8;
 const AGENT_MASONRY_MIN_COLUMN_WIDTH_PX = 360;
 const AGENT_MASONRY_COLUMN_GAP_PX = 10;
-const WORKFLOW_ACTIVITY_MAX_ENTRIES = 600;
+const WORKFLOW_ACTIVITY_MAX_ENTRIES = 2000;
+const SESSION_ACTIVITY_WINDOW_LIMIT = 200;
+const SESSION_MESSAGE_WINDOW_LIMIT = 200;
 
 const state = {
   locale: "en",
@@ -144,6 +146,11 @@ const state = {
     entries: [],
     error: "",
   },
+  activity: {
+    beforeCursor: null,
+    hasMoreBefore: false,
+    loadingOlder: false,
+  },
   activityEntries: [],
   agents: new Map(),
   agentOrder: [],
@@ -196,7 +203,10 @@ const state = {
   },
   messages: {
     cursor: null,
+    beforeCursor: null,
+    hasMoreBefore: false,
     syncing: false,
+    loadingOlder: false,
     timer: null,
     needsSync: false,
     reloadAll: false,
@@ -208,6 +218,7 @@ const state = {
     expandedSteps: new Map(),
     preserveScrollNextRender: false,
     preservedScrollTop: null,
+    preservedScrollHeight: null,
     suppressAutoStickToBottomUntil: 0,
   },
   renderScheduled: false,
@@ -483,11 +494,17 @@ function applySnapshot(payload) {
 }
 
 function resetRuntimeViews() {
+  state.activity.beforeCursor = null;
+  state.activity.hasMoreBefore = false;
+  state.activity.loadingOlder = false;
   state.activityEntries = [];
   state.agents.clear();
   state.agentOrder = [];
   state.messages.cursor = null;
+  state.messages.beforeCursor = null;
+  state.messages.hasMoreBefore = false;
   state.messages.syncing = false;
+  state.messages.loadingOlder = false;
   if (state.messages.timer !== null) {
     window.clearTimeout(state.messages.timer);
     state.messages.timer = null;
@@ -497,6 +514,7 @@ function resetRuntimeViews() {
   state.agentPanel.expandedSteps.clear();
   state.agentPanel.preserveScrollNextRender = false;
   state.agentPanel.preservedScrollTop = null;
+  state.agentPanel.preservedScrollHeight = null;
   state.agentPanel.suppressAutoStickToBottomUntil = 0;
   if (state.agentPanel.deferredTimer !== null) {
     window.clearTimeout(state.agentPanel.deferredTimer);
@@ -2147,6 +2165,9 @@ function updateToolRunDetailSnapshot(toolRunId) {
     if (nextSnapshot.result === undefined && existingSnapshot.result !== undefined) {
       nextSnapshot.result = existingSnapshot.result;
     }
+    if (!Array.isArray(nextSnapshot.timeline) && Array.isArray(existingSnapshot.timeline)) {
+      nextSnapshot.timeline = existingSnapshot.timeline;
+    }
   }
   state.toolRuns.detail.runSnapshot = nextSnapshot;
 }
@@ -2343,6 +2364,38 @@ function appendActivity(record) {
     return;
   }
   markWorkflowActivityDirty();
+}
+
+function replaceActivityEntries(records) {
+  if (!Array.isArray(records)) {
+    state.activityEntries = [];
+    markWorkflowActivityDirty({ full: true });
+    return;
+  }
+  state.activityEntries = records
+    .filter((record) => record && !STREAM_SKIP_ACTIVITY.has(String(record.event_type || "")))
+    .map((record) => formatActivity(record));
+  if (state.activityEntries.length > WORKFLOW_ACTIVITY_MAX_ENTRIES) {
+    state.activityEntries = state.activityEntries.slice(-WORKFLOW_ACTIVITY_MAX_ENTRIES);
+  }
+  markWorkflowActivityDirty({ full: true });
+}
+
+function prependActivityEntries(records) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return;
+  }
+  const rendered = records
+    .filter((record) => record && !STREAM_SKIP_ACTIVITY.has(String(record.event_type || "")))
+    .map((record) => formatActivity(record));
+  if (rendered.length === 0) {
+    return;
+  }
+  state.activityEntries = [...rendered, ...state.activityEntries];
+  if (state.activityEntries.length > WORKFLOW_ACTIVITY_MAX_ENTRIES) {
+    state.activityEntries = state.activityEntries.slice(0, WORKFLOW_ACTIVITY_MAX_ENTRIES);
+  }
+  markWorkflowActivityDirty({ full: true });
 }
 
 function formatActivity(record) {
@@ -2721,15 +2774,22 @@ async function loadSessionEvents(sessionId) {
   if (!sessionId) {
     return;
   }
-  const payload = await fetchJson(`/api/session/${encodeURIComponent(sessionId)}/events`);
+  const query = new URLSearchParams({
+    limit: String(SESSION_ACTIVITY_WINDOW_LIMIT),
+    activity_only: "true",
+  });
+  const payload = await fetchJson(
+    `/api/session/${encodeURIComponent(sessionId)}/events?${query.toString()}`
+  );
   if (!payload || !Array.isArray(payload.events)) {
     return;
   }
   const snapshotAgents = payload && Array.isArray(payload.agents) ? payload.agents : [];
   resetRuntimeViews();
-  for (const record of payload.events) {
-    consumeRuntimeEvent(record);
-  }
+  replaceActivityEntries(payload.events);
+  state.activity.beforeCursor =
+    payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+  state.activity.hasMoreBefore = Boolean(payload && payload.has_more_before);
   await loadSessionMessages(sessionId);
   if (snapshotAgents.length > 0) {
     applyAgentSnapshot(snapshotAgents);
@@ -2742,13 +2802,74 @@ async function loadSessionMessages(sessionId) {
     return;
   }
   state.messages.cursor = null;
+  state.messages.beforeCursor = null;
+  state.messages.hasMoreBefore = false;
   resetAgentMessageEntries({ preserveNonMessage: false });
-  let cursor = null;
-  for (let pageIndex = 0; pageIndex < 200; pageIndex += 1) {
-    const query = new URLSearchParams({ limit: "500" });
-    if (cursor) {
-      query.set("cursor", cursor);
-    }
+  const query = new URLSearchParams({
+    limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
+    tail: String(SESSION_MESSAGE_WINDOW_LIMIT),
+  });
+  const payload = await fetchJson(
+    `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
+  );
+  const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
+  if (records.length > 0) {
+    applyMessageRecords(records);
+  }
+  state.messages.cursor =
+    payload && typeof payload.next_cursor === "string" ? payload.next_cursor : null;
+  state.messages.beforeCursor =
+    payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+  state.messages.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  markAgentPanelDirty();
+}
+
+async function loadOlderActivity() {
+  const sessionId = activeSessionId();
+  const beforeCursor = String(state.activity.beforeCursor || "").trim();
+  if (!sessionId || !beforeCursor || state.activity.loadingOlder) {
+    return;
+  }
+  state.activity.loadingOlder = true;
+  scheduleRender();
+  try {
+    const query = new URLSearchParams({
+      limit: String(SESSION_ACTIVITY_WINDOW_LIMIT),
+      activity_only: "true",
+      before: beforeCursor,
+      include_agents: "false",
+    });
+    const payload = await fetchJson(
+      `/api/session/${encodeURIComponent(sessionId)}/events?${query.toString()}`
+    );
+    const records = payload && Array.isArray(payload.events) ? payload.events : [];
+    prependActivityEntries(records);
+    state.activity.beforeCursor =
+      payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+    state.activity.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  } finally {
+    state.activity.loadingOlder = false;
+    scheduleRender();
+  }
+}
+
+async function loadOlderMessages() {
+  const sessionId = activeSessionId();
+  const beforeCursor = String(state.messages.beforeCursor || "").trim();
+  if (!sessionId || !beforeCursor || state.messages.loadingOlder) {
+    return;
+  }
+  state.messages.loadingOlder = true;
+  state.agentPanel.preserveScrollNextRender = true;
+  state.agentPanel.preservedScrollTop = dom.agentsLive.scrollTop;
+  state.agentPanel.preservedScrollHeight = dom.agentsLive.scrollHeight;
+  state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
+  scheduleRender();
+  try {
+    const query = new URLSearchParams({
+      limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
+      before: beforeCursor,
+    });
     const payload = await fetchJson(
       `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
     );
@@ -2756,19 +2877,14 @@ async function loadSessionMessages(sessionId) {
     if (records.length > 0) {
       applyMessageRecords(records);
     }
-    const nextCursor = payload && typeof payload.next_cursor === "string" ? payload.next_cursor : null;
-    const hasMore = Boolean(payload && payload.has_more);
-    if (!hasMore) {
-      cursor = nextCursor || cursor;
-      break;
-    }
-    if (!nextCursor || nextCursor === cursor) {
-      break;
-    }
-    cursor = nextCursor;
+    state.messages.beforeCursor =
+      payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+    state.messages.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  } finally {
+    state.messages.loadingOlder = false;
+    markAgentPanelDirty();
+    scheduleRender();
   }
-  state.messages.cursor = cursor;
-  markAgentPanelDirty();
 }
 
 async function syncSessionMessagesIncremental() {
@@ -3065,6 +3181,16 @@ function renderOverviewTab() {
     ? renderMarkdown(state.runtime.summary)
     : `<div class="plain-inline">${escapeHtml(runtimeMessage)}</div>`;
   const insightMessageTitle = state.runtime.summary ? t("summary") : t("message");
+  const activityActions = state.activity.hasMoreBefore
+    ? `<button
+          type="button"
+          class="history-load-button"
+          data-action="load-older-activity"
+          ${state.activity.loadingOlder ? "disabled" : ""}
+        >${escapeHtml(
+          state.activity.loadingOlder ? t("loading") : t("load_older_activity")
+        )}</button>`
+    : "";
   const activityHtml =
     recentActivity.length > 0
       ? recentActivity
@@ -3134,7 +3260,11 @@ function renderOverviewTab() {
         <div class="overview-insight-message">${insightMessageBody}</div>
       </div>
       <div class="overview-insight-block">
-        <div class="overview-insight-head">${escapeHtml(t("activity"))}</div>
+        <div class="overview-insight-head overview-insight-head-with-action">
+          <span>${escapeHtml(t("activity"))}</span>
+          ${activityActions}
+        </div>
+        <div class="entry-sub">${escapeHtml(t("recent_history_window_note"))}</div>
         <div class="overview-insight-activity">${activityHtml}</div>
       </div>
     </div>
@@ -3156,6 +3286,22 @@ function renderWorkflowTab() {
   }
   if (dom.workflowZoomResetButton) {
     dom.workflowZoomResetButton.textContent = `${Math.round(state.workflow.scale * 100)}%`;
+  }
+  if (dom.activityTitle) {
+    const action = state.activity.hasMoreBefore
+      ? `<button
+            type="button"
+            class="history-load-button"
+            data-action="load-older-activity"
+            ${state.activity.loadingOlder ? "disabled" : ""}
+          >${escapeHtml(
+            state.activity.loadingOlder ? t("loading") : t("load_older_activity")
+          )}</button>`
+      : "";
+    dom.activityTitle.innerHTML = `
+      <span>${escapeHtml(t("activity"))}</span>
+      ${action}
+    `;
   }
   renderWorkflowActivityLog();
 }
@@ -3737,6 +3883,7 @@ function renderAgentPanel() {
   const previousTop = dom.agentsLive.scrollTop;
   const preserveScrollNextRender = Boolean(state.agentPanel.preserveScrollNextRender);
   const preservedScrollTop = Number(state.agentPanel.preservedScrollTop);
+  const preservedScrollHeight = Number(state.agentPanel.preservedScrollHeight);
   const suppressAutoStickToBottom = now < Number(state.agentPanel.suppressAutoStickToBottomUntil || 0);
   const atBottom =
     dom.agentsLive.scrollTop + dom.agentsLive.clientHeight >= dom.agentsLive.scrollHeight - 8;
@@ -3744,6 +3891,7 @@ function renderAgentPanel() {
     dom.agentsLive.innerHTML = `<div class="entry-sub">${escapeHtml(t("no_active_stream"))}</div>`;
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
     state.agentPanel.dirty = false;
     state.agentPanel.lastRenderedAt = now;
     return;
@@ -3752,15 +3900,37 @@ function renderAgentPanel() {
     dom.agentsLive.innerHTML = `<div class="entry-sub">${escapeHtml(t("agents_filter_empty"))}</div>`;
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
     state.agentPanel.dirty = false;
     state.agentPanel.lastRenderedAt = now;
     return;
   }
-  dom.agentsLive.innerHTML = renderAgentMasonryLayout(agents);
+  const historyControls = `
+    <div class="history-controls">
+      <div class="entry-sub">${escapeHtml(t("recent_history_window_note"))}</div>
+      ${
+        state.messages.hasMoreBefore
+          ? `<button
+                type="button"
+                class="history-load-button"
+                data-action="load-older-messages"
+                ${state.messages.loadingOlder ? "disabled" : ""}
+              >${escapeHtml(
+                state.messages.loadingOlder ? t("loading") : t("load_older_messages")
+              )}</button>`
+          : ""
+      }
+    </div>
+  `;
+  dom.agentsLive.innerHTML = `${historyControls}${renderAgentMasonryLayout(agents)}`;
   if (preserveScrollNextRender && Number.isFinite(preservedScrollTop)) {
-    dom.agentsLive.scrollTop = Math.max(0, preservedScrollTop);
+    const heightDelta = Number.isFinite(preservedScrollHeight)
+      ? Math.max(0, dom.agentsLive.scrollHeight - preservedScrollHeight)
+      : 0;
+    dom.agentsLive.scrollTop = Math.max(0, preservedScrollTop + heightDelta);
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
   } else if (atBottom && !suppressAutoStickToBottom) {
     dom.agentsLive.scrollTop = dom.agentsLive.scrollHeight;
   } else {
@@ -3944,8 +4114,40 @@ function renderToolRunJsonValue(value, emptyText) {
   return `<pre class="json-block"><code>${escapeHtml(formatted)}</code></pre>`;
 }
 
+function mergedToolRunTimeline(runId) {
+  const detailSnapshot =
+    state.toolRuns.detail.runSnapshot &&
+    typeof state.toolRuns.detail.runSnapshot === "object" &&
+    String(state.toolRuns.detail.runSnapshot.id || "").trim() === String(runId || "").trim()
+      ? state.toolRuns.detail.runSnapshot
+      : null;
+  const detailEntries = Array.isArray(detailSnapshot && detailSnapshot.timeline)
+    ? detailSnapshot.timeline
+    : [];
+  const liveEntries = state.toolRuns.eventTimelineByRunId.get(runId) || [];
+  const merged = [];
+  const seen = new Set();
+  for (const entry of [...detailEntries, ...liveEntries]) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const key = [
+      String(entry.timestamp || ""),
+      String(entry.event_type || ""),
+      String(entry.phase || ""),
+      String(entry.agent_id || ""),
+    ].join("::");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 function renderToolRunTimeline(runId) {
-  const entries = state.toolRuns.eventTimelineByRunId.get(runId) || [];
+  const entries = mergedToolRunTimeline(runId);
   if (!Array.isArray(entries) || entries.length === 0) {
     return `<div class="entry-sub">${escapeHtml(t("tool_runs_detail_no_timeline"))}</div>`;
   }
@@ -6504,6 +6706,28 @@ function bindEvents() {
     setWorkflowExpanded(true);
     scheduleRender();
   });
+  dom.overviewFeed.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='load-older-activity']");
+    if (!button) {
+      return;
+    }
+    void loadOlderActivity();
+  });
+  dom.activityTitle.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='load-older-activity']");
+    if (!button) {
+      return;
+    }
+    void loadOlderActivity();
+  });
   dom.workflowGraph.addEventListener(
     "wheel",
     (event) => {
@@ -6651,6 +6875,7 @@ function bindEvents() {
       state.agentsView.roleFilter = String(dom.agentsRoleFilter.value || "all").trim().toLowerCase();
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = 0;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1000;
       markAgentPanelDirty();
       scheduleRender();
@@ -6662,6 +6887,7 @@ function bindEvents() {
       state.agentsView.searchQuery = dom.agentsSearchInput.value;
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = 0;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1000;
       markAgentPanelDirty();
       scheduleRender();
@@ -7029,6 +7255,7 @@ function bindEvents() {
       const preservedTop = dom.agentsLive.scrollTop;
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = preservedTop;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
       window.requestAnimationFrame(() => {
         dom.agentsLive.scrollTop = preservedTop;
@@ -7040,11 +7267,19 @@ function bindEvents() {
   dom.agentFocusBody.addEventListener("toggle", onStepGroupToggle, true);
 
   dom.agentsLive.addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-action]");
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action]");
     if (!button) {
       return;
     }
     const action = button.getAttribute("data-action");
+    if (action === "load-older-messages") {
+      void loadOlderMessages();
+      return;
+    }
     if (action === "copy-agent-id") {
       const value = button.getAttribute("data-copy-value") || "";
       void copyAgentField(value, "copied_agent_id");

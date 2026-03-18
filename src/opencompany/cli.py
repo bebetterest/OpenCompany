@@ -203,6 +203,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
     )
 
+    clone_parser = subparsers.add_parser(
+        "clone",
+        help="Clone an existing non-running session into a new branch session",
+    )
+    clone_parser.add_argument("session_id", help="Source session ID")
+    clone_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    clone_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    clone_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+    )
+
     export_parser = subparsers.add_parser(
         "export-logs",
         help="Export session bundle (events + messages + diagnostics + tool-run metrics)",
@@ -935,11 +948,12 @@ class _RunStatusPanel:
                 if session_status_raw:
                     session_status = session_status_raw
                     self._session_status = session_status_raw
-            agent_rows = [
-                row
-                for row in orchestrator.storage.load_agents(session_id)
-                if isinstance(row, dict)
-            ]
+            load_agents = getattr(orchestrator, "load_session_agents", None)
+            if callable(load_agents):
+                raw_agent_rows = load_agents(session_id)
+            else:
+                raw_agent_rows = orchestrator.storage.load_agents(session_id)
+            agent_rows = [row for row in raw_agent_rows if isinstance(row, dict)]
             agent_ids = [
                 str(row.get("id", "")).strip()
                 for row in agent_rows
@@ -982,9 +996,17 @@ class _RunStatusPanel:
         role = str(row.get("role", "")).strip().lower()
         status_raw = str(row.get("status", "")).strip().lower()
         status = status_raw
-        children = self._decode_children(row.get("children_json"))
+        children = self._decode_children(
+            row.get("children_json")
+            if "children_json" in row
+            else row.get("children")
+        )
         metadata = self._decode_metadata(row.get("metadata_json"))
-        model = str(metadata.get("model", "")).strip() or self.labels["none"]
+        model = (
+            str(row.get("model", "")).strip()
+            or str(metadata.get("model", "")).strip()
+            or self.labels["none"]
+        )
         summary = str(row.get("summary") or "").strip() or self.labels["none"]
         try:
             step_count = max(0, int(row.get("step_count") or 0))
@@ -1035,6 +1057,8 @@ class _RunStatusPanel:
 
     @staticmethod
     def _decode_children(raw_children: Any) -> list[str]:
+        if isinstance(raw_children, list):
+            return [str(item).strip() for item in raw_children if str(item).strip()]
         if not isinstance(raw_children, str):
             return []
         try:
@@ -1047,6 +1071,8 @@ class _RunStatusPanel:
 
     @staticmethod
     def _decode_metadata(raw_metadata: Any) -> dict[str, Any]:
+        if isinstance(raw_metadata, dict):
+            return raw_metadata
         if not isinstance(raw_metadata, str):
             return {}
         try:
@@ -1852,8 +1878,7 @@ async def _resume(
     orchestrator = Orchestrator(Path("."), locale=locale, app_dir=app_dir, debug=debug)
     resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
     resolved_model = str(model or "").strip() or None
-    resumed_from = orchestrator.load_session_context(normalized_session_id)
-    resumed_session_id = resumed_from.id
+    resumed_session_id = normalized_session_id
     panel: _RunStatusPanel | None = None
     if _run_status_panel_enabled():
         panel = _RunStatusPanel(
@@ -1913,6 +1938,49 @@ async def _resume(
     print(f"session_status={session.status.value}")
     print(f"completion_state={session.completion_state}")
     _maybe_apply_staged_changes(orchestrator, session.id)
+
+
+def _clone_session(
+    app_dir: Path | None,
+    locale: str | None,
+    session_id: str,
+    debug: bool,
+) -> None:
+    normalized_session_id = _normalize_session_id_or_exit(session_id)
+    orchestrator = Orchestrator(Path("."), locale=locale, app_dir=app_dir, debug=debug)
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="clone_command_started",
+        session_id=normalized_session_id,
+        payload={
+            "locale": locale,
+            "source_session_id": normalized_session_id,
+        },
+    )
+    try:
+        cloned = orchestrator.clone_session(normalized_session_id)
+    except Exception as exc:
+        orchestrator.diagnostics.log(
+            component="cli",
+            event_type="clone_command_failed",
+            level="error",
+            session_id=normalized_session_id,
+            payload={"source_session_id": normalized_session_id},
+            error=exc,
+        )
+        raise
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="clone_command_finished",
+        session_id=cloned.id,
+        payload={
+            "source_session_id": normalized_session_id,
+            "session_status": cloned.status.value,
+        },
+    )
+    print(f"source_session_id={normalized_session_id}")
+    print(f"session_id={cloned.id}")
+    print(f"session_status={cloned.status.value}")
 
 
 def _export(
@@ -2520,6 +2588,13 @@ def main() -> None:
                         getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)
                     ),
                 )
+            )
+        elif args.command == "clone":
+            _clone_session(
+                app_dir,
+                args.locale,
+                args.session_id,
+                bool(args.debug),
             )
         elif args.command == "export-logs":
             _export(

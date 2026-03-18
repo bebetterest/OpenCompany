@@ -515,6 +515,23 @@ class WebUIRuntimeState:
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
         return orchestrator.load_session_events(normalized)
 
+    def list_session_events_page(
+        self,
+        session_id: str,
+        *,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+    ) -> dict[str, Any]:
+        normalized = self._resolve_session_id(session_id)
+        orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
+        return orchestrator.list_session_events_page(
+            normalized,
+            limit=limit,
+            before=before,
+            activity_only=activity_only,
+        )
+
     def load_session_agents(self, session_id: str) -> list[dict[str, Any]]:
         normalized = self._resolve_session_id(session_id)
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
@@ -530,6 +547,7 @@ class WebUIRuntimeState:
         cursor: str | None = None,
         limit: int = 500,
         tail: int | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         normalized = self._resolve_session_id(session_id)
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
@@ -539,6 +557,7 @@ class WebUIRuntimeState:
             cursor=cursor,
             limit=limit,
             tail=tail,
+            before=before,
         )
 
     def list_tool_runs_page(
@@ -560,21 +579,26 @@ class WebUIRuntimeState:
 
     def get_tool_run(self, session_id: str, tool_run_id: str) -> dict[str, Any]:
         normalized_session_id = self._resolve_session_id(session_id)
+        orchestrator = self._terminal_orchestrator()
+        if hasattr(orchestrator, "get_tool_run_detail"):
+            return orchestrator.get_tool_run_detail(normalized_session_id, tool_run_id)
         normalized_tool_run_id = str(tool_run_id or "").strip()
         if not normalized_tool_run_id:
             raise ValueError("tool_run_id is required")
-        orchestrator = self._terminal_orchestrator()
         record = orchestrator.storage.load_tool_run(normalized_tool_run_id)
         if not isinstance(record, dict):
             raise ValueError(f"Tool run {normalized_tool_run_id} was not found.")
         if str(record.get("session_id", "")).strip() != normalized_session_id:
             raise ValueError(f"Tool run {normalized_tool_run_id} is outside the current session.")
-
         detail = dict(record)
-        if str(detail.get("tool_name", "")).strip() == "shell":
+        if str(detail.get("tool_name", "")).strip() == "shell" and hasattr(
+            orchestrator,
+            "_shell_outputs_for_tool_run",
+        ):
             stdout, stderr = orchestrator._shell_outputs_for_tool_run(detail)
             detail["stdout"] = stdout
             detail["stderr"] = stderr
+        detail.setdefault("timeline", [])
         return detail
 
     def tool_run_metrics(self, session_id: str) -> dict[str, Any]:
@@ -1279,7 +1303,12 @@ class WebUIRuntimeState:
         normalized_agent_id = str(agent_id or "").strip()
         if not normalized_agent_id:
             return ""
-        for row in orchestrator.storage.load_agents(session_id):
+        load_agents = getattr(orchestrator, "load_session_agents", None)
+        if callable(load_agents):
+            rows = load_agents(session_id)
+        else:
+            rows = orchestrator.storage.load_agents(session_id)
+        for row in rows:
             if str(row.get("id", "")).strip() != normalized_agent_id:
                 continue
             return str(row.get("role", "")).strip().lower()

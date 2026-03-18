@@ -348,7 +348,7 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
                 def load_session_context(self, session_id: str) -> RunSession:
                     del session_id
                     return RunSession(
-                        id="session-copy-1",
+                        id="session-live",
                         project_dir=project_dir,
                         task="loaded task",
                         locale="en",
@@ -380,6 +380,8 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
             app.orchestrator = _FakeOrchestrator()  # type: ignore[assignment]
             app._restore_session_history("session-live")
 
+            self.assertEqual(app.configured_resume_session_id, "session-live")
+            self.assertEqual(app.current_session_id, "session-live")
             self.assertEqual(app.session_mode, WorkspaceMode.DIRECT)
             self.assertTrue(app.session_mode_locked)
 

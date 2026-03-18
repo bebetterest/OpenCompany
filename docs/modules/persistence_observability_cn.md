@@ -15,6 +15,8 @@
 - `sessions`：会话元数据、状态、总结、配置快照
 - `agents`：agent 图节点、父子关系、完成字段
 - `events`：结构化运行时事件
+- `tool_run_timeline_events`：按 source event id 建立的 tool-run 生命周期写时投影表
+- `tool_run_timeline_backfills`：旧 session 一次性时间线回填完成标记
 - `checkpoints`：运行快照序列化
 - `pending_actions`：待处理 agent 队列标记
 - `tool_runs`：工具执行生命周期
@@ -42,6 +44,9 @@ runtime events 作为补充，承载：
 
 - `llm_token` / `llm_reasoning` 预览遥测（不在 agents 实时面板展示）
 - Tool Runs 视图所需的 tool-run 生命周期迁移
+  - 新 session 会在写入 `events` 时同步把 `tool_call_started` / `tool_call` / `tool_run_submitted` / `tool_run_updated` 投影到 `tool_run_timeline_events`
+  - 旧 session 会在首次读取 tool-run 详情时按 session 做一次懒回填，之后详情时间线直接读取投影表，不再反复扫描整段 session events
+  - 显式 clone session 时也会基于 clone 后的 events 立即重建同一份投影，避免 clone session 在首次打开详情时再做一次回填
 - Steer Runs 视图所需的 steer-run 生命周期迁移（`steer_run_submitted`、`steer_run_updated`）
 - shell/protocol/control/sandbox 诊断告警
 
