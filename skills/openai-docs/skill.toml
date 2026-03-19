@@ -1,0 +1,7 @@
+[skill]
+id = "openai-docs"
+name = "OpenAI Docs"
+name_cn = "OpenAI 文档"
+description = "Use official OpenAI documentation and bundled reference notes for OpenAI product and API questions."
+description_cn = "使用 OpenAI 官方文档与内置参考笔记处理 OpenAI 产品与 API 相关问题。"
+tags = ["openai", "docs", "api"]

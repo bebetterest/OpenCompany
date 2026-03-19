@@ -11,6 +11,7 @@ from opencompany.llm.openrouter import ChatResult
 from opencompany.models import ShellCommandResult
 from opencompany.orchestrator import Orchestrator, default_app_dir
 from opencompany.remote import normalize_remote_session_config
+from opencompany.skills import discover_local_skills
 
 
 class FakeLLMClient:
@@ -84,6 +85,22 @@ def write_skill(root: Path, skill_id: str) -> None:
 
 
 class SkillsFeatureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bundled_default_skills_follow_opencompany_layout(self) -> None:
+        app_dir = default_app_dir()
+        bundled_ids = {"openai-docs", "pdf", "skill-creator", "skill-installer"}
+
+        discovered = discover_local_skills(app_dir=app_dir)
+
+        self.assertTrue(bundled_ids.issubset(discovered))
+        for skill_id in bundled_ids:
+            skill_dir = app_dir / "skills" / skill_id
+            self.assertTrue((skill_dir / "skill.toml").is_file())
+            self.assertTrue((skill_dir / "SKILL.md").is_file())
+            self.assertTrue((skill_dir / "SKILL_cn.md").is_file())
+            self.assertTrue((skill_dir / "resources").is_dir())
+            for legacy_name in ("agents", "scripts", "references", "assets"):
+                self.assertFalse((skill_dir / legacy_name).exists())
+
     async def test_remote_skill_discovery_skips_invalid_candidates(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

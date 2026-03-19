@@ -1,0 +1,7 @@
+[skill]
+id = "skill-installer"
+name = "Skill Installer"
+name_cn = "Skill 安装器"
+description = "Import external skills into OpenCompany project or global skill directories and normalize legacy layouts."
+description_cn = "把外部 skill 导入 OpenCompany 的项目或全局 skill 目录，并规范化旧布局。"
+tags = ["skills", "install", "github"]

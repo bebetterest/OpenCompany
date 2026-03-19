@@ -32,6 +32,7 @@ Language: **English** | [中文](README_cn.md)
 - 🌐 Project environments: supports both local directories and remote SSH Linux directories as execution environments.
 - 📝 Workspace modes: supports `Direct` and `Staged`; `Direct` writes to the project immediately, while `Staged` holds diffs for user approval before apply (remote supports `Direct` only).
 - 🧰 Skills: sessions can enable reusable skill bundles from project/global sources; selected skills are materialized into `.opencompany_skills/<session_id>/...` and inherited by workers.
+- 📦 Default bundled skills: this repository ships with a small default set of skills adapted from Codex for OpenCompany under `skills/` (currently `pdf`, `openai-docs`, `skill-creator`, and `skill-installer`).
 - 🔒 Security model: supports both `anthropic` [sandbox (SRT)](https://github.com/anthropic-experimental/sandbox-runtime) and `none` (unconstrained) runtime backends.
 - 🖥️ Three interfaces: supports Web UI / TUI / CLI, with Web UI recommended (bilingual visualization in Chinese/English covers session overview, collaboration graph, per-agent details, tool/steer traces, and operations like session create/import, config updates, agent create/steer/terminate, and opening agent terminals).
 - 🤖 LLM access: supports model calls through [OpenRouter](https://openrouter.ai/).
@@ -173,6 +174,7 @@ Add a skill:
 - Put the skill directory under either `<project_dir>/skills/` or `<app_dir>/skills/`.
 - It is not enough to create only the folder name; a valid skill must include at least `skill.toml` and `SKILL.md`.
 - If the same `skill_id` exists in both places, the project source overrides the global source.
+- This repository already includes a default bundled set of skills under `skills/`, adapted from Codex to the OpenCompany layout.
 
 ```text
 <project_dir>/skills/<skill_id>/
