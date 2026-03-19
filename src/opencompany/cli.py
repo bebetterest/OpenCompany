@@ -131,6 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
             help="Host key verification policy for remote SSH.",
         )
 
+    def add_mcp_server_options(target_parser: argparse.ArgumentParser, *, help_text: str) -> None:
+        target_parser.add_argument(
+            "--mcp-server",
+            action="append",
+            dest="mcp_servers",
+            default=None,
+            help=help_text,
+        )
+
     run_parser = subparsers.add_parser(
         "run",
         help="Run a task and persist runtime events/messages for the session",
@@ -163,6 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="skills",
         default=None,
         help="Enable a skill id for this run. Repeat to select multiple skills.",
+    )
+    add_mcp_server_options(
+        run_parser,
+        help_text="Enable an MCP server id for this run. Repeat to select multiple servers.",
     )
     run_parser.add_argument(
         "--preview-chars",
@@ -201,6 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="skills",
         default=None,
         help="Replace the enabled skill set for this resume. Repeat to select multiple skills.",
+    )
+    add_mcp_server_options(
+        resume_parser,
+        help_text="Replace the enabled MCP server set for this resume. Repeat to select multiple servers.",
     )
     resume_parser.add_argument(
         "--preview-chars",
@@ -243,6 +260,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
     )
     add_remote_options(skills_parser)
+
+    mcp_parser = subparsers.add_parser(
+        "mcp-servers",
+        help="Inspect configured MCP servers and print discovered tools/resources",
+    )
+    mcp_parser.add_argument("--project-dir", default=".", help="Target project directory")
+    mcp_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    mcp_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    mcp_parser.add_argument(
+        "--sandbox-backend",
+        choices=sandbox_backend_choices,
+        default=None,
+        help="Override sandbox backend for this inspection only (defaults to [sandbox].backend).",
+    )
+    add_mcp_server_options(
+        mcp_parser,
+        help_text="Inspect only the specified MCP server ids. Repeat to select multiple servers.",
+    )
+    mcp_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+    )
+    add_remote_options(mcp_parser)
 
     export_parser = subparsers.add_parser(
         "export-logs",
@@ -1829,6 +1870,7 @@ async def _run_task(
     model: str | None = None,
     root_agent_name: str | None = None,
     enabled_skill_ids: list[str] | None = None,
+    enabled_mcp_server_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1856,6 +1898,7 @@ async def _run_task(
             "model": resolved_model,
             "root_agent_name": resolved_root_agent_name,
             "enabled_skill_ids": list(enabled_skill_ids or []),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
         },
     )
     session = None
@@ -1869,6 +1912,8 @@ async def _run_task(
             run_kwargs["workspace_mode"] = workspace_mode
         if enabled_skill_ids is not None:
             run_kwargs["enabled_skill_ids"] = enabled_skill_ids
+        if enabled_mcp_server_ids is not None:
+            run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
         if remote_config is not None:
             run_kwargs["remote_config"] = remote_config
             if remote_password:
@@ -1904,6 +1949,7 @@ async def _resume(
     debug: bool,
     model: str | None = None,
     enabled_skill_ids: list[str] | None = None,
+    enabled_mcp_server_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1934,6 +1980,7 @@ async def _resume(
             "sandbox_backend": resolved_sandbox_backend,
             "model": resolved_model,
             "enabled_skill_ids": list(enabled_skill_ids or []),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
         },
     )
     session = None
@@ -1947,6 +1994,8 @@ async def _resume(
             resume_kwargs["model"] = resolved_model
         if enabled_skill_ids is not None:
             resume_kwargs["enabled_skill_ids"] = enabled_skill_ids
+        if enabled_mcp_server_ids is not None:
+            resume_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
         if remote_password:
             resume_kwargs["remote_password"] = remote_password
         session = await orchestrator.resume(
@@ -1992,6 +2041,67 @@ async def _skills(
         remote_password=remote_password,
     )
     print(json.dumps(skills, ensure_ascii=False, indent=2))
+
+
+async def _mcp_servers(
+    project_dir: Path,
+    app_dir: Path | None,
+    locale: str | None,
+    debug: bool,
+    *,
+    enabled_mcp_server_ids: list[str] | None = None,
+    sandbox_backend: str | None = None,
+    remote_config: RemoteSessionConfig | None = None,
+    remote_password: str | None = None,
+) -> None:
+    orchestrator = Orchestrator(project_dir, locale=locale, app_dir=app_dir, debug=debug)
+    resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
+    inspection_session_id = f"mcp-inspect-{uuid.uuid4().hex[:12]}"
+    workspace_path = (
+        Path(remote_config.remote_dir).expanduser()
+        if remote_config is not None
+        else project_dir.resolve()
+    )
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="mcp_servers_command_started",
+        session_id=inspection_session_id,
+        payload={
+            "project_dir": str(project_dir),
+            "workspace_path": str(workspace_path),
+            "sandbox_backend": resolved_sandbox_backend,
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
+            "remote": remote_config is not None,
+        },
+    )
+    try:
+        if remote_config is not None:
+            orchestrator._apply_session_remote_runtime(
+                session_id=inspection_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+        rows = await orchestrator.mcp_manager.inspect_servers(
+            enabled_server_ids=enabled_mcp_server_ids,
+            workspace_path=workspace_path,
+            workspace_is_remote=remote_config is not None,
+            tool_executor=orchestrator.tool_executor,
+            session_id=inspection_session_id,
+        )
+    finally:
+        await orchestrator.mcp_manager.close_session(inspection_session_id)
+        orchestrator.tool_executor.cleanup_session_remote_runtime(inspection_session_id)
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="mcp_servers_command_finished",
+        session_id=inspection_session_id,
+        payload={
+            "server_count": len(rows),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
+        },
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
 
 
 def _clone_session(
@@ -2625,6 +2735,7 @@ def main() -> None:
                     model=getattr(args, "model", None),
                     root_agent_name=getattr(args, "root_agent_name", None),
                     enabled_skill_ids=getattr(args, "skills", None),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)),
                 )
@@ -2639,6 +2750,7 @@ def main() -> None:
                     bool(args.debug),
                     model=getattr(args, "model", None),
                     enabled_skill_ids=getattr(args, "skills", None),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(
                         getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)
@@ -2656,6 +2768,23 @@ def main() -> None:
                     app_dir,
                     args.locale,
                     bool(args.debug),
+                    remote_config=remote_config,
+                    remote_password=remote_password,
+                )
+            )
+        elif args.command == "mcp-servers":
+            remote_config, remote_password = _remote_cli_config_from_args(
+                args,
+                command_name="mcp-servers",
+            )
+            asyncio.run(
+                _mcp_servers(
+                    project_dir or Path(".").resolve(),
+                    app_dir,
+                    args.locale,
+                    bool(args.debug),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
+                    sandbox_backend=getattr(args, "sandbox_backend", None),
                     remote_config=remote_config,
                     remote_password=remote_password,
                 )

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from opencompany.mcp import McpError
 from opencompany.models import (
     AgentNode,
     AgentRole,
@@ -86,6 +87,133 @@ def bootstrap_runtime(
 
 
 class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ask_agent_emits_runtime_mcp_state_when_prepare_agent_updates_status(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-mcp-runtime-update",
+            )
+
+            async def _fake_prepare_agent(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                return {
+                    "enabled": True,
+                    "enabled_server_ids": ["filesystem"],
+                    "entries": [
+                        {
+                            "id": "filesystem",
+                            "title": "filesystem",
+                            "transport": "stdio",
+                            "enabled": True,
+                            "connected": True,
+                            "tool_count": 2,
+                            "resource_count": 1,
+                        }
+                    ],
+                    "warnings": [],
+                    "dynamic_tools": [],
+                    "updated_at": "2026-03-19T10:00:00Z",
+                }
+
+            async def _fake_runtime_ask(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                return []
+
+            session.enabled_mcp_server_ids = ["filesystem"]
+            orchestrator.mcp_manager.prepare_agent = _fake_prepare_agent  # type: ignore[method-assign]
+            orchestrator.agent_runtime.ask = _fake_runtime_ask  # type: ignore[method-assign]
+
+            await orchestrator._ask_agent(
+                root,
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+
+            self.assertTrue(session.mcp_state["entries"][0]["connected"])
+            events = orchestrator.storage.load_events(session.id)
+            refresh_events = [
+                event
+                for event in events
+                if event["event_type"] == "session_mcp_refreshed"
+            ]
+            self.assertEqual(len(refresh_events), 1)
+            payload = json.loads(refresh_events[0]["payload_json"])
+            self.assertEqual(payload["mcp_state"]["entries"][0]["tool_count"], 2)
+
+    async def test_ask_agent_persists_mcp_warning_when_prepare_agent_fails(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-mcp-runtime-failure",
+            )
+
+            async def _raise_prepare_agent(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                raise McpError("MCP bootstrap failed")
+
+            async def _fake_runtime_ask(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                return []
+
+            session.enabled_mcp_server_ids = ["filesystem"]
+            orchestrator.mcp_manager.prepare_agent = _raise_prepare_agent  # type: ignore[method-assign]
+            orchestrator.agent_runtime.ask = _fake_runtime_ask  # type: ignore[method-assign]
+
+            await orchestrator._ask_agent(
+                root,
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+
+            self.assertEqual(
+                session.mcp_state["warnings"][0]["message"],
+                "MCP bootstrap failed",
+            )
+            events = orchestrator.storage.load_events(session.id)
+            refresh_events = [
+                event
+                for event in events
+                if event["event_type"] == "session_mcp_refreshed"
+            ]
+            self.assertEqual(len(refresh_events), 1)
+            payload = json.loads(refresh_events[0]["payload_json"])
+            self.assertEqual(
+                payload["mcp_state"]["warnings"][0]["message"],
+                "MCP bootstrap failed",
+            )
+
+    def test_project_tool_result_preserves_mcp_truncation_flags(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+
+            resource_result = orchestrator._project_tool_result(
+                action={"type": "read_mcp_resource"},
+                raw_result={
+                    "server_id": "filesystem",
+                    "uri": "file:///demo.txt",
+                    "contents": [{"text": "demo"}],
+                    "contents_truncated": True,
+                },
+            )
+            dynamic_result = orchestrator._project_tool_result(
+                action={"type": "mcp__filesystem__search__deadbeef"},
+                raw_result={
+                    "server_id": "filesystem",
+                    "tool_name": "search",
+                    "content": [{"text": "demo"}],
+                    "content_truncated": True,
+                },
+            )
+
+            self.assertTrue(resource_result["contents_truncated"])
+            self.assertTrue(dynamic_result["content_truncated"])
+
     def test_get_tool_run_detail_uses_projected_timeline_without_session_scan(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)

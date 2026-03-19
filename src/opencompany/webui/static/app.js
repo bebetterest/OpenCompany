@@ -73,6 +73,9 @@ const state = {
     selected_skill_ids: [],
     skills_state: {},
     available_skills: [],
+    selected_mcp_server_ids: [],
+    mcp_state: {},
+    available_mcp_servers: [],
     session_status: "idle",
     summary: "",
     status_message: "",
@@ -81,6 +84,9 @@ const state = {
     project_sync_action_in_progress: false,
   },
   skillsUi: {
+    discovering: false,
+  },
+  mcpUi: {
     discovering: false,
   },
   sessionsDir: "",
@@ -251,6 +257,15 @@ const dom = {
   skillsSelected: document.getElementById("skills-selected"),
   skillsList: document.getElementById("skills-list"),
   skillsWarnings: document.getElementById("skills-warnings"),
+  mcpLabel: document.getElementById("mcp-label"),
+  mcpInput: document.getElementById("mcp-input"),
+  mcpDiscoverButton: document.getElementById("mcp-discover-button"),
+  mcpSelectAllButton: document.getElementById("mcp-select-all-button"),
+  mcpClearButton: document.getElementById("mcp-clear-button"),
+  mcpStatus: document.getElementById("mcp-status"),
+  mcpSelected: document.getElementById("mcp-selected"),
+  mcpList: document.getElementById("mcp-list"),
+  mcpWarnings: document.getElementById("mcp-warnings"),
   runButton: document.getElementById("run-button"),
   terminalButton: document.getElementById("terminal-button"),
   setupButton: document.getElementById("setup-button"),
@@ -436,6 +451,98 @@ function currentSkillEntries() {
   return Array.isArray(entries)
     ? entries.filter((item) => item && typeof item === "object")
     : [];
+}
+
+function normalizeMcpServerIdsFromText(text) {
+  const parts = String(text || "")
+    .split(/[\s,]+/)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(parts)];
+}
+
+function selectedMcpServerIds() {
+  return Array.isArray(state.runtime.selected_mcp_server_ids)
+    ? state.runtime.selected_mcp_server_ids.filter((item) => String(item || "").trim())
+    : [];
+}
+
+function mcpInputValue() {
+  return selectedMcpServerIds().join(", ");
+}
+
+function syncMcpInputValue({ force = false } = {}) {
+  if (!dom.mcpInput) {
+    return;
+  }
+  if (!force && document.activeElement === dom.mcpInput) {
+    return;
+  }
+  const nextValue = mcpInputValue();
+  if (dom.mcpInput.value !== nextValue) {
+    dom.mcpInput.value = nextValue;
+  }
+}
+
+function setSelectedMcpServerIds(nextIds, { syncInput = false } = {}) {
+  const normalized = Array.isArray(nextIds)
+    ? normalizeMcpServerIdsFromText(nextIds.join(","))
+    : normalizeMcpServerIdsFromText(nextIds);
+  state.runtime.selected_mcp_server_ids = normalized;
+  if (syncInput) {
+    syncMcpInputValue({ force: true });
+  }
+  scheduleRender();
+}
+
+function currentMcpState() {
+  return state.runtime.mcp_state && typeof state.runtime.mcp_state === "object"
+    ? state.runtime.mcp_state
+    : {};
+}
+
+function currentMcpEntries() {
+  const entries = currentMcpState().entries;
+  return Array.isArray(entries)
+    ? entries.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function availableMcpServers() {
+  return Array.isArray(state.runtime.available_mcp_servers)
+    ? state.runtime.available_mcp_servers.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function mergedMcpServerCatalog() {
+  const catalog = new Map();
+  availableMcpServers().forEach((server) => {
+    const serverId = String(server.id || "").trim();
+    if (!serverId) {
+      return;
+    }
+    catalog.set(serverId, {
+      ...server,
+      discovered: true,
+    });
+  });
+  currentMcpEntries().forEach((entry) => {
+    const serverId = String(entry.id || "").trim();
+    if (!serverId) {
+      return;
+    }
+    const current = catalog.get(serverId) || {};
+    catalog.set(serverId, {
+      ...current,
+      ...entry,
+      id: serverId,
+      discovered: Boolean(current.discovered),
+      materialized: true,
+    });
+  });
+  return [...catalog.values()].sort((left, right) =>
+    String(left.id || "").localeCompare(String(right.id || ""))
+  );
 }
 
 function mergeSkillCatalogRecord(current, rawSkill, flags = {}) {
@@ -3378,6 +3485,140 @@ function renderSkillWarnings() {
     .join("");
 }
 
+function renderSelectedMcpServerChips(catalog, controlsDisabled) {
+  const selectedIds = selectedMcpServerIds();
+  if (!selectedIds.length) {
+    dom.mcpSelected.innerHTML = `<div class="skills-empty">${escapeHtml(
+      t("mcp_selected_empty")
+    )}</div>`;
+    return;
+  }
+  const catalogById = new Map(catalog.map((server) => [String(server.id || "").trim(), server]));
+  dom.mcpSelected.innerHTML = selectedIds
+    .map((serverId) => {
+      const server = catalogById.get(serverId) || null;
+      const title = String(server?.title || serverId).trim() || serverId;
+      const meta = [];
+      if (server && title !== serverId) {
+        meta.push(serverId);
+      }
+      if (!server) {
+        meta.push(t("skills_manual_label"));
+      } else {
+        const transport = String(server.transport || "").trim();
+        if (transport) {
+          meta.push(transport);
+        }
+        if (server.materialized) {
+          meta.push(String(server.connected) === "true" || server.connected ? t("mcp_connected") : t("mcp_disconnected"));
+        }
+      }
+      return `
+        <button
+          type="button"
+          class="skills-selection-chip${server ? "" : " is-manual"}"
+          data-action="remove-mcp-server"
+          data-mcp-server-id="${escapeHtml(serverId)}"
+          ${controlsDisabled ? "disabled" : ""}
+          title="${escapeHtml(t("mcp_disable"))}"
+        >
+          <span class="skills-selection-chip-main">
+            <span class="skills-selection-label">${escapeHtml(title)}</span>
+            <span class="skills-selection-meta">${escapeHtml(meta.join(" · "))}</span>
+          </span>
+          <span class="skills-selection-remove" aria-hidden="true">×</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderMcpServerCatalog(catalog, controlsDisabled) {
+  if (!catalog.length) {
+    const message = state.mcpUi.discovering ? t("loading") : t("mcp_catalog_empty");
+    dom.mcpList.innerHTML = `<div class="skills-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+  const selected = new Set(selectedMcpServerIds());
+  dom.mcpList.innerHTML = catalog
+    .map((server) => {
+      const serverId = String(server.id || "").trim();
+      const title = String(server.title || serverId).trim() || serverId;
+      const isSelected = selected.has(serverId);
+      const transport = String(server.transport || "").trim();
+      const toolCount = Math.max(0, Number(server.tool_count || 0));
+      const resourceCount = Math.max(0, Number(server.resource_count || 0));
+      const warning = String(server.warning || "").trim();
+      const badges = [];
+      if (transport) {
+        badges.push(`<span class="skill-badge">${escapeHtml(transport)}</span>`);
+      }
+      if (server.materialized) {
+        badges.push(
+          `<span class="skill-badge ${server.connected ? "is-active" : ""}">${escapeHtml(
+            server.connected ? t("mcp_connected") : t("mcp_disconnected")
+          )}</span>`
+        );
+      }
+      if (toolCount > 0) {
+        badges.push(`<span class="skill-badge">${escapeHtml(`${t("tools_label")}: ${toolCount}`)}</span>`);
+      }
+      if (resourceCount > 0) {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(`${t("resources_label")}: ${resourceCount}`)}</span>`
+        );
+      }
+      return `
+        <article class="skill-card${isSelected ? " is-selected" : ""}">
+          <div class="skill-card-head">
+            <div class="skill-card-title-block">
+              <div class="skill-card-title">${escapeHtml(title)}</div>
+              <div class="skill-card-id">${escapeHtml(serverId)}</div>
+            </div>
+            <button
+              type="button"
+              class="skill-card-action"
+              data-action="toggle-mcp-server"
+              data-mcp-server-id="${escapeHtml(serverId)}"
+              aria-pressed="${isSelected ? "true" : "false"}"
+              ${controlsDisabled ? "disabled" : ""}
+            >${escapeHtml(isSelected ? t("mcp_disable") : t("mcp_enable"))}</button>
+          </div>
+          <div class="skill-badge-row">${badges.join("")}</div>
+          <div class="skill-card-description">${escapeHtml(
+            warning || String(server.url || server.command || "").trim() || t("none_value")
+          )}</div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderMcpWarnings() {
+  const warnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  if (!warnings.length) {
+    dom.mcpWarnings.classList.add("hidden");
+    dom.mcpWarnings.innerHTML = "";
+    return;
+  }
+  dom.mcpWarnings.classList.remove("hidden");
+  dom.mcpWarnings.innerHTML = warnings
+    .map((warning) => {
+      const serverId = String(warning?.server_id || "").trim();
+      const message = String(warning?.message || "").trim();
+      return `
+        <div class="skill-warning-card">
+          <div class="skill-warning-head">
+            <span class="skill-warning-badge">${escapeHtml(t("mcp_warnings_label"))}</span>
+            ${serverId ? `<span class="skill-warning-skill">${escapeHtml(serverId)}</span>` : ""}
+          </div>
+          <div class="skill-warning-text">${escapeHtml(message || t("none_value"))}</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function renderControls() {
   dom.taskInput.placeholder = t("task_input");
   syncTaskInputValue();
@@ -3399,6 +3640,12 @@ function renderControls() {
     : t("skills_discover");
   dom.skillsSelectAllButton.textContent = t("skills_select_all");
   dom.skillsClearButton.textContent = t("skills_clear");
+  dom.mcpLabel.textContent = t("mcp_servers_label");
+  dom.mcpInput.placeholder = t("mcp_servers_placeholder");
+  syncMcpInputValue();
+  dom.mcpDiscoverButton.textContent = state.mcpUi.discovering ? t("loading") : t("mcp_discover");
+  dom.mcpSelectAllButton.textContent = t("mcp_select_all");
+  dom.mcpClearButton.textContent = t("mcp_clear");
   autoSizeTaskInput();
   const runSubmitting = Boolean(state.runtime.runSubmitting);
   dom.runButton.textContent = runSubmitting ? t("run_submitting") : t("run");
@@ -3414,14 +3661,19 @@ function renderControls() {
   const syncBusy = Boolean(state.runtime.project_sync_action_in_progress);
   const setupBusy = Boolean(state.setup.busy);
   const discovering = Boolean(state.skillsUi.discovering);
+  const mcpDiscovering = Boolean(state.mcpUi.discovering);
   const directMode = isDirectWorkspaceMode();
-  const controlsDisabled = running || syncBusy || setupBusy || discovering;
+  const controlsDisabled = running || syncBusy || setupBusy || discovering || mcpDiscovering;
   const catalog = mergedSkillCatalog();
   const catalogIds = new Set(catalog.map((skill) => String(skill.id || "").trim()));
   const warnings = Array.isArray(currentSkillsState().warnings)
     ? currentSkillsState().warnings
     : [];
+  const mcpCatalog = mergedMcpServerCatalog();
+  const mcpCatalogIds = new Set(mcpCatalog.map((server) => String(server.id || "").trim()));
+  const mcpWarnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
   const manualSelectedCount = selectedSkillIds().filter((skillId) => !catalogIds.has(skillId)).length;
+  const manualSelectedMcpCount = selectedMcpServerIds().filter((serverId) => !mcpCatalogIds.has(serverId)).length;
   dom.runButton.disabled = runSubmitting || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.modelInput.disabled = syncBusy || setupBusy;
   dom.rootAgentNameInput.disabled = syncBusy || setupBusy;
@@ -3429,6 +3681,10 @@ function renderControls() {
   dom.skillsDiscoverButton.disabled = controlsDisabled || !state.launchConfig.can_run;
   dom.skillsSelectAllButton.disabled = controlsDisabled || catalog.length === 0;
   dom.skillsClearButton.disabled = controlsDisabled || selectedSkillIds().length === 0;
+  dom.mcpInput.disabled = controlsDisabled;
+  dom.mcpDiscoverButton.disabled = controlsDisabled;
+  dom.mcpSelectAllButton.disabled = controlsDisabled || mcpCatalog.length === 0;
+  dom.mcpClearButton.disabled = controlsDisabled || selectedMcpServerIds().length === 0;
   dom.terminalButton.disabled = syncBusy || setupBusy || !activeSessionId();
   dom.setupButton.disabled = running || syncBusy || setupBusy;
   dom.interruptButton.disabled = !running;
@@ -3442,6 +3698,9 @@ function renderControls() {
   const selectedSkillsText = selectedSkillIds().length
     ? selectedSkillIds().join(", ")
     : t("none_value");
+  const selectedMcpText = selectedMcpServerIds().length
+    ? selectedMcpServerIds().join(", ")
+    : t("none_value");
   dom.skillsStatus.textContent = `${t("skills_selected_label")}: ${selectedSkillIds().length} | ${t(
     "skills_catalog_label"
   )}: ${catalog.length} | ${t("skills_manual_label")}: ${manualSelectedCount} | ${t(
@@ -3450,7 +3709,15 @@ function renderControls() {
   renderSelectedSkillChips(catalog, controlsDisabled);
   renderSkillsCatalog(catalog, controlsDisabled);
   renderSkillWarnings();
-  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("skills_label")}: ${selectedSkillsText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
+  dom.mcpStatus.textContent = `${t("mcp_selected_label")}: ${selectedMcpServerIds().length} | ${t(
+    "mcp_catalog_label"
+  )}: ${mcpCatalog.length} | ${t("skills_manual_label")}: ${manualSelectedMcpCount} | ${t(
+    "mcp_warnings_label"
+  )}: ${mcpWarnings.length}`;
+  renderSelectedMcpServerChips(mcpCatalog, controlsDisabled);
+  renderMcpServerCatalog(mcpCatalog, controlsDisabled);
+  renderMcpWarnings();
+  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("skills_label")}: ${selectedSkillsText} | ${t("mcp_servers_label")}: ${selectedMcpText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
 }
 
 function renderTabs() {
@@ -3532,8 +3799,13 @@ function renderOverviewTab() {
   const runtimeMessage = state.runtime.summary || state.runtime.status_message || "-";
   const skillsState = currentSkillsState();
   const skillWarnings = Array.isArray(skillsState.warnings) ? skillsState.warnings : [];
+  const mcpState = currentMcpState();
+  const mcpWarnings = Array.isArray(mcpState.warnings) ? mcpState.warnings : [];
   const enabledSkillsText = selectedSkillIds().length
     ? selectedSkillIds().join(", ")
+    : t("none_value");
+  const enabledMcpText = selectedMcpServerIds().length
+    ? selectedMcpServerIds().join(", ")
     : t("none_value");
   const focusAgent = state.agentOrder
     .map((id) => state.agents.get(id))
@@ -3560,6 +3832,9 @@ function renderOverviewTab() {
     [t("skills_selected_label"), enabledSkillsText],
     [t("skills_bundle_root_label"), String(skillsState.bundle_root || "") || t("unset_value")],
     [t("skills_warnings_label"), String(skillWarnings.length)],
+    [t("mcp_selected_label"), enabledMcpText],
+    [t("mcp_connected_count_label"), String(currentMcpEntries().filter((item) => item.connected).length)],
+    [t("mcp_warnings_label"), String(mcpWarnings.length)],
     [t("sessions_root"), state.sessionsDir || t("unset_value")],
   ])}</div>`;
 
@@ -6740,6 +7015,7 @@ async function runSession(task, model, rootAgentName) {
     model: String(model || "").trim(),
     sandbox_backend: activeSandboxBackend(),
     enabled_skill_ids: selectedSkillIds(),
+    enabled_mcp_server_ids: selectedMcpServerIds(),
   };
   const normalizedRootAgentName = String(rootAgentName || "").trim();
   if (normalizedRootAgentName) {
@@ -6815,6 +7091,23 @@ async function discoverSkills() {
     state.runtime.status_message = `${skills.length} ${t("skills_discovered")}`;
   } finally {
     state.skillsUi.discovering = false;
+    scheduleRender();
+  }
+}
+
+async function discoverMcpServers() {
+  state.mcpUi.discovering = true;
+  scheduleRender();
+  try {
+    const payload = await fetchJson("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    applySnapshot(payload.snapshot || payload);
+    const servers = payload && Array.isArray(payload.mcp_servers) ? payload.mcp_servers : [];
+    state.runtime.status_message = `${servers.length} ${t("mcp_servers_discovered")}`;
+  } finally {
+    state.mcpUi.discovering = false;
     scheduleRender();
   }
 }
@@ -7349,6 +7642,69 @@ function bindEvents() {
       selected.add(skillId);
     }
     setSelectedSkillIds([...selected], { syncInput: true });
+  });
+
+  dom.mcpInput.addEventListener("input", () => {
+    setSelectedMcpServerIds(dom.mcpInput.value);
+  });
+
+  dom.mcpDiscoverButton.addEventListener("click", async () => {
+    try {
+      await discoverMcpServers();
+    } catch (error) {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    }
+  });
+
+  dom.mcpSelectAllButton.addEventListener("click", () => {
+    const catalogIds = mergedMcpServerCatalog().map((server) => String(server.id || "").trim());
+    setSelectedMcpServerIds([...selectedMcpServerIds(), ...catalogIds], { syncInput: true });
+  });
+
+  dom.mcpClearButton.addEventListener("click", () => {
+    setSelectedMcpServerIds([], { syncInput: true });
+  });
+
+  dom.mcpSelected.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='remove-mcp-server']");
+    if (!button) {
+      return;
+    }
+    const serverId = String(button.getAttribute("data-mcp-server-id") || "").trim();
+    if (!serverId) {
+      return;
+    }
+    setSelectedMcpServerIds(
+      selectedMcpServerIds().filter((item) => item !== serverId),
+      { syncInput: true }
+    );
+  });
+
+  dom.mcpList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='toggle-mcp-server']");
+    if (!button) {
+      return;
+    }
+    const serverId = String(button.getAttribute("data-mcp-server-id") || "").trim();
+    if (!serverId) {
+      return;
+    }
+    const selected = new Set(selectedMcpServerIds());
+    if (selected.has(serverId)) {
+      selected.delete(serverId);
+    } else {
+      selected.add(serverId);
+    }
+    setSelectedMcpServerIds([...selected], { syncInput: true });
   });
 
   if (dom.agentsRoleFilter) {

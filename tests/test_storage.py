@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from opencompany.models import EventRecord
+from opencompany.models import EventRecord, RunSession, SessionStatus
 from opencompany.storage import Storage
 
 
@@ -72,6 +72,8 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(row["enabled_skill_ids_json"], "[]")
             self.assertEqual(row["skill_bundle_root"], "")
             self.assertEqual(row["skills_state_json"], "{}")
+            self.assertEqual(row["enabled_mcp_server_ids_json"], "[]")
+            self.assertEqual(row["mcp_state_json"], "{}")
 
     def test_migration_backfills_missing_workspace_mode_to_staged(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -225,3 +227,32 @@ class StorageTests(unittest.TestCase):
                 "2026-03-18T10:00:00Z",
             )
             self.assertTrue(storage.has_tool_run_timeline_backfill("session-1"))
+
+    def test_upsert_session_persists_mcp_selection_and_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "opencompany.db")
+            session = RunSession(
+                id="session-mcp-state",
+                project_dir=Path(temp_dir),
+                task="demo task",
+                locale="en",
+                root_agent_id="agent-root",
+                status=SessionStatus.RUNNING,
+                enabled_mcp_server_ids=["filesystem", "docs"],
+                mcp_state={
+                    "enabled_server_ids": ["filesystem", "docs"],
+                    "entries": [{"id": "filesystem", "connected": True}],
+                    "warnings": [{"server_id": "docs", "message": "offline"}],
+                },
+            )
+
+            storage.upsert_session(session)
+            row = storage.load_session(session.id)
+
+            assert row is not None
+            self.assertEqual(
+                row["enabled_mcp_server_ids_json"],
+                '["filesystem", "docs"]',
+            )
+            self.assertIn('"connected": true', row["mcp_state_json"])
+            self.assertIn('"server_id": "docs"', row["mcp_state_json"])

@@ -141,6 +141,14 @@ Worker agents:
 - For password auth, runtime can reuse secure local credential storage after first successful input; when OS credential backends are unavailable, an encrypted local fallback store is used.
 - Session finalization/interruption/failure triggers remote runtime cleanup (SSH control state + transient cache artifacts).
 
+## MCP Session State
+
+- Session config can now carry `enabled_mcp_server_ids` and persisted `mcp_state` alongside skills.
+- MCP server definitions come from `[mcp]` / `[mcp.servers.<id>]` in `opencompany.toml`; per-run selection is session-local and can differ from config defaults.
+- Each agent uses its own MCP connections so roots/workers in different workspaces do not share roots or tool/resource caches.
+- Runtime prepares MCP connections before each agent's first LLM step, keeps them alive across later steps, and closes them on agent/session shutdown.
+- Resume/import preserves enabled server ids; missing/broken servers are surfaced as warnings in `session.mcp_state` instead of being silently dropped.
+
 ## Finalization and User Confirmation
 
 When root finalizes with `completed` or `partial`:

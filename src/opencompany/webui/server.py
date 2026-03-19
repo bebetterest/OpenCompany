@@ -147,8 +147,11 @@ def create_webui_app(
         sandbox_backend_text = _optional_string(payload.get("sandbox_backend"))
         remote_password = _optional_string(payload.get("remote_password"))
         raw_enabled_skill_ids = payload.get("enabled_skill_ids")
+        raw_enabled_mcp_server_ids = payload.get("enabled_mcp_server_ids")
         if raw_enabled_skill_ids is not None and not isinstance(raw_enabled_skill_ids, list):
             raise HTTPException(status_code=400, detail="enabled_skill_ids must be an array.")
+        if raw_enabled_mcp_server_ids is not None and not isinstance(raw_enabled_mcp_server_ids, list):
+            raise HTTPException(status_code=400, detail="enabled_mcp_server_ids must be an array.")
         remote_payload = payload.get("remote")
         if remote_payload is not None and not isinstance(remote_payload, dict):
             raise HTTPException(status_code=400, detail="remote must be an object.")
@@ -202,6 +205,12 @@ def create_webui_app(
                     for item in raw_enabled_skill_ids
                     if str(item).strip()
                 ]
+            if isinstance(raw_enabled_mcp_server_ids, list):
+                start_run_kwargs["enabled_mcp_server_ids"] = [
+                    str(item).strip()
+                    for item in raw_enabled_mcp_server_ids
+                    if str(item).strip()
+                ]
             return await state.start_run(task, **start_run_kwargs)
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -218,6 +227,16 @@ def create_webui_app(
                 remote=remote_payload if isinstance(remote_payload, dict) else None,
                 remote_password=_optional_string(body.get("remote_password")),
             )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/servers")
+    async def api_mcp_servers() -> JSONResponse:
+        try:
+            result = await state.discover_mcp_servers()
             return JSONResponse(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

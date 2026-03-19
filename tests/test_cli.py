@@ -105,6 +105,22 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(resume_args.skills, ["skill-c"])
         self.assertEqual(skills_args.project_dir, "/tmp/demo")
 
+    def test_run_resume_and_mcp_servers_command_accept_mcp_flags(self) -> None:
+        run_args = build_parser().parse_args(
+            ["run", "--mcp-server", "filesystem", "--mcp-server", "docs", "inspect repo"]
+        )
+        resume_args = build_parser().parse_args(
+            ["resume", "session-123", "--mcp-server", "docs", "continue"]
+        )
+        inspect_args = build_parser().parse_args(
+            ["mcp-servers", "--mcp-server", "filesystem", "--project-dir", "/tmp/demo"]
+        )
+
+        self.assertEqual(run_args.mcp_servers, ["filesystem", "docs"])
+        self.assertEqual(resume_args.mcp_servers, ["docs"])
+        self.assertEqual(inspect_args.mcp_servers, ["filesystem"])
+        self.assertEqual(inspect_args.project_dir, "/tmp/demo")
+
     def test_run_tui_and_ui_accept_remote_flags(self) -> None:
         run_args = build_parser().parse_args(
             [
@@ -1137,6 +1153,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                             workspace_mode="staged",
                             model="fake/model",
                             root_agent_name="Demo Root",
+                            enabled_mcp_server_ids=["filesystem", "docs"],
                             sandbox_backend="none",
                         )
                     )
@@ -1148,6 +1165,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                 "model": "fake/model",
                 "root_agent_name": "Demo Root",
                 "workspace_mode": "staged",
+                "enabled_mcp_server_ids": ["filesystem", "docs"],
             },
         )
         orchestrator = captured["orchestrator"]
@@ -1278,13 +1296,17 @@ class CliRunResumePanelTests(unittest.TestCase):
                             instruction="continue from latest status",
                             debug=False,
                             model="fake/model",
+                            enabled_mcp_server_ids=["filesystem"],
                             sandbox_backend="none",
                         )
                     )
 
         self.assertEqual(captured["resumed_session_id"], "session-123")
         self.assertEqual(captured["instruction"], "continue from latest status")
-        self.assertEqual(captured["resume_kwargs"], {"model": "fake/model"})
+        self.assertEqual(
+            captured["resume_kwargs"],
+            {"model": "fake/model", "enabled_mcp_server_ids": ["filesystem"]},
+        )
         self.assertEqual(captured["resume_backend"], "none")
         self.assertEqual(captured["resume_backend_cls"], "backend::none")
         orchestrator = captured["orchestrator"]

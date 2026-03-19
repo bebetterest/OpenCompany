@@ -32,6 +32,7 @@
 - 🌐 项目环境：支持本地目录与远程 SSH Linux 目录作为执行环境。
 - 📝 工作区模式：支持 `Direct` 与 `Staged`；`Direct` 直接写入项目目录，`Staged` 先暂存 diff 并在用户审批后应用（远程仅支持 `Direct`）。
 - 🧰 Skills：session 可启用来自项目源/全局源的可复用 skill bundle；选中的 skills 会物化到 `.opencompany_skills/<session_id>/...`，并由 workers 继承使用。
+- 🔌 MCP client：session 可启用已配置的 MCP servers，把发现到的 MCP tools 直接暴露给 agents，并支持 MCP resources 浏览/读取，以及在安全前提下暴露 workspace roots。
 - 📦 默认内置 skills：本仓库默认在 `skills/` 下提供一组从 Codex 改造为 OpenCompany 结构的 skills（当前包括 `pdf`、`openai-docs`、`skill-creator` 和 `skill-installer`）。
 - 🔒 安全性：支持 `anthropic` [sandbox（SRT）](https://github.com/anthropic-experimental/sandbox-runtime) 与 `none`（不受限）两种运行后端。
 - 🖥️ 三种界面：支持 Web UI / TUI / CLI，推荐 Web UI（可视化支持中英双语，可查看会话总览、协作结构、各 agent 详情、工具与引导信息，并支持创建/导入会话、修改配置、创建/引导/终止 agent、打开 agent 环境终端等操作）。
@@ -208,6 +209,22 @@ opencompany skills --project-dir /path/to/target
 opencompany run \
   --skill repo-map \
   --skill release-notes \
+  "Inspect this repository and propose next engineering steps."
+```
+
+检查当前已配置的 MCP servers：
+
+```bash
+opencompany mcp-servers
+opencompany mcp-servers --mcp-server filesystem
+```
+
+显式启用 MCP servers 运行：
+
+```bash
+opencompany run \
+  --mcp-server filesystem \
+  --mcp-server docs \
   "Inspect this repository and propose next engineering steps."
 ```
 

@@ -58,6 +58,11 @@
 - 按角色取工具集合（配置 + prompt schema）
 - 组装请求消息（`system` + conversation）
 
+MCP 集成后，上下文组装会新增两层运行时内容：
+
+- 追加 agent 级 MCP prompt block，汇总当前启用 servers、连接 warning 与已发现数量
+- 将内建工具、MCP helper 工具以及已连接 servers 动态发现出的 MCP tool 定义合并成 agent 当前可见的工具表面
+
 `ContextStore`：
 
 - 追加 conversation / tool-result 消息

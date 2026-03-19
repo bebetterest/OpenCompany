@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from opencompany.config import OpenCompanyConfig
+from opencompany.mcp import render_mcp_prompt
 from opencompany.models import AgentNode
 from opencompany.orchestration.messages import tool_result_message
 from opencompany.prompts import PromptLibrary
 from opencompany.skills import render_skills_prompt
-from opencompany.tools import tool_definitions_for_role
+from opencompany.tools.catalog import tool_definitions_for_agent
 
 
 PersistAgentFn = Callable[[AgentNode], None]
@@ -59,22 +60,25 @@ class ContextAssembler:
         prompt = self.prompt_library.load(agent.role.value, self.locale)
         metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
         skills_catalog = metadata.get("skills_catalog")
-        if not isinstance(skills_catalog, dict):
-            return prompt
-        skills_prompt = render_skills_prompt(
-            locale=self.locale,
-            bundle_root=str(skills_catalog.get("bundle_root", "") or ""),
-            manifest_path=str(skills_catalog.get("manifest_path", "") or ""),
-            skills_state=skills_catalog,
-        )
-        if not skills_prompt:
-            return prompt
-        return f"{prompt.rstrip()}\n\n{skills_prompt}"
+        sections = [prompt.rstrip()]
+        if isinstance(skills_catalog, dict):
+            skills_prompt = render_skills_prompt(
+                locale=self.locale,
+                bundle_root=str(skills_catalog.get("bundle_root", "") or ""),
+                manifest_path=str(skills_catalog.get("manifest_path", "") or ""),
+                skills_state=skills_catalog,
+            )
+            if skills_prompt:
+                sections.append(skills_prompt)
+        mcp_prompt = render_mcp_prompt(self.locale, metadata.get("mcp"))
+        if mcp_prompt:
+            sections.append(mcp_prompt)
+        return "\n\n".join(section for section in sections if section)
 
     def tools(self, agent: AgentNode) -> list[dict[str, object]]:
-        return tool_definitions_for_role(
-            agent.role,
-            self.locale,
+        return tool_definitions_for_agent(
+            agent,
+            locale=self.locale,
             config=self.config,
             prompt_library=self.prompt_library,
         )

@@ -23,13 +23,13 @@ OpenCompany documentation is organized as a layered map aligned with the current
 ### Module references (`docs/modules/`)
 
 - `runtime_core.md`: session lifecycle, limits, root/worker boundary.
-- `orchestration_pipeline.md`: loop engine, context assembly, forced summary behavior.
-- `tool_runtime.md`: tool registry, executor, `tool_run` lifecycle semantics, and remote SSH sandbox transport behavior.
+- `orchestration_pipeline.md`: loop engine, context assembly, forced summary behavior, and MCP-aware prompt/tool injection.
+- `tool_runtime.md`: tool registry, executor, `tool_run` lifecycle semantics, dynamic MCP tool/resource surfaces, and remote SSH sandbox transport behavior.
 - `workspace_sync.md`: `direct` / `staged` workspace modes, local/remote root selection in `direct`, fork/merge, diff artifacts, staged apply/undo.
 - `skills.md`: skill source discovery, project materialization, resume replacement semantics, and prompt/runtime integration.
 - `persistence_observability.md`: SQLite, JSONL logs, checkpoints, diagnostics.
 - `llm_prompts.md`: OpenRouter streaming path and prompt/tool-definition loading.
-- `ui_surfaces.md`: Web UI and TUI setup flows (local vs remote workspace in `direct`), session mode selection/locking, APIs, and Tool/Steer Runs panels.
+- `ui_surfaces.md`: Web UI and TUI setup flows (local vs remote workspace in `direct`), session mode selection/locking, MCP selection state, APIs, and Tool/Steer Runs panels.
 - `testing_debugging.md`: test matrix, validation commands, debugging workflow.
 
 Each module doc has a synchronized Chinese mirror (`*_cn.md`) with the same section structure.

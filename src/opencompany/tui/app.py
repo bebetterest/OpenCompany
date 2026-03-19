@@ -1790,6 +1790,25 @@ class OpenCompanyApp(App):
         margin-right: 1;
     }
 
+    #mcp_servers_input_row {
+        width: auto;
+        min-width: 44;
+        max-width: 104;
+        height: auto;
+    }
+
+    #mcp_servers_label {
+        width: 16;
+        content-align: left middle;
+    }
+
+    #mcp_servers_input {
+        width: 52;
+        min-width: 24;
+        max-width: 80;
+        margin-right: 1;
+    }
+
     #locale_controls {
         width: auto;
         height: auto;
@@ -1873,6 +1892,7 @@ class OpenCompanyApp(App):
 
     #live_tree {
         height: 1fr;
+        min-height: 4;
         width: 100%;
         padding: 0;
     }
@@ -2226,6 +2246,7 @@ class OpenCompanyApp(App):
         self._task_input_seeded_default: str | None = None
         self._task_input_programmatic_update: bool = False
         self.selected_model: str = self._default_model_from_config()
+        self.selected_mcp_server_ids: list[str] = []
         self._diagnostics: DiagnosticLogger | None = None
         self._panel_refresh_scheduled: bool = False
         self._panel_refresh_dirty: bool = False
@@ -2389,6 +2410,9 @@ class OpenCompanyApp(App):
                             yield Static("", id="locale_label")
                             yield Button("", id="locale_en_button")
                             yield Button("", id="locale_zh_button")
+                    with Horizontal(id="mcp_servers_input_row"):
+                        yield Static("", id="mcp_servers_label")
+                        yield Input("", id="mcp_servers_input")
                     with Horizontal(id="task_row"):
                         yield Static("", id="task_label")
                         task_input = TextArea("", id="task_input")
@@ -2724,6 +2748,7 @@ class OpenCompanyApp(App):
                         reactivate_agent_id=normalized_target_agent_id or None,
                         run_root_agent=run_root_agent,
                         remote_password=self.remote_password,
+                        enabled_mcp_server_ids=list(self.selected_mcp_server_ids) or None,
                     )
                 )
             self._steer_runs_dirty = True
@@ -2831,6 +2856,14 @@ class OpenCompanyApp(App):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "root_agent_name_input":
             return
+        if event.input.id == "mcp_servers_input":
+            parts = [
+                str(item).strip()
+                for item in re.split(r"[\s,]+", str(event.value or ""))
+                if str(item).strip()
+            ]
+            self.selected_mcp_server_ids = list(dict.fromkeys(parts))
+            return
         if event.input.id != "model_input":
             return
         self.selected_model = self._selected_model_for_run(event.value)
@@ -2937,11 +2970,23 @@ class OpenCompanyApp(App):
         model_input = self.query_one("#model_input", Input)
         selected_model = self._selected_model_for_run(model_input.value)
         root_agent_name_input = self._query_optional("#root_agent_name_input", Input)
+        mcp_servers_input = self._query_optional("#mcp_servers_input", Input)
         root_agent_name = (
             str(root_agent_name_input.value or "").strip()
             if root_agent_name_input is not None
             else ""
         )
+        selected_mcp_server_ids = (
+            list(dict.fromkeys(
+                str(item).strip()
+                for item in re.split(r"[\s,]+", str(mcp_servers_input.value or ""))
+                if str(item).strip()
+            ))
+            if mcp_servers_input is not None
+            else list(self.selected_mcp_server_ids)
+        )
+        selected_mcp_server_ids = selected_mcp_server_ids or None
+        self.selected_mcp_server_ids = list(selected_mcp_server_ids or [])
         self.selected_model = selected_model
         if not model_input.value.strip():
             model_input.value = selected_model
@@ -2963,6 +3008,7 @@ class OpenCompanyApp(App):
                 task,
                 model=selected_model,
                 root_agent_name=root_agent_name or None,
+                enabled_mcp_server_ids=selected_mcp_server_ids,
                 source="tui",
             )
             self.current_task = task
@@ -2998,6 +3044,7 @@ class OpenCompanyApp(App):
                     "task": task,
                     "model": selected_model,
                     "root_agent_name": root_agent_name,
+                    "enabled_mcp_server_ids": list(selected_mcp_server_ids or []),
                 },
             )
             self.session_task = asyncio.create_task(
@@ -3007,6 +3054,7 @@ class OpenCompanyApp(App):
                     selected_model,
                     root_agent_name,
                     self.remote_password,
+                    selected_mcp_server_ids,
                 )
             )
             return
@@ -3031,6 +3079,7 @@ class OpenCompanyApp(App):
                 "task": task,
                 "model": selected_model,
                 "root_agent_name": root_agent_name,
+                "enabled_mcp_server_ids": list(selected_mcp_server_ids or []),
                 "project_dir": str(self.project_dir) if self.project_dir is not None else None,
                 "remote_target": self.remote_config.ssh_target if self.remote_config else None,
             },
@@ -3043,6 +3092,7 @@ class OpenCompanyApp(App):
                 self.session_mode,
                 self.remote_config,
                 self.remote_password,
+                selected_mcp_server_ids,
             )
         )
 
@@ -3368,6 +3418,7 @@ class OpenCompanyApp(App):
                 self.current_task = loaded_session.task
                 self.current_session_status = loaded_session.status.value
                 self.current_summary = loaded_session.final_summary or ""
+                self.selected_mcp_server_ids = list(loaded_session.enabled_mcp_server_ids)
                 history_session_id = loaded_session.id
             records = orchestrator.load_session_events(history_session_id)
             if hasattr(orchestrator, "load_session_agents"):
@@ -3681,6 +3732,7 @@ class OpenCompanyApp(App):
         session_mode: WorkspaceMode | str | None = None,
         remote_config: RemoteSessionConfig | None = None,
         remote_password: str | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         assert self.orchestrator is not None
         try:
@@ -3694,6 +3746,8 @@ class OpenCompanyApp(App):
                 run_kwargs["remote_config"] = remote_config
                 if str(remote_password or "").strip():
                     run_kwargs["remote_password"] = remote_password
+            if enabled_mcp_server_ids is not None:
+                run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await self.orchestrator.run_task(task, **run_kwargs)
             self.project_dir = session.project_dir.resolve()
             if hasattr(self.orchestrator, "_session_remote_config"):
@@ -3707,6 +3761,7 @@ class OpenCompanyApp(App):
             self.session_mode_locked = True
             self.current_session_status = session.status.value
             self.current_summary = session.final_summary or self.current_summary
+            self.selected_mcp_server_ids = list(session.enabled_mcp_server_ids)
             self._refresh_project_sync_state()
             self._update_status(self.current_summary or self.translator.text("session_completed"))
         except asyncio.CancelledError:
@@ -3755,6 +3810,7 @@ class OpenCompanyApp(App):
         model: str,
         root_agent_name: str | None = None,
         remote_password: str | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         assert self.orchestrator is not None
         try:
@@ -3764,6 +3820,8 @@ class OpenCompanyApp(App):
             }
             if str(remote_password or "").strip():
                 run_kwargs["remote_password"] = remote_password
+            if enabled_mcp_server_ids is not None:
+                run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await self.orchestrator.run_task_in_session(
                 session_id,
                 task,
@@ -3781,6 +3839,7 @@ class OpenCompanyApp(App):
             self.session_mode_locked = True
             self.current_session_status = session.status.value
             self.current_summary = session.final_summary or self.current_summary
+            self.selected_mcp_server_ids = list(session.enabled_mcp_server_ids)
             self._refresh_project_sync_state()
             self._update_status(self.current_summary or self.translator.text("session_completed"))
         except asyncio.CancelledError:
@@ -3830,6 +3889,7 @@ class OpenCompanyApp(App):
         reactivate_agent_id: str | None = None,
         run_root_agent: bool = True,
         remote_password: str | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         assert self.orchestrator is not None
         try:
@@ -3840,6 +3900,8 @@ class OpenCompanyApp(App):
             }
             if str(remote_password or "").strip():
                 resume_kwargs["remote_password"] = remote_password
+            if enabled_mcp_server_ids is not None:
+                resume_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await self.orchestrator.resume(
                 session_id,
                 instruction,
@@ -3857,6 +3919,7 @@ class OpenCompanyApp(App):
             self.session_mode_locked = True
             self.current_session_status = session.status.value
             self.current_summary = session.final_summary or self.current_summary
+            self.selected_mcp_server_ids = list(session.enabled_mcp_server_ids)
             self._refresh_project_sync_state()
             self._update_status(self.current_summary or self.translator.text("session_resumed_done"))
         except asyncio.CancelledError:
@@ -6724,10 +6787,12 @@ class OpenCompanyApp(App):
         locale_label = self._query_optional("#locale_label", Static)
         model_label = self._query_optional("#model_label", Static)
         root_agent_name_label = self._query_optional("#root_agent_name_label", Static)
+        mcp_servers_label = self._query_optional("#mcp_servers_label", Static)
         task_label = self._query_optional("#task_label", Static)
         task_input = self._query_optional("#task_input", TextArea)
         model_input = self._query_optional("#model_input", Input)
         root_agent_name_input = self._query_optional("#root_agent_name_input", Input)
+        mcp_servers_input = self._query_optional("#mcp_servers_input", Input)
         overview_title = self._query_optional("#overview_panel_title", Static)
         live_title = self._query_optional("#live_panel_title", Static)
         tool_runs_title = self._query_optional("#tool_runs_panel_title", Static)
@@ -6761,10 +6826,12 @@ class OpenCompanyApp(App):
                 locale_label,
                 model_label,
                 root_agent_name_label,
+                mcp_servers_label,
                 task_label,
                 task_input,
                 model_input,
                 root_agent_name_input,
+                mcp_servers_input,
                 overview_title,
                 live_title,
                 tool_runs_title,
@@ -6798,10 +6865,14 @@ class OpenCompanyApp(App):
         locale_label.update(self.translator.text("locale"))
         model_label.update(self.translator.text("model_input_label"))
         root_agent_name_label.update(self.translator.text("root_agent_name_label"))
+        mcp_servers_label.update(self.translator.text("mcp_servers_label"))
         task_label.update(self.translator.text("task"))
         task_input.border_title = self.translator.text("task_input")
         model_input.placeholder = self.translator.text("model_input_placeholder")
         root_agent_name_input.placeholder = self.translator.text("root_agent_name_placeholder")
+        mcp_servers_input.placeholder = self.translator.text("mcp_servers_placeholder")
+        if str(mcp_servers_input.value or "").strip() != ", ".join(self.selected_mcp_server_ids):
+            mcp_servers_input.value = ", ".join(self.selected_mcp_server_ids)
         self._ensure_model_input_value()
         overview_title.update(self.translator.text("overview_title"))
         live_title.update(self.translator.text("live_output_title"))
@@ -8646,6 +8717,7 @@ class OpenCompanyApp(App):
         run_button = self._query_optional("#run_button", Button)
         model_input = self._query_optional("#model_input", Input)
         root_agent_name_input = self._query_optional("#root_agent_name_input", Input)
+        mcp_servers_input = self._query_optional("#mcp_servers_input", Input)
         terminal_button = self._query_optional("#terminal_button", Button)
         apply_button = self._query_optional("#apply_button", Button)
         undo_button = self._query_optional("#undo_button", Button)
@@ -8658,6 +8730,8 @@ class OpenCompanyApp(App):
             model_input.disabled = controls_busy
         if root_agent_name_input is not None:
             root_agent_name_input.disabled = controls_busy
+        if mcp_servers_input is not None:
+            mcp_servers_input.disabled = controls_busy
         if terminal_button is not None:
             terminal_button.disabled = controls_busy or not bool(self._active_session_id())
         if apply_button is not None:
@@ -8786,6 +8860,7 @@ class OpenCompanyApp(App):
         self.current_session_status = "idle"
         self.current_focus_agent_id = None
         self.current_summary = ""
+        self.selected_mcp_server_ids = []
         self.project_sync_state = None
         self.last_project_sync_operation = None
         self._diff_preview_cache_key = None

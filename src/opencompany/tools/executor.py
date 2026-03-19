@@ -13,6 +13,7 @@ from opencompany.models import (
     AgentNode,
     AgentRole,
     AgentStatus,
+    InteractiveShellRequest,
     RemoteSessionConfig,
     RemoteShellContext,
     ShellCommandRequest,
@@ -21,6 +22,7 @@ from opencompany.models import (
 from opencompany.sandbox.base import SandboxBackend, SandboxError
 from opencompany.status_machine import AGENT_TERMINAL_STATUSES, KNOWN_AGENT_STATUSES
 from opencompany.storage import Storage
+from opencompany.tools.catalog import visible_tool_names_for_agent
 from opencompany.tools.runtime import (
     decode_offset_cursor,
     encode_offset_cursor,
@@ -226,6 +228,59 @@ class ToolExecutor:
             timeout_seconds=self.timeout_seconds_for_action("shell"),
             network_policy=self.config.sandbox.network_policy,
             allowed_domains=list(self.config.sandbox.allowed_domains),
+            environment=dict(environment or {}),
+            session_id=str(session_id or ""),
+            remote=remote,
+        )
+
+    def build_interactive_request(
+        self,
+        *,
+        workspace_root: Path,
+        command: str,
+        cwd: str = ".",
+        writable_paths: list[Path] | None = None,
+        environment: dict[str, str] | None = None,
+        session_id: str = "",
+        remote: RemoteShellContext | None = None,
+    ) -> InteractiveShellRequest:
+        normalized_command = str(command or "").strip()
+        if not normalized_command:
+            raise ValueError("Shell command is required.")
+        if remote is not None:
+            root = self._normalize_remote_workspace_root(str(workspace_root))
+            resolved_cwd = Path(
+                self._resolve_remote_workspace_path(root, str(cwd or ".")).as_posix()
+            )
+            requested_writable_paths = list(writable_paths or [Path(root.as_posix())])
+            normalized_writable_paths: list[Path] = []
+            for path in requested_writable_paths:
+                resolved_path = self._resolve_remote_workspace_path(root, str(path))
+                normalized_writable_paths.append(Path(resolved_path.as_posix()))
+            return InteractiveShellRequest(
+                command=normalized_command,
+                cwd=resolved_cwd,
+                workspace_root=Path(root.as_posix()),
+                writable_paths=normalized_writable_paths,
+                environment=dict(environment or {}),
+                session_id=str(session_id or ""),
+                remote=remote,
+            )
+        root = workspace_root.resolve()
+        relative_cwd = self.normalize_workspace_path(root, cwd or ".")
+        resolved_cwd = resolve_in_workspace(root, relative_cwd)
+        requested_writable_paths = list(writable_paths or [root])
+        normalized_writable_paths: list[Path] = []
+        for path in requested_writable_paths:
+            resolved_path = Path(path).expanduser().resolve()
+            if resolved_path != root and root not in resolved_path.parents:
+                raise ValueError(f"Writable path escapes workspace: {resolved_path}")
+            normalized_writable_paths.append(resolved_path)
+        return InteractiveShellRequest(
+            command=normalized_command,
+            cwd=resolved_cwd,
+            workspace_root=root,
+            writable_paths=normalized_writable_paths,
             environment=dict(environment or {}),
             session_id=str(session_id or ""),
             remote=remote,
@@ -892,8 +947,13 @@ class ToolExecutor:
             return "agent_id"
         return "unknown"
 
-    def _role_tool_names(self, role: AgentRole) -> tuple[str, ...]:
-        return tuple(self.config.runtime.tools.tool_names_for_role(role.value))
+    def _role_tool_names(self, agent_or_role: AgentNode | AgentRole) -> tuple[str, ...]:
+        if isinstance(agent_or_role, AgentNode):
+            return visible_tool_names_for_agent(
+                agent_or_role,
+                config=self.config,
+            )
+        return tuple(self.config.runtime.tools.tool_names_for_role(agent_or_role.value))
 
     def _unknown_tool_result(
         self,
@@ -902,7 +962,7 @@ class ToolExecutor:
         action: dict[str, Any],
     ) -> dict[str, Any]:
         action_type = str(action.get("type", "<unknown>")).strip() or "<unknown>"
-        available_tools = list(self._role_tool_names(agent.role))
+        available_tools = list(self._role_tool_names(agent))
         suggestions = get_close_matches(action_type, available_tools, n=3, cutoff=0.45)
         if action_type in {"write_file", "edit_file", "append_file", "create_file"} and "shell" in available_tools:
             next_step_hint = (
@@ -971,7 +1031,7 @@ class ToolExecutor:
             "error": error,
             "error_code": error_code,
             "action": self._action_feedback_payload(action),
-            "available_tools": list(self._role_tool_names(agent.role)),
+            "available_tools": list(self._role_tool_names(agent)),
         }
         if include_suggestions:
             payload["suggested_tools"] = include_suggestions

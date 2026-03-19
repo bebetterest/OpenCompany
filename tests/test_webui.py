@@ -133,6 +133,12 @@ class WebUIStateTests(unittest.TestCase):
                         root_agent_id="agent-root",
                         workspace_mode=WorkspaceMode.DIRECT,
                         status=SessionStatus.INTERRUPTED,
+                        enabled_mcp_server_ids=["filesystem"],
+                        mcp_state={
+                            "enabled_server_ids": ["filesystem"],
+                            "entries": [{"id": "filesystem", "connected": True}],
+                            "warnings": [{"server_id": "docs", "message": "offline"}],
+                        },
                     )
 
             state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
@@ -143,6 +149,11 @@ class WebUIStateTests(unittest.TestCase):
             self.assertTrue(state.launch_config().can_resume())
             self.assertEqual(state.launch_config().session_mode, WorkspaceMode.DIRECT)
             self.assertTrue(state.launch_config().session_mode_locked)
+            self.assertEqual(state.selected_mcp_server_ids, ["filesystem"])
+            self.assertEqual(
+                state.mcp_state["warnings"][0]["message"],
+                "offline",
+            )
 
     def test_sandbox_backend_defaults_to_config_and_can_be_overridden_per_launch(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1095,6 +1106,7 @@ model = "openai/gpt-4o-mini"
                         self.app_dir = app_dir
                         self.calls: list[tuple[str, str, str, str]] = []
                         self.root_agent_names: list[str | None] = []
+                        self.enabled_mcp_server_ids: list[list[str] | None] = []
 
                     def submit_run_in_active_session(
                         self,
@@ -1103,10 +1115,12 @@ model = "openai/gpt-4o-mini"
                         *,
                         model: str | None = None,
                         root_agent_name: str | None = None,
+                        enabled_mcp_server_ids: list[str] | None = None,
                         source: str = "webui",
                     ) -> dict[str, str]:
                         self.calls.append((session_id, task, str(model or ""), source))
                         self.root_agent_names.append(root_agent_name)
+                        self.enabled_mcp_server_ids.append(enabled_mcp_server_ids)
                         return {
                             "session_id": session_id,
                             "root_agent_id": "agent-root-live",
@@ -1123,6 +1137,7 @@ model = "openai/gpt-4o-mini"
                     "root task live",
                     model="openai/gpt-4.1-mini",
                     root_agent_name="Root Live",
+                    enabled_mcp_server_ids=["filesystem", "docs"],
                 )
                 self.assertEqual(
                     fake.calls,
@@ -1136,6 +1151,7 @@ model = "openai/gpt-4o-mini"
                     ],
                 )
                 self.assertEqual(fake.root_agent_names, ["Root Live"])
+                self.assertEqual(fake.enabled_mcp_server_ids, [["filesystem", "docs"]])
                 self.assertEqual(snapshot["runtime"]["session_status"], "running")
                 self.assertEqual(state.current_task, "root task live")
                 self.assertIsNotNone(state.session_task)

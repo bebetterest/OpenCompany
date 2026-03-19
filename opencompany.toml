@@ -84,6 +84,10 @@ shell_seconds = 300
 [runtime.tool_timeouts.actions]
 compress_context = 300
 wait_time = 65
+list_mcp_servers = 20
+list_mcp_resources = 20
+read_mcp_resource = 30
+mcp_tool = 60
 list_agent_runs = 10
 get_agent_run = 10
 cancel_agent = 20
@@ -102,6 +106,9 @@ root_tools = [
   "shell",
   "compress_context",
   "wait_time",
+  "list_mcp_servers",
+  "list_mcp_resources",
+  "read_mcp_resource",
   "list_agent_runs",
   "get_agent_run",
   "spawn_agent",
@@ -119,6 +126,9 @@ worker_tools = [
   "shell",
   "compress_context",
   "wait_time",
+  "list_mcp_servers",
+  "list_mcp_resources",
+  "read_mcp_resource",
   "list_agent_runs",
   "get_agent_run",
   "spawn_agent",
@@ -225,6 +235,39 @@ allowed_domains = [
 # 沙箱命令统一超时（秒）
 # Unified sandbox command timeout in seconds
 timeout_seconds = 300
+
+
+# MCP client configuration
+# MCP 客户端配置
+[mcp]
+# MCP protocol version advertised during initialize
+# initialize 阶段向 server 宣告的 MCP 协议版本
+protocol_version = "2025-11-25"
+
+# Example stdio MCP server
+# 示例：stdio MCP server
+#[mcp.servers.filesystem]
+#transport = "stdio"
+#enabled = false
+#title = "Filesystem MCP"
+#timeout_seconds = 30
+#command = "npx"
+#args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#env = {}
+#cwd = "."
+#allowed_tools = []
+
+# Example Streamable HTTP MCP server
+# 示例：Streamable HTTP MCP server
+#[mcp.servers.example_http]
+#transport = "streamable_http"
+#enabled = false
+#title = "Example HTTP MCP"
+#timeout_seconds = 30
+#url = "http://127.0.0.1:3000/mcp"
+#headers = { Authorization = "env:MCP_AUTH_TOKEN" }
+#expose_roots = true
+#allowed_tools = []
 
 
 # 日志与导出文件名配置（位于 data_dir 下）

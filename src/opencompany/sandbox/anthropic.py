@@ -15,10 +15,68 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from opencompany.config import SandboxConfig
-from opencompany.models import RemoteShellContext, ShellCommandRequest, ShellCommandResult
+from opencompany.models import (
+    InteractiveShellRequest,
+    RemoteShellContext,
+    ShellCommandRequest,
+    ShellCommandResult,
+)
 from opencompany.remote import parse_ssh_target
-from opencompany.sandbox.base import SandboxBackend, SandboxError, ShellEventCallback
+from opencompany.sandbox.base import (
+    InteractiveSandboxProcess,
+    SandboxBackend,
+    SandboxError,
+    ShellEventCallback,
+)
 from opencompany.utils import resolve_in_workspace, truncate_text
+
+
+class _InteractiveAnthropicSandboxProcess(InteractiveSandboxProcess):
+    def __init__(
+        self,
+        *,
+        backend: "AnthropicSandboxBackend",
+        process: asyncio.subprocess.Process,
+        stdout_task: asyncio.Task[None],
+        stderr_task: asyncio.Task[None],
+        settings_path: Path,
+    ) -> None:
+        self._backend = backend
+        self._process = process
+        self._stdout_task = stdout_task
+        self._stderr_task = stderr_task
+        self._settings_path = settings_path
+        self._closed = False
+
+    async def write_line(self, text: str) -> None:
+        if self._closed:
+            raise SandboxError("Interactive process is already closed.")
+        if self._process.stdin is None:
+            raise SandboxError("Interactive process stdin is unavailable.")
+        self._process.stdin.write((str(text) + "\n").encode("utf-8"))
+        await self._process.stdin.drain()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.stdin is not None:
+            self._process.stdin.close()
+            with contextlib.suppress(Exception):
+                await self._process.stdin.wait_closed()
+        if self._process.returncode is None:
+            await self._backend._terminate_process(self._process)
+        await self.wait_closed()
+
+    async def wait_closed(self) -> None:
+        try:
+            await self._process.wait()
+            await self._backend._drain_stream_tasks(
+                self._stdout_task,
+                self._stderr_task,
+            )
+        finally:
+            self._settings_path.unlink(missing_ok=True)
 
 
 class AnthropicSandboxBackend(SandboxBackend):
@@ -305,6 +363,80 @@ class AnthropicSandboxBackend(SandboxBackend):
             killed=killed,
             termination_reason=termination_reason,
             reader_tasks_cancelled=reader_tasks_cancelled,
+        )
+
+    async def start_interactive(
+        self,
+        request: InteractiveShellRequest,
+        on_stdout: ShellEventCallback | None = None,
+        on_stderr: ShellEventCallback | None = None,
+    ) -> InteractiveSandboxProcess:
+        if request.remote is not None:
+            raise SandboxError("Interactive stdio MCP sessions do not support remote workspaces.")
+        cli_path = self.resolve_cli_path()
+        resolve_in_workspace(
+            request.workspace_root,
+            str(request.cwd.relative_to(request.workspace_root)),
+        )
+        shell_request = ShellCommandRequest(
+            command=request.command,
+            cwd=request.cwd,
+            workspace_root=request.workspace_root,
+            writable_paths=list(request.writable_paths),
+            timeout_seconds=0.0,
+            environment=dict(request.environment),
+            session_id=request.session_id,
+        )
+        settings = self.build_settings(shell_request)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(settings, handle)
+            handle.flush()
+            settings_path = Path(handle.name)
+
+        env = os.environ.copy()
+        env.update(request.environment)
+        env.pop("BASH_ENV", None)
+        env.pop("ENV", None)
+        sandbox_command = self.build_sandbox_command(request.command)
+        process = await asyncio.create_subprocess_exec(
+            cli_path,
+            "--settings",
+            str(settings_path),
+            sandbox_command,
+            cwd=str(request.cwd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=os.name != "nt",
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        async def _read_stream(
+            stream: asyncio.StreamReader,
+            channel: str,
+            callback: ShellEventCallback | None,
+        ) -> None:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                if callback is None:
+                    continue
+                text = line.decode("utf-8", errors="replace")
+                maybe = callback(channel, text)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+
+        stdout_task = asyncio.create_task(_read_stream(process.stdout, "stdout", on_stdout))
+        stderr_task = asyncio.create_task(_read_stream(process.stderr, "stderr", on_stderr))
+        return _InteractiveAnthropicSandboxProcess(
+            backend=self,
+            process=process,
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            settings_path=settings_path,
         )
 
     def cleanup_session(self, session_id: str) -> None:

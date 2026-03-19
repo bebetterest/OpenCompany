@@ -141,6 +141,14 @@ worker：
 - 对于 password auth，首次成功输入后可复用本地安全凭据存储；当 OS 凭据后端不可用时，会使用本地加密回退存储。
 - 会话完成/中断/失败时会触发远程运行时清理（SSH 控制状态 + 临时缓存残留）。
 
+## MCP 会话状态
+
+- 会话现在会和 skills 一起持久化 `enabled_mcp_server_ids` 与 `mcp_state`。
+- MCP server 定义来自 `opencompany.toml` 中的 `[mcp]` / `[mcp.servers.<id>]`；单次 run/resume 选择的是会话级启用集合，可不同于配置默认值。
+- 每个 agent 都使用自己独立的 MCP 连接，因此不同 workspace 下的 root/worker 不会共享 roots 或 tool/resource 缓存。
+- runtime 会在 agent 第一次 LLM step 前准备 MCP 连接，在后续 step 中保持复用，并在 agent/session 结束时关闭。
+- resume/import 会保留启用的 server ids；缺失或损坏的 servers 会作为 `session.mcp_state` 中的 warning 暴露，而不是静默忽略。
+
 ## 收尾与用户确认
 
 当 root 以 `completed` 或 `partial` 收尾时：

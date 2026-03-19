@@ -14,11 +14,23 @@
 当前 root/worker 默认工具集合：
 
 - `shell`、`compress_context`、`wait_time`
+- `list_mcp_servers`、`list_mcp_resources`、`read_mcp_resource`
 - `list_agent_runs`、`get_agent_run`、`spawn_agent`、`cancel_agent`、`steer_agent`
 - `list_tool_runs`、`get_tool_run`、`wait_run`、`cancel_tool_run`
 - `finish`
 
 角色可用工具可通过 `[runtime.tools]` 配置，其中也包括 `steer_agent_scope`（`session` / `descendants`）。
+
+## MCP 工具与资源表面
+
+- helper 工具：
+  - `list_mcp_servers`：列出当前 agent runtime 可见的启用/已配置 MCP servers。
+  - `list_mcp_resources`：按分页列出缓存中的 MCP resources，并支持可选 `server_id` 过滤。
+  - `read_mcp_resource`：读取单个具体 MCP resource URI；v1 不做 resource template 展开。
+- 动态 MCP tools 会在运行时以 `mcp__<server_id>__<tool_name>__<hash>` 这种 synthetic name 注入。
+- 动态 MCP tools 仍然是一等工具调用：每次调用都会生成自己的 `tool_run` 行，并返回投影后的 agent 可见结果。
+- 动态 MCP tool 的超时预算统一归入 `runtime.tool_timeouts.actions.mcp_tool`。
+- MCP tool/resource 输出会先做脱敏与尺寸截断，再返回给 agent 或持久化到 `tool_run.result`。
 
 ## 协议原则
 

@@ -18,6 +18,7 @@ OpenCompany 当前提供两套本地界面：
 - 启动配置：`/api/bootstrap`、`/api/launch-config`、`/api/sessions`
 - 执行控制：`/api/run`、`/api/interrupt`
 - skill discover：`/api/skills/discover`
+- MCP discover：`/api/mcp/servers`
 - sandbox 终端拉起：`/api/terminal/open`
 - 远程工作目录校验：`/api/remote/validate`
 - 可观测性：`/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -30,6 +31,7 @@ OpenCompany 当前提供两套本地界面：
 - 当 launch config 提供 `project_dir` 时，`/api/run` 新建会话并运行。
 - 新建会话的 launch config 还会携带 `session_mode`（`direct` / `staged`），默认是 `direct`。
 - `/api/run` 接受 `enabled_skill_ids`；对于已加载 session，这会为新一轮 run 替换当前 skill 集；若省略则保留原集合。
+- `/api/run` 也接受 `enabled_mcp_server_ids`；对于已加载 session，这会为新一轮 run 替换当前启用的 MCP server 集；若省略则保留原集合。
 - 新建会话的 launch config 还可携带 `remote`（SSH 目标、远程目录、认证策略）以及仅请求态的 `remote_password`。
 - 远程工作目录仅在 `session_mode=direct` 时可用；`staged + remote` 会被拒绝。
 - 对 password auth 会话，请求态 `remote_password` 会用于 `/api/run`、`/api/terminal/open` 与 `/api/remote/validate`。
@@ -62,6 +64,10 @@ Web UI 特性：
   - 已发现 skills 会以可切换卡片展示，并附带来源/文档元数据、已选 chips 和告警卡片
   - 已在当前 session 物化生效的 skills，即使还没重新 discover，也会继续显示在选择器里
   - Overview 卡片会展示当前启用 id、bundle root 与告警数量
+- 控制栏也提供一套 MCP server 选择器：手动输入 + `发现` / `全选` / `清空`
+  - 选择结果会作为 `enabled_mcp_server_ids` 提交
+  - discover 会读取 `opencompany.toml` 中配置的 MCP servers
+  - Overview 卡片会展示当前启用的 MCP ids，以及来自 `session.mcp_state` 的 connected/warning 数量
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
 - session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
 - 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示
@@ -124,6 +130,7 @@ TUI 提供 run/interrupt、基于 setup 的会话加载、project sync 操作和
 同时在控制栏提供 `终端` 动作，直接拉起系统终端窗口，复用与 agent `shell` 调用一致的 sandbox backend/config，且工作目录固定到当前活动 session workspace。终端改动与 agent 改动一样会被 workspace diff/project sync 跟踪。
 控制栏采用三行布局：第一行是模型输入 + root-agent-name 输入 + 语言切换按钮（`EN` / `中文`），第二行是带明确 `任务` 标签的多行 `TextArea` 输入（按内容自动增高，最小 3 行、最大 9 行），第三行是运行控制按钮（`运行`、`终端`、`重新配置`、`中断`）。
 模型输入默认读取配置，并可按每次运行/继续自由覆盖。
+控制栏还包含一个简单的 MCP server 输入框，便于 TUI 用户在运行/继续时提交 `enabled_mcp_server_ids`。
 Agent 卡片/状态区域会显示各 agent 的模型，来源于持久化 metadata。
 Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`、上下文 token 使用、使用率、最近压缩范围）。
 在 `direct` 模式下，TUI 会禁用 `Diff` 标签页以及 `Apply` / `Undo` 控件。
@@ -131,6 +138,8 @@ Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`
 CLI 同时提供 `opencompany terminal <session_id>` 与 `opencompany terminal <session_id> --self-check`。
 `--self-check` 会同时校验与 agent `shell` 的策略一致性，以及按 backend 的运行时语义（workspace 内可写；`anthropic` 期望 workspace 外被阻止，`none` 期望 workspace 外可写）。
 交互式 CLI 的 run/resume 状态面板现包含每个 agent 的 `model` 字段。
+CLI 还提供 `opencompany mcp-servers`，用于校验配置并打印 MCP servers 的 capabilities/tools/resources。
+CLI 的 `run` / `resume` / `mcp-servers` 都支持重复传入 `--mcp-server <id>`。
 CLI 的 `run`/`tui`/`ui` 在新建会话时支持远程参数：
 - `--remote-target user@host[:port]`
 - `--remote-dir /abs/linux/path`

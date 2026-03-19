@@ -67,6 +67,17 @@ class RemoteShellContext:
 
 
 @dataclass(slots=True)
+class InteractiveShellRequest:
+    command: str
+    cwd: Path
+    workspace_root: Path
+    writable_paths: list[Path]
+    environment: dict[str, str] = field(default_factory=dict)
+    session_id: str = ""
+    remote: RemoteShellContext | None = None
+
+
+@dataclass(slots=True)
 class WorkspaceRef:
     id: str
     path: Path
@@ -113,8 +124,10 @@ class RunSession:
     completion_state: str | None = None
     follow_up_needed: bool = False
     enabled_skill_ids: list[str] = field(default_factory=list)
+    enabled_mcp_server_ids: list[str] = field(default_factory=list)
     skill_bundle_root: str = ""
     skills_state: dict[str, Any] = field(default_factory=dict)
+    mcp_state: dict[str, Any] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 
 

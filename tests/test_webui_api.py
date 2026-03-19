@@ -81,6 +81,10 @@ keep_pinned_messages = 3
                 self.assertIn('<button id="skills-clear-button"', response.text)
                 self.assertIn('<div id="skills-selected"', response.text)
                 self.assertIn('<div id="skills-warnings"', response.text)
+                self.assertIn('<input id="mcp-input"', response.text)
+                self.assertIn('<button id="mcp-discover-button"', response.text)
+                self.assertIn('<div id="mcp-selected"', response.text)
+                self.assertIn('<div id="mcp-warnings"', response.text)
                 self.assertIn('<select id="agents-role-filter">', response.text)
                 self.assertIn('<input id="agents-search-input"', response.text)
                 self.assertIn('<input id="steer-runs-search-input"', response.text)
@@ -207,6 +211,44 @@ keep_pinned_messages = 3
             self.assertEqual(captured["task"], "demo")
             self.assertEqual(captured["enabled_skill_ids"], ["skill-a", "skill-b"])
 
+    def test_run_forwards_enabled_mcp_server_ids(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {}
+
+            async def _fake_start_run(
+                task: str,
+                model: str | None = None,
+                root_agent_name: str | None = None,
+                enabled_mcp_server_ids: list[str] | None = None,
+            ) -> dict[str, object]:
+                captured["task"] = task
+                captured["model"] = model
+                captured["root_agent_name"] = root_agent_name
+                captured["enabled_mcp_server_ids"] = enabled_mcp_server_ids
+                return {"ok": True}
+
+            runtime_state.start_run = _fake_start_run  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/run",
+                    json={
+                        "task": "demo",
+                        "enabled_mcp_server_ids": ["filesystem", " docs ", ""],
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(captured["task"], "demo")
+            self.assertEqual(
+                captured["enabled_mcp_server_ids"],
+                ["filesystem", "docs"],
+            )
+
     def test_run_rejects_invalid_skill_id_with_400(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -255,6 +297,27 @@ keep_pinned_messages = 3
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["skills"], [{"id": "skill-a"}])
             self.assertEqual(captured["project_dir"], "/tmp/demo")
+
+    def test_mcp_servers_discover_endpoint_forwards_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {"called": False}
+
+            async def _fake_discover_mcp_servers() -> dict[str, object]:
+                captured["called"] = True
+                return {"mcp_servers": [{"id": "filesystem"}], "snapshot": {"ok": True}}
+
+            runtime_state.discover_mcp_servers = _fake_discover_mcp_servers  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/mcp/servers", json={})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["mcp_servers"], [{"id": "filesystem"}])
+            self.assertTrue(bool(captured["called"]))
 
     def test_run_while_running_skips_launch_reconfigure(self) -> None:
         with TemporaryDirectory() as temp_dir:

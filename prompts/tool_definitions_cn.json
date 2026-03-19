@@ -57,6 +57,68 @@
       }
     }
   },
+  "list_mcp_servers": {
+    "type": "function",
+    "function": {
+      "name": "list_mcp_servers",
+      "description": "列出当前 agent 已启用的 MCP servers，包括连接状态以及已发现的 tool/resource 数量。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_mcp_resources": {
+    "type": "function",
+    "function": {
+      "name": "list_mcp_resources",
+      "description": "列出已发现的 MCP resources。若需要 URI，请先调用该工具再调用 read_mcp_resource。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "description": "可选：限制为单个 MCP server id。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "最多返回多少个 resource。默认取 runtime.tools.list_default_limit，并受 runtime.tools.list_max_limit 限制。"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "可选：上一页 list_mcp_resources 返回的分页游标。"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "read_mcp_resource": {
+    "type": "function",
+    "function": {
+      "name": "read_mcp_resource",
+      "description": "按 URI 读取单个 MCP resource。若多个 server 上存在同一 URI，请同时提供 server_id。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "uri": {
+            "type": "string",
+            "description": "必填：要读取的 MCP resource URI。"
+          },
+          "server_id": {
+            "type": "string",
+            "description": "可选：当 URI 有歧义，或你想强制指定某个 server 时提供。"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
   "list_agent_runs": {
     "type": "function",
     "function": {

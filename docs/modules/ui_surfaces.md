@@ -18,6 +18,7 @@ Major API groups:
 - bootstrap/configuration: `/api/bootstrap`, `/api/launch-config`, `/api/sessions`
 - execution control: `/api/run`, `/api/interrupt`
 - skill discovery: `/api/skills/discover`
+- MCP discovery: `/api/mcp/servers`
 - sandbox terminal launch: `/api/terminal/open`
 - remote workspace validation: `/api/remote/validate`
 - observability: `/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -30,6 +31,7 @@ Execution semantics:
 - `/api/run` starts a new session when launch config provides `project_dir`.
 - New-session launch config also carries `session_mode` (`direct` / `staged`), defaulting to `direct`.
 - `/api/run` accepts `enabled_skill_ids`; for loaded sessions this replaces the current skill set for the new run, while omitted values keep the existing set.
+- `/api/run` also accepts `enabled_mcp_server_ids`; for loaded sessions this replaces the enabled MCP server set for the new run, while omitted values keep the existing set.
 - New-session launch config may carry `remote` (SSH target + remote dir + auth policy) and request-only `remote_password`.
 - Remote workspace is accepted only when `session_mode=direct`; `staged + remote` is rejected.
 - For password auth sessions, request-time `remote_password` is used on `/api/run`, `/api/terminal/open`, and `/api/remote/validate`.
@@ -62,6 +64,10 @@ Web UI-specific capabilities:
   - discovered skills render as selectable cards with source/doc metadata, selected chips, and warning cards
   - already-materialized session skills remain visible in the selector even before a fresh discover
   - overview cards surface the current enabled ids, bundle root, and skill warning count
+- control-bar also exposes an MCP server selector with manual input plus `Discover` / `Select All` / `Clear`
+  - selection is submitted as `enabled_mcp_server_ids`
+  - discover reads configured MCP servers from `opencompany.toml`
+  - overview cards surface enabled MCP ids plus connected/warning counts from session `mcp_state`
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
 - session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
 - initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active
@@ -124,6 +130,7 @@ When `Run` is pressed again while the same session is running, runtime immediate
 It also provides a `Terminal` action from the control row that directly launches a system terminal window using the same sandbox backend/config as agent `shell` calls, with workspace root fixed to the active session workspace. Edits made there are tracked by workspace diff/project sync just like agent edits.
 The control row is organized in three lines: model input + root-agent-name input + locale switch buttons (`EN` / `中文`), a task line with explicit `Task` label and multiline `TextArea` input (content-driven height expansion, min 3/max 9 rows), and run controls (`Run`, `Terminal`, `Reconfigure`, `Interrupt`).
 The model input defaults from config and remains overridable per run/continue.
+The control row also includes a simple MCP server input so TUI users can submit `enabled_mcp_server_ids` on run/continue without leaving the terminal.
 Agent cards/status sections display each agent's selected model from persisted metadata.
 Agent cards/status sections also display context-compression metrics (`compression_count`, context token usage, usage ratio, latest compacted range).
 In `direct` mode, TUI disables the `Diff` tab and `Apply` / `Undo` controls.

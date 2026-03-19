@@ -139,6 +139,9 @@ class WebUIRuntimeState:
         self.selected_skill_ids: list[str] = []
         self.skills_state: dict[str, Any] = {}
         self.available_skills: list[dict[str, Any]] = []
+        self.selected_mcp_server_ids: list[str] = []
+        self.mcp_state: dict[str, Any] = {}
+        self.available_mcp_servers: list[dict[str, Any]] = []
         self.project_sync_action_in_progress: bool = False
 
         self.event_hub = EventHub()
@@ -190,6 +193,9 @@ class WebUIRuntimeState:
                 "selected_skill_ids": list(self.selected_skill_ids),
                 "skills_state": self.skills_state,
                 "available_skills": list(self.available_skills),
+                "selected_mcp_server_ids": list(self.selected_mcp_server_ids),
+                "mcp_state": self.mcp_state,
+                "available_mcp_servers": list(self.available_mcp_servers),
                 "session_status": self.current_session_status,
                 "summary": self.current_summary,
                 "status_message": self.status_message,
@@ -283,6 +289,9 @@ class WebUIRuntimeState:
         self.selected_skill_ids = []
         self.skills_state = {}
         self.available_skills = []
+        self.selected_mcp_server_ids = []
+        self.mcp_state = {}
+        self.available_mcp_servers = []
 
     def _load_configured_session_context(self, session_id: str) -> None:
         self._require_session_dir(session_id)
@@ -297,6 +306,7 @@ class WebUIRuntimeState:
         self.session_mode = normalize_workspace_mode(loaded.workspace_mode)
         self.session_mode_locked = True
         self.available_skills = []
+        self.available_mcp_servers = []
         self._apply_session_runtime_state(loaded)
 
     def _apply_session_runtime_state(self, session: RunSession) -> None:
@@ -308,6 +318,24 @@ class WebUIRuntimeState:
         self.skills_state = (
             dict(session.skills_state) if isinstance(session.skills_state, dict) else {}
         )
+        self.selected_mcp_server_ids = list(session.enabled_mcp_server_ids)
+        self.mcp_state = (
+            dict(session.mcp_state) if isinstance(session.mcp_state, dict) else {}
+        )
+
+    @staticmethod
+    def _normalize_mcp_server_ids(server_ids: list[str] | None) -> list[str] | None:
+        if server_ids is None:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in server_ids:
+            server_id = str(item).strip()
+            if not server_id or server_id in seen:
+                continue
+            seen.add(server_id)
+            normalized.append(server_id)
+        return normalized
 
     def _project_dir_display(self) -> str | None:
         if self.remote_config is not None:
@@ -330,6 +358,7 @@ class WebUIRuntimeState:
         model: str | None = None,
         root_agent_name: str | None = None,
         enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._state_lock:
             normalized_task = task.strip()
@@ -342,10 +371,13 @@ class WebUIRuntimeState:
                 if enabled_skill_ids is not None
                 else None
             )
+            normalized_mcp_server_ids = self._normalize_mcp_server_ids(enabled_mcp_server_ids)
             self.selected_model = resolved_model
             self.root_agent_name = resolved_root_agent_name
             if normalized_skill_ids is not None:
                 self.selected_skill_ids = list(normalized_skill_ids)
+            if normalized_mcp_server_ids is not None:
+                self.selected_mcp_server_ids = list(normalized_mcp_server_ids)
             resolved_session_id = self._normalize_optional_session_id(
                 self.configured_resume_session_id
             )
@@ -367,6 +399,7 @@ class WebUIRuntimeState:
                     normalized_task,
                     model=resolved_model,
                     root_agent_name=resolved_root_agent_name or None,
+                    enabled_mcp_server_ids=normalized_mcp_server_ids,
                     source="webui",
                 )
                 self.current_task = normalized_task
@@ -392,6 +425,7 @@ class WebUIRuntimeState:
                         resolved_root_agent_name,
                         self.remote_password,
                         normalized_skill_ids,
+                        normalized_mcp_server_ids,
                     )
                 )
                 return self.snapshot()
@@ -414,6 +448,7 @@ class WebUIRuntimeState:
                     self.remote_config,
                     self.remote_password,
                     normalized_skill_ids,
+                    normalized_mcp_server_ids,
                 )
             )
         return self.snapshot()
@@ -446,6 +481,15 @@ class WebUIRuntimeState:
         self.available_skills = skills
         return {
             "skills": skills,
+            "snapshot": self.snapshot(),
+        }
+
+    async def discover_mcp_servers(self) -> dict[str, Any]:
+        orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
+        servers = orchestrator.mcp_manager.available_servers()
+        self.available_mcp_servers = list(servers)
+        return {
+            "mcp_servers": servers,
             "snapshot": self.snapshot(),
         }
 
@@ -1133,6 +1177,16 @@ class WebUIRuntimeState:
                     if isinstance(details.get("warnings"), list)
                     else [],
                 }
+        elif event_type == "session_mcp_refreshed":
+            if isinstance(details, dict):
+                self.selected_mcp_server_ids = self._normalize_mcp_server_ids(
+                    details.get("enabled_mcp_server_ids")
+                    if isinstance(details.get("enabled_mcp_server_ids"), list)
+                    else None
+                ) or []
+                mcp_state = details.get("mcp_state")
+                if isinstance(mcp_state, dict):
+                    self.mcp_state = dict(mcp_state)
         elif event_type == "session_interrupted":
             self.current_session_status = "interrupted"
             self.status_message = self.translator.text("session_interrupted")
@@ -1161,6 +1215,7 @@ class WebUIRuntimeState:
         remote: RemoteSessionConfig | None = None,
         remote_password: str | None = None,
         enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1177,6 +1232,8 @@ class WebUIRuntimeState:
                 run_kwargs["remote_password"] = remote_password
             if enabled_skill_ids is not None:
                 run_kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.run_task(task, **run_kwargs)
             self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
@@ -1203,6 +1260,7 @@ class WebUIRuntimeState:
         root_agent_name: str | None = None,
         remote_password: str | None = None,
         enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1216,6 +1274,8 @@ class WebUIRuntimeState:
                 kwargs["remote_password"] = remote_password
             if enabled_skill_ids is not None:
                 kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.run_task_in_session(
                 session_id,
                 task,
@@ -1247,6 +1307,7 @@ class WebUIRuntimeState:
         run_root_agent: bool = True,
         remote_password: str | None = None,
         enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1261,6 +1322,8 @@ class WebUIRuntimeState:
                 kwargs["remote_password"] = remote_password
             if enabled_skill_ids is not None:
                 kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.resume(
                 session_id,
                 instruction,

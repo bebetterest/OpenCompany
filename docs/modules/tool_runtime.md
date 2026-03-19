@@ -14,11 +14,23 @@ Tool runtime spans:
 Current default tool set for root and worker:
 
 - `shell`, `compress_context`, `wait_time`
+- `list_mcp_servers`, `list_mcp_resources`, `read_mcp_resource`
 - `list_agent_runs`, `get_agent_run`, `spawn_agent`, `cancel_agent`, `steer_agent`
 - `list_tool_runs`, `get_tool_run`, `wait_run`, `cancel_tool_run`
 - `finish`
 
 Role-specific availability is configurable via `[runtime.tools]`, including `steer_agent_scope` (`session` or `descendants`).
+
+## MCP Tool and Resource Surface
+
+- Helper tools:
+  - `list_mcp_servers`: lists enabled/configured MCP servers visible to the current agent runtime.
+  - `list_mcp_resources`: lists cached MCP resources with pagination and optional `server_id` filter.
+  - `read_mcp_resource`: reads one concrete MCP resource URI; v1 does not expand resource templates.
+- Dynamic MCP tools are injected at runtime as synthetic names shaped like `mcp__<server_id>__<tool_name>__<hash>`.
+- Dynamic MCP tools are first-class tool calls: each one gets its own `tool_run` row and agent-visible projected result.
+- Timeout budgeting for dynamic MCP tools is grouped under `runtime.tool_timeouts.actions.mcp_tool`.
+- MCP tool/resource outputs are sanitized and size-bounded before they are projected back to agents or persisted into `tool_run.result`.
 
 ## Contract Principles
 

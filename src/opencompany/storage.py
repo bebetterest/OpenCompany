@@ -50,8 +50,10 @@ class Storage:
                 completion_state TEXT,
                 follow_up_needed INTEGER NOT NULL,
                 enabled_skill_ids_json TEXT NOT NULL DEFAULT '[]',
+                enabled_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
                 skill_bundle_root TEXT NOT NULL DEFAULT '',
                 skills_state_json TEXT NOT NULL DEFAULT '{}',
+                mcp_state_json TEXT NOT NULL DEFAULT '{}',
                 config_snapshot_json TEXT NOT NULL
             );
 
@@ -190,12 +192,22 @@ class Storage:
         )
         self._ensure_column(
             "sessions",
+            "enabled_mcp_server_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        self._ensure_column(
+            "sessions",
             "skill_bundle_root",
             "TEXT NOT NULL DEFAULT ''",
         )
         self._ensure_column(
             "sessions",
             "skills_state_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "sessions",
+            "mcp_state_json",
             "TEXT NOT NULL DEFAULT '{}'",
         )
         self._ensure_column("agents", "status_reason", "TEXT")
@@ -313,9 +325,9 @@ class Storage:
             INSERT INTO sessions (
                 id, project_dir, task, locale, root_agent_id, workspace_mode, status, created_at,
                 status_reason, updated_at, loop_index, final_summary, completion_state,
-                follow_up_needed, enabled_skill_ids_json, skill_bundle_root, skills_state_json,
-                config_snapshot_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                follow_up_needed, enabled_skill_ids_json, enabled_mcp_server_ids_json,
+                skill_bundle_root, skills_state_json, mcp_state_json, config_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project_dir=excluded.project_dir,
                 task=excluded.task,
@@ -331,8 +343,10 @@ class Storage:
                 completion_state=excluded.completion_state,
                 follow_up_needed=excluded.follow_up_needed,
                 enabled_skill_ids_json=excluded.enabled_skill_ids_json,
+                enabled_mcp_server_ids_json=excluded.enabled_mcp_server_ids_json,
                 skill_bundle_root=excluded.skill_bundle_root,
                 skills_state_json=excluded.skills_state_json,
+                mcp_state_json=excluded.mcp_state_json,
                 config_snapshot_json=excluded.config_snapshot_json
             """,
             (
@@ -351,8 +365,10 @@ class Storage:
                 completion_state,
                 int(session.follow_up_needed),
                 json.dumps(json_ready(session.enabled_skill_ids), ensure_ascii=False),
+                json.dumps(json_ready(session.enabled_mcp_server_ids), ensure_ascii=False),
                 str(session.skill_bundle_root or ""),
                 json.dumps(json_ready(session.skills_state), ensure_ascii=False),
+                json.dumps(json_ready(session.mcp_state), ensure_ascii=False),
                 json.dumps(json_ready(session.config_snapshot), ensure_ascii=False),
             ),
         )

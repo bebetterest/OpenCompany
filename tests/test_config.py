@@ -287,3 +287,64 @@ backend = "none"
             )
             config = OpenCompanyConfig.load(project_dir)
             self.assertEqual(config.sandbox.backend, "none")
+
+    def test_mcp_config_is_loaded(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / "opencompany.toml").write_text(
+                """
+[mcp]
+protocol_version = "2025-11-25"
+
+[mcp.servers.filesystem]
+transport = "stdio"
+enabled = true
+title = "Filesystem"
+expose_roots = true
+timeout_seconds = 45
+allowed_tools = ["read_file", "write_file"]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+cwd = "."
+env = { API_TOKEN = "env:TEST_TOKEN" }
+
+[mcp.servers.docs]
+transport = "streamable_http"
+enabled = false
+title = "Docs"
+url = "http://127.0.0.1:8787/mcp"
+headers = { Authorization = "env:DOCS_TOKEN", "X-Test" = "demo" }
+""".strip(),
+                encoding="utf-8",
+            )
+            config = OpenCompanyConfig.load(project_dir)
+
+            self.assertEqual(config.mcp.protocol_version, "2025-11-25")
+            self.assertEqual(sorted(config.mcp.servers.keys()), ["docs", "filesystem"])
+            filesystem = config.mcp.servers["filesystem"]
+            self.assertEqual(filesystem.transport, "stdio")
+            self.assertEqual(filesystem.command, "npx")
+            self.assertEqual(filesystem.args[-1], ".")
+            self.assertEqual(filesystem.allowed_tools, ["read_file", "write_file"])
+            self.assertTrue(filesystem.expose_roots)
+            self.assertEqual(filesystem.timeout_seconds, 45.0)
+            self.assertEqual(filesystem.env["API_TOKEN"], "env:TEST_TOKEN")
+            docs = config.mcp.servers["docs"]
+            self.assertEqual(docs.transport, "streamable_http")
+            self.assertEqual(docs.url, "http://127.0.0.1:8787/mcp")
+            self.assertEqual(docs.headers["Authorization"], "env:DOCS_TOKEN")
+            self.assertFalse(docs.enabled)
+
+    def test_mcp_rejects_invalid_transport_configuration(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.bad]
+transport = "streamable_http"
+command = "python -m demo"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "requires non-empty url"):
+                OpenCompanyConfig.load(project_dir)

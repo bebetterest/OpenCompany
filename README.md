@@ -32,6 +32,7 @@ Language: **English** | [中文](README_cn.md)
 - 🌐 Project environments: supports both local directories and remote SSH Linux directories as execution environments.
 - 📝 Workspace modes: supports `Direct` and `Staged`; `Direct` writes to the project immediately, while `Staged` holds diffs for user approval before apply (remote supports `Direct` only).
 - 🧰 Skills: sessions can enable reusable skill bundles from project/global sources; selected skills are materialized into `.opencompany_skills/<session_id>/...` and inherited by workers.
+- 🔌 MCP client: sessions can enable configured MCP servers, expose discovered MCP tools directly to agents, browse/read MCP resources, and selectively expose workspace roots when safe.
 - 📦 Default bundled skills: this repository ships with a small default set of skills adapted from Codex for OpenCompany under `skills/` (currently `pdf`, `openai-docs`, `skill-creator`, and `skill-installer`).
 - 🔒 Security model: supports both `anthropic` [sandbox (SRT)](https://github.com/anthropic-experimental/sandbox-runtime) and `none` (unconstrained) runtime backends.
 - 🖥️ Three interfaces: supports Web UI / TUI / CLI, with Web UI recommended (bilingual visualization in Chinese/English covers session overview, collaboration graph, per-agent details, tool/steer traces, and operations like session create/import, config updates, agent create/steer/terminate, and opening agent terminals).
@@ -208,6 +209,22 @@ Run with explicit skills:
 opencompany run \
   --skill repo-map \
   --skill release-notes \
+  "Inspect this repository and propose next engineering steps."
+```
+
+Inspect configured MCP servers:
+
+```bash
+opencompany mcp-servers
+opencompany mcp-servers --mcp-server filesystem
+```
+
+Run with explicit MCP servers:
+
+```bash
+opencompany run \
+  --mcp-server filesystem \
+  --mcp-server docs \
   "Inspect this repository and propose next engineering steps."
 ```
 
