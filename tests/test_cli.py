@@ -1312,6 +1312,115 @@ class CliRunResumePanelTests(unittest.TestCase):
         orchestrator = captured["orchestrator"]
         self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
 
+    def test_skills_command_prints_json_and_forwards_remote_args(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    captured["init"] = {
+                        "project_dir": project_dir,
+                        "locale": locale,
+                        "app_dir": app_dir,
+                        "debug": debug,
+                    }
+
+                async def discover_skills(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["discover_kwargs"] = kwargs
+                    return [{"id": "skill-a"}]
+
+            remote_config = SimpleNamespace(remote_dir="/home/demo/workspace")
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._skills(
+                            project_dir=project_dir,
+                            app_dir=app_dir,
+                            locale="en",
+                            debug=False,
+                            remote_config=remote_config,  # type: ignore[arg-type]
+                            remote_password="secret",
+                        )
+                    )
+
+        self.assertEqual(json.loads(output.getvalue()), [{"id": "skill-a"}])
+        self.assertEqual(
+            captured["discover_kwargs"],
+            {
+                "project_dir": None,
+                "remote_config": remote_config,
+                "remote_password": "secret",
+            },
+        )
+
+    def test_mcp_servers_command_prints_json_and_cleans_up_remote_runtime(self) -> None:
+        captured: dict[str, object] = {"events": []}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+
+            class _FakeMcpManager:
+                async def inspect_servers(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["inspect_kwargs"] = kwargs
+                    return [{"id": "filesystem"}]
+
+                async def close_session(self, session_id: str) -> None:
+                    captured["closed_session_id"] = session_id
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.app_dir = app_dir
+                    self.config = SimpleNamespace(sandbox=SimpleNamespace(backend="anthropic"))
+                    self.tool_executor = SimpleNamespace(
+                        cleanup_session_remote_runtime=lambda session_id: captured.setdefault(
+                            "cleaned_session_ids", []
+                        ).append(session_id)
+                    )
+                    self.mcp_manager = _FakeMcpManager()
+                    self.diagnostics = SimpleNamespace(
+                        log=lambda **kwargs: captured["events"].append(kwargs)
+                    )
+
+                def _apply_session_remote_runtime(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["remote_runtime_kwargs"] = kwargs
+
+            remote_config = SimpleNamespace(remote_dir="/home/demo/workspace")
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._mcp_servers(
+                            project_dir=project_dir,
+                            app_dir=app_dir,
+                            locale="en",
+                            debug=False,
+                            enabled_mcp_server_ids=["filesystem"],
+                            remote_config=remote_config,  # type: ignore[arg-type]
+                            remote_password="secret",
+                        )
+                    )
+
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered, [{"id": "filesystem"}])
+        inspect_kwargs = captured["inspect_kwargs"]
+        assert isinstance(inspect_kwargs, dict)
+        self.assertEqual(inspect_kwargs["enabled_server_ids"], ["filesystem"])
+        self.assertEqual(inspect_kwargs["workspace_path"], Path("/home/demo/workspace"))
+        self.assertTrue(inspect_kwargs["workspace_is_remote"])
+        self.assertTrue(str(captured["closed_session_id"]).startswith("mcp-inspect-"))
+        self.assertEqual(
+            captured["cleaned_session_ids"],
+            [captured["closed_session_id"]],
+        )
+
     def test_clone_command_calls_explicit_clone_and_prints_ids(self) -> None:
         captured: dict[str, object] = {"events": []}
         with tempfile.TemporaryDirectory() as temp_dir:

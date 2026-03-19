@@ -17,6 +17,7 @@ import shutil
 import sys
 from textwrap import shorten
 import unicodedata
+import uuid
 
 try:
     import termios

@@ -298,6 +298,25 @@ keep_pinned_messages = 3
             self.assertEqual(response.json()["skills"], [{"id": "skill-a"}])
             self.assertEqual(captured["project_dir"], "/tmp/demo")
 
+    def test_skills_discover_endpoint_returns_400_on_value_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _raise_discover_skills(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                raise ValueError("skills config required")
+
+            runtime_state.discover_skills = _raise_discover_skills  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/skills/discover", json={})
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"], "skills config required")
+
     def test_mcp_servers_discover_endpoint_forwards_payload(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -318,6 +337,24 @@ keep_pinned_messages = 3
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["mcp_servers"], [{"id": "filesystem"}])
             self.assertTrue(bool(captured["called"]))
+
+    def test_mcp_servers_discover_endpoint_returns_500_on_runtime_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _raise_discover_mcp_servers() -> dict[str, object]:
+                raise RuntimeError("mcp discover failed")
+
+            runtime_state.discover_mcp_servers = _raise_discover_mcp_servers  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/mcp/servers", json={})
+
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(response.json()["detail"], "mcp discover failed")
 
     def test_run_while_running_skips_launch_reconfigure(self) -> None:
         with TemporaryDirectory() as temp_dir:

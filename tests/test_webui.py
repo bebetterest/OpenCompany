@@ -6,6 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from opencompany.models import (
@@ -154,6 +155,93 @@ class WebUIStateTests(unittest.TestCase):
                 state.mcp_state["warnings"][0]["message"],
                 "offline",
             )
+
+    def test_discover_skills_and_mcp_servers_update_runtime_caches(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = SimpleNamespace(
+                            available_servers=lambda: [{"id": "filesystem"}]
+                        )
+
+                    async def discover_skills(self, **kwargs):  # type: ignore[no-untyped-def]
+                        self.skill_kwargs = kwargs
+                        return [{"id": "skill-a"}]
+
+                fake = _FakeOrchestrator()
+                state._read_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+
+                skills_result = await state.discover_skills(project_dir=str(project_dir))
+                mcp_result = await state.discover_mcp_servers()
+
+                self.assertEqual(skills_result["skills"], [{"id": "skill-a"}])
+                self.assertEqual(state.available_skills, [{"id": "skill-a"}])
+                self.assertEqual(fake.skill_kwargs["project_dir"], project_dir.resolve())
+                self.assertEqual(mcp_result["mcp_servers"], [{"id": "filesystem"}])
+                self.assertEqual(state.available_mcp_servers, [{"id": "filesystem"}])
+
+        asyncio.run(run())
+
+    def test_runtime_events_update_skills_and_mcp_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            state = WebUIRuntimeState(
+                project_dir=None,
+                session_id=None,
+                app_dir=app_dir,
+                locale="en",
+                debug=False,
+            )
+
+            state._consume_runtime_update(
+                {
+                    "session_id": "session-1",
+                    "event_type": "session_skills_materialized",
+                    "payload": {
+                        "enabled_skill_ids": ["skill-a", "skill-b"],
+                        "skill_bundle_root": ".opencompany_skills/session-1",
+                        "manifest_path": ".opencompany_skills/session-1/manifest.json",
+                        "warnings": [{"type": "missing_source", "skill_id": "missing"}],
+                    },
+                }
+            )
+            state._consume_runtime_update(
+                {
+                    "session_id": "session-1",
+                    "event_type": "session_mcp_refreshed",
+                    "payload": {
+                        "enabled_mcp_server_ids": ["filesystem"],
+                        "mcp_state": {"entries": [{"id": "filesystem", "connected": True}]},
+                    },
+                }
+            )
+
+            self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
+            self.assertEqual(
+                state.skills_state["bundle_root"],
+                ".opencompany_skills/session-1",
+            )
+            self.assertEqual(
+                state.skills_state["warnings"][0]["skill_id"],
+                "missing",
+            )
+            self.assertEqual(state.selected_mcp_server_ids, ["filesystem"])
+            self.assertTrue(state.mcp_state["entries"][0]["connected"])
 
     def test_sandbox_backend_defaults_to_config_and_can_be_overridden_per_launch(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1106,20 +1194,25 @@ model = "openai/gpt-4o-mini"
                         self.app_dir = app_dir
                         self.calls: list[tuple[str, str, str, str]] = []
                         self.root_agent_names: list[str | None] = []
+                        self.enabled_skill_ids: list[list[str] | None] = []
                         self.enabled_mcp_server_ids: list[list[str] | None] = []
 
-                    def submit_run_in_active_session(
+                    async def submit_run_in_active_session(
                         self,
                         session_id: str,
                         task: str,
                         *,
                         model: str | None = None,
                         root_agent_name: str | None = None,
+                        enabled_skill_ids: list[str] | None = None,
                         enabled_mcp_server_ids: list[str] | None = None,
+                        remote_password: str | None = None,
                         source: str = "webui",
                     ) -> dict[str, str]:
+                        del remote_password
                         self.calls.append((session_id, task, str(model or ""), source))
                         self.root_agent_names.append(root_agent_name)
+                        self.enabled_skill_ids.append(enabled_skill_ids)
                         self.enabled_mcp_server_ids.append(enabled_mcp_server_ids)
                         return {
                             "session_id": session_id,
@@ -1137,6 +1230,7 @@ model = "openai/gpt-4o-mini"
                     "root task live",
                     model="openai/gpt-4.1-mini",
                     root_agent_name="Root Live",
+                    enabled_skill_ids=["skill-a", "skill-b"],
                     enabled_mcp_server_ids=["filesystem", "docs"],
                 )
                 self.assertEqual(
@@ -1151,9 +1245,11 @@ model = "openai/gpt-4o-mini"
                     ],
                 )
                 self.assertEqual(fake.root_agent_names, ["Root Live"])
+                self.assertEqual(fake.enabled_skill_ids, [["skill-a", "skill-b"]])
                 self.assertEqual(fake.enabled_mcp_server_ids, [["filesystem", "docs"]])
                 self.assertEqual(snapshot["runtime"]["session_status"], "running")
                 self.assertEqual(state.current_task, "root task live")
+                self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
                 self.assertIsNotNone(state.session_task)
                 assert state.session_task is not None
                 state.session_task.cancel()

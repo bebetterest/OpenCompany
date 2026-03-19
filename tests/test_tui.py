@@ -826,7 +826,7 @@ model = "openai/gpt-4.1-mini"
                 def subscribe(self, callback) -> None:  # type: ignore[no-untyped-def]
                     self.callback = callback
 
-                def submit_run_in_active_session(
+                async def submit_run_in_active_session(
                     self,
                     session_id: str,
                     task: str,
@@ -834,8 +834,10 @@ model = "openai/gpt-4.1-mini"
                     model: str | None = None,
                     root_agent_name: str | None = None,
                     enabled_mcp_server_ids: list[str] | None = None,
+                    remote_password: str | None = None,
                     source: str = "tui",
                 ) -> dict[str, str]:
+                    del remote_password
                     self.calls.append((session_id, task, str(model or ""), source))
                     self.root_agent_names.append(root_agent_name)
                     self.enabled_mcp_server_ids = enabled_mcp_server_ids

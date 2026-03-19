@@ -189,7 +189,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             agents = {root.id: root}
             orchestrator._live_session_contexts[session.id] = (session, agents, workspace_manager)
 
-            submitted = orchestrator.submit_run_in_active_session(
+            submitted = await orchestrator.submit_run_in_active_session(
                 session_id,
                 "new live root task",
                 model="openai/gpt-4.1",
@@ -252,7 +252,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             agents = {root.id: root}
             orchestrator._live_session_contexts[session.id] = (session, agents, workspace_manager)
 
-            submitted = orchestrator.submit_run_in_active_session(
+            submitted = await orchestrator.submit_run_in_active_session(
                 session_id,
                 "new live root task",
                 model="openai/gpt-4.1",

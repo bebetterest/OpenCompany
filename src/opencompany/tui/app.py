@@ -3003,12 +3003,13 @@ class OpenCompanyApp(App):
             if self.orchestrator is None:
                 self._update_status(self.translator.text("already_running"))
                 return
-            self.orchestrator.submit_run_in_active_session(
+            await self.orchestrator.submit_run_in_active_session(
                 submit_session_id,
                 task,
                 model=selected_model,
                 root_agent_name=root_agent_name or None,
                 enabled_mcp_server_ids=selected_mcp_server_ids,
+                remote_password=self.remote_password,
                 source="tui",
             )
             self.current_task = task

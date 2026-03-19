@@ -394,12 +394,14 @@ class WebUIRuntimeState:
                 orchestrator = self.orchestrator
                 if orchestrator is None:
                     raise RuntimeError(self.translator.text("already_running"))
-                orchestrator.submit_run_in_active_session(
+                await orchestrator.submit_run_in_active_session(
                     submit_session_id,
                     normalized_task,
                     model=resolved_model,
                     root_agent_name=resolved_root_agent_name or None,
+                    enabled_skill_ids=normalized_skill_ids,
                     enabled_mcp_server_ids=normalized_mcp_server_ids,
+                    remote_password=self.remote_password,
                     source="webui",
                 )
                 self.current_task = normalized_task

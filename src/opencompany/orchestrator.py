@@ -655,14 +655,16 @@ class Orchestrator:
             )
         return session
 
-    def submit_run_in_active_session(
+    async def submit_run_in_active_session(
         self,
         session_id: str,
         task: str,
         *,
         model: str | None = None,
         root_agent_name: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
         enabled_mcp_server_ids: list[str] | None = None,
+        remote_password: str | None = None,
         source: str = "webui",
     ) -> dict[str, Any]:
         selected_model = self._set_runtime_model_override(model)
@@ -682,13 +684,18 @@ class Orchestrator:
                 f"Session {normalized_session_id} is not running (status={session.status.value})."
             )
 
-        if enabled_mcp_server_ids is not None:
-            session.enabled_mcp_server_ids = self.mcp_manager.normalize_enabled_server_ids(
-                enabled_mcp_server_ids
-            )
-            session.mcp_state = self.mcp_manager.session_state(
-                enabled_server_ids=session.enabled_mcp_server_ids,
-            )
+        await self._refresh_session_skills(
+            session=session,
+            agents=agents,
+            workspace_manager=workspace_manager,
+            requested_skill_ids=enabled_skill_ids,
+            remote_password=remote_password,
+        )
+        await self._refresh_session_mcp(
+            session=session,
+            agents=agents,
+            requested_server_ids=enabled_mcp_server_ids,
+        )
 
         root_agent = self._append_root_agent_for_task(
             session=session,
@@ -698,8 +705,6 @@ class Orchestrator:
             root_agent_name=root_agent_name,
             status=AgentStatus.RUNNING,
         )
-        if enabled_mcp_server_ids is not None:
-            self._apply_mcp_state_to_agents(session=session, agents=agents)
         session.root_agent_id = root_agent.id
         session.task = normalized_task
         session.updated_at = utc_now()
@@ -717,6 +722,7 @@ class Orchestrator:
                 "project_dir": str(self.project_dir),
                 "root_agent_id": root_agent.id,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
                 "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
             },
         )
@@ -736,6 +742,7 @@ class Orchestrator:
                 "source": str(source or "manual"),
                 "running_session_append": True,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
                 "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
             },
             workspace_id=root_agent.workspace_id,
@@ -747,6 +754,7 @@ class Orchestrator:
             "model": selected_model,
             "source": str(source or "manual"),
             "workspace_mode": session.workspace_mode.value,
+            "enabled_skill_ids": list(session.enabled_skill_ids),
             "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
         }
 
