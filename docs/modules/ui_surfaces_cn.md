@@ -56,9 +56,11 @@ Web UI 特性：
   - 默认值来自 `opencompany.toml`（`[llm.openrouter].model`）
   - 每次运行/继续前可覆盖；提交值会透传到 runtime，并在该次执行中同时作用于 root/worker 的 LLM 调用
 - 控制栏提供可选 root-agent-name 输入框；非空时 `/api/run` 会透传该值，runtime 以它作为 root agent 命名基底（仍保留会话内去重）
-- 控制栏也提供 skills 输入框与 `Discover` 动作
-  - skills 会作为 `enabled_skill_ids` 提交
+- 控制栏也提供一套 skills 选择器：手动输入 + `发现` / `全选` / `清空`
+  - skills 仍会作为 `enabled_skill_ids` 提交
   - discover 会按当前本地或远程 launch context 读取项目源/全局源 skills
+  - 已发现 skills 会以可切换卡片展示，并附带来源/文档元数据、已选 chips 和告警卡片
+  - 已在当前 session 物化生效的 skills，即使还没重新 discover，也会继续显示在选择器里
   - Overview 卡片会展示当前启用 id、bundle root 与告警数量
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
 - session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载

@@ -69,6 +69,7 @@ locale 行为：
   - 漂移或缺源告警
 
 这个附加区块只提供上下文信息：skills 不会注册新工具，也不会修改 tool schema。
+角色 prompt 还会补充如何使用该区块：root 需要把它纳入规划/委派并向下游传递精确路径，worker 需要先阅读引用文档，并通过 `shell` 完成任何文件/脚本/二进制检查。
 
 ## 角色与语言耦合
 
@@ -85,6 +86,7 @@ locale 行为：
 - Root prompt 还明确要求：若已有 agent 只需要纠偏或补充约束，应优先使用 `steer_agent`，而不是再创建一个范围重叠的新subagent。
 - Root prompt 还要求所有 agent 间消息/回复都通过 `steer_agent` 发送；新的用户消息属于权威指令必须严格遵循，而来自其他agent 的消息则必须先分析再决定如何采用。
 - Root prompt 还要求在 spawn 子任务时严格按子任务指令范围行动，并对参考文件/内容执行“未明确允许修改即只读”的约束。
+- Root prompt 还明确：若存在 `Enabled Skills` 区块，应将其视为可复用资源提示，并在合适时优先利用相关 skill；规划和委派要纳入相关 skills，向子 agent 传递其中列出的精确路径，且除非用户明确要求，否则物化后的 skill bundle 保持只读。
 - Root prompt 要求对运行中的子任务进行中途巡检，可明确使用 `wait_time` / `wait_run`，且在终止关键子任务时必须联动终止依赖链分支。
 - Root prompt 要求子任务完成或终止后先验收与清理，再进入下游；需要继续推进时做有针对性的再拆分，仅对极小编辑由 root 直接处理。
 - Root prompt 规定在几乎不可完成（如无可行路径或预计超过24小时）时，向用户交接分析总结而非盲目继续。
@@ -95,6 +97,7 @@ locale 行为：
 - Worker prompt 也明确要求：若已有运行中的 agent 只需要纠偏或补充约束，应优先使用 `steer_agent`。
 - Worker prompt 还要求所有 agent 间消息/回复都通过 `steer_agent` 发送；新的用户/父agent 消息属于权威指令必须严格遵循，而来自其他非父级agent 的消息则需要 worker 自行分析判断后再使用。
 - Worker prompt 同样要求参考文件/内容默认只读：未明确给出修改权限时，不得修改或删除。
+- Worker prompt 还明确：若存在 `Enabled Skills` 区块，应将其视为可复用资源提示，并在合适时优先利用相关 skill；先读取引用文档，严格使用列出的路径，查看/执行 skill 内脚本或二进制时只能通过 `shell`，且未明确许可前物化后的 skill bundle 保持只读。
 - Worker prompt 在其创建子任务时也遵循同级护栏：防重叠分配、依赖 `child_agent_id` 传递、禁止父级重复执行、终止依赖链联动、中途巡检与等待。
 - Worker prompt 要求基于依赖agent产出推进，先做子任务结果验收与清理，并在当前环境不可完成时提交清晰阻塞分析与下一步建议。
 - Worker prompt 也强调已结束 agent 的 `finish` 总结/反馈约束，以及通过 `get_agent_run(agent_id)` 查看最后一条消息的做法。

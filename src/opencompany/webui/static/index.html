@@ -43,11 +43,19 @@
         </div>
         <div class="control-row model-row">
           <label id="skills-label" for="skills-input">Skills</label>
-          <input id="skills-input" type="text" placeholder="skill-a, skill-b" />
-          <button id="skills-discover-button" type="button">Discover</button>
+          <div class="skills-control-shell">
+            <div class="skills-toolbar">
+              <input id="skills-input" type="text" placeholder="skill-a, skill-b" />
+              <button id="skills-discover-button" type="button">Discover</button>
+              <button id="skills-select-all-button" type="button">Select All</button>
+              <button id="skills-clear-button" type="button">Clear</button>
+            </div>
+            <div id="skills-status" class="path-label"></div>
+            <div id="skills-selected" class="skills-selected"></div>
+            <div id="skills-list" class="skills-catalog"></div>
+            <div id="skills-warnings" class="skills-warnings hidden"></div>
+          </div>
         </div>
-        <div id="skills-status" class="path-label"></div>
-        <div id="skills-list" class="control-summary"></div>
         <div id="control-summary" class="control-summary"></div>
       </section>
 

@@ -141,6 +141,8 @@ Prompt behavior:
 - `ContextAssembler.system_prompt()` appends an `Enabled Skills` block
 - the block includes bundle root, manifest path, enabled skill ids, localized doc paths, and warnings
 - agents are told to treat the materialized files as read-only runtime assets
+- root prompt also tells the coordinator to incorporate relevant skills into planning/delegation and to steer children with exact doc/file paths from that block
+- worker prompt also tells executors to read the referenced skill docs first and to inspect or execute skill scripts/binaries only through `shell`
 
 Execution behavior:
 

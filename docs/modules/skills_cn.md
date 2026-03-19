@@ -141,6 +141,8 @@ Prompt 行为：
 - `ContextAssembler.system_prompt()` 会追加 `Enabled Skills` 区块
 - 该区块包含 bundle root、manifest 路径、启用的 skill ids、本地化文档路径与告警
 - prompt 会明确要求 agent 把这些物化文件视为只读运行时资源
+- root prompt 还会要求协调者在规划/委派时主动纳入相关 skill，并在 steer 子 agent 时引用该区块里的精确文档/文件路径
+- worker prompt 还会要求执行者先读取引用文档，并且只能通过 `shell` 查看或执行 skill 内的脚本/二进制文件
 
 执行行为：
 

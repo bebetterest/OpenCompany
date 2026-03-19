@@ -80,6 +80,9 @@ const state = {
     runSubmitting: false,
     project_sync_action_in_progress: false,
   },
+  skillsUi: {
+    discovering: false,
+  },
   sessionsDir: "",
   appDir: "",
   activeTab: "overview",
@@ -242,8 +245,12 @@ const dom = {
   skillsLabel: document.getElementById("skills-label"),
   skillsInput: document.getElementById("skills-input"),
   skillsDiscoverButton: document.getElementById("skills-discover-button"),
+  skillsSelectAllButton: document.getElementById("skills-select-all-button"),
+  skillsClearButton: document.getElementById("skills-clear-button"),
   skillsStatus: document.getElementById("skills-status"),
+  skillsSelected: document.getElementById("skills-selected"),
   skillsList: document.getElementById("skills-list"),
+  skillsWarnings: document.getElementById("skills-warnings"),
   runButton: document.getElementById("run-button"),
   terminalButton: document.getElementById("terminal-button"),
   setupButton: document.getElementById("setup-button"),
@@ -394,10 +401,148 @@ function skillsInputValue() {
   return selectedSkillIds().join(", ");
 }
 
+function syncSkillsInputValue({ force = false } = {}) {
+  if (!dom.skillsInput) {
+    return;
+  }
+  if (!force && document.activeElement === dom.skillsInput) {
+    return;
+  }
+  const nextSkillsValue = skillsInputValue();
+  if (dom.skillsInput.value !== nextSkillsValue) {
+    dom.skillsInput.value = nextSkillsValue;
+  }
+}
+
+function setSelectedSkillIds(nextIds, { syncInput = false } = {}) {
+  const normalized = Array.isArray(nextIds)
+    ? normalizeSkillIdsFromText(nextIds.join(","))
+    : normalizeSkillIdsFromText(nextIds);
+  state.runtime.selected_skill_ids = normalized;
+  if (syncInput) {
+    syncSkillsInputValue({ force: true });
+  }
+  scheduleRender();
+}
+
 function currentSkillsState() {
   return state.runtime.skills_state && typeof state.runtime.skills_state === "object"
     ? state.runtime.skills_state
     : {};
+}
+
+function currentSkillEntries() {
+  const entries = currentSkillsState().entries;
+  return Array.isArray(entries)
+    ? entries.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function mergeSkillCatalogRecord(current, rawSkill, flags = {}) {
+  const skill = rawSkill && typeof rawSkill === "object" ? rawSkill : {};
+  const normalizedTags = Array.isArray(skill.tags)
+    ? skill.tags
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    : Array.isArray(current?.tags)
+      ? current.tags
+      : [];
+  return {
+    ...(current || {}),
+    ...skill,
+    tags: normalizedTags,
+    discovered: Boolean((current && current.discovered) || flags.discovered),
+    materialized: Boolean((current && current.materialized) || flags.materialized),
+  };
+}
+
+function mergedSkillCatalog() {
+  const catalog = new Map();
+  const append = (rawSkill, flags = {}) => {
+    if (!rawSkill || typeof rawSkill !== "object") {
+      return;
+    }
+    const skillId = String(rawSkill.id || "").trim();
+    if (!skillId) {
+      return;
+    }
+    const current = catalog.get(skillId);
+    catalog.set(skillId, mergeSkillCatalogRecord(current, rawSkill, flags));
+  };
+
+  currentSkillEntries().forEach((item) => append(item, { materialized: true }));
+  const availableSkills = Array.isArray(state.runtime.available_skills)
+    ? state.runtime.available_skills
+    : [];
+  availableSkills.forEach((item) => append(item, { discovered: true }));
+
+  return [...catalog.values()].sort((left, right) =>
+    String(left.id || "").localeCompare(String(right.id || ""))
+  );
+}
+
+function skillDisplayName(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const localizedName = state.locale === "zh" ? skill.name_cn : skill.name;
+  return String(localizedName || skill.name || skill.id || "").trim();
+}
+
+function skillDescription(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const localizedDescription = state.locale === "zh" ? skill.description_cn : skill.description;
+  return String(localizedDescription || skill.description || "").trim();
+}
+
+function skillPreferredDocPath(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const candidates =
+    state.locale === "zh"
+      ? [
+          skill.localized_doc_project_path,
+          skill.main_doc_project_path,
+          skill.localized_doc_path,
+          skill.main_doc_path,
+        ]
+      : [
+          skill.main_doc_project_path,
+          skill.localized_doc_project_path,
+          skill.main_doc_path,
+          skill.localized_doc_path,
+        ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function skillSourceLabel(skill) {
+  const sourceType = String(skill?.source_type || "").trim().toLowerCase();
+  if (sourceType === "project") {
+    return t("skills_source_project");
+  }
+  if (sourceType === "global") {
+    return t("skills_source_global");
+  }
+  return sourceType || "";
+}
+
+function skillWarningMessage(warning) {
+  if (!warning || typeof warning !== "object") {
+    return "";
+  }
+  if (state.locale === "zh") {
+    return String(warning.message_cn || warning.message || "").trim();
+  }
+  return String(warning.message || warning.message_cn || "").trim();
 }
 
 function scheduleRender() {
@@ -3078,6 +3223,161 @@ function syncTaskInputValue() {
   }
 }
 
+function renderSelectedSkillChips(catalog, controlsDisabled) {
+  const selectedIds = selectedSkillIds();
+  if (!selectedIds.length) {
+    dom.skillsSelected.innerHTML = `<div class="skills-empty">${escapeHtml(
+      t("skills_selected_empty")
+    )}</div>`;
+    return;
+  }
+  const catalogById = new Map(catalog.map((skill) => [String(skill.id || "").trim(), skill]));
+  dom.skillsSelected.innerHTML = selectedIds
+    .map((skillId) => {
+      const skill = catalogById.get(skillId) || null;
+      const title = skillDisplayName(skill) || skillId;
+      const meta = [];
+      if (skill && title !== skillId) {
+        meta.push(skillId);
+      }
+      if (skill?.materialized) {
+        meta.push(t("skills_active_label"));
+      }
+      if (!skill) {
+        meta.push(t("skills_manual_label"));
+      } else {
+        const sourceLabel = skillSourceLabel(skill);
+        if (sourceLabel) {
+          meta.push(sourceLabel);
+        }
+      }
+      return `
+        <button
+          type="button"
+          class="skills-selection-chip${skill ? "" : " is-manual"}"
+          data-action="remove-skill"
+          data-skill-id="${escapeHtml(skillId)}"
+          ${controlsDisabled ? "disabled" : ""}
+          title="${escapeHtml(t("skills_disable"))}"
+        >
+          <span class="skills-selection-chip-main">
+            <span class="skills-selection-label">${escapeHtml(title)}</span>
+            <span class="skills-selection-meta">${escapeHtml(meta.join(" · "))}</span>
+          </span>
+          <span class="skills-selection-remove" aria-hidden="true">×</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderSkillsCatalog(catalog, controlsDisabled) {
+  if (!catalog.length) {
+    const message = state.skillsUi.discovering ? t("loading") : t("skills_catalog_empty");
+    dom.skillsList.innerHTML = `<div class="skills-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+  const selected = new Set(selectedSkillIds());
+  dom.skillsList.innerHTML = catalog
+    .map((skill) => {
+      const skillId = String(skill.id || "").trim();
+      const isSelected = selected.has(skillId);
+      const description = skillDescription(skill);
+      const docPath = skillPreferredDocPath(skill);
+      const sourceLabel = skillSourceLabel(skill);
+      const tags = Array.isArray(skill.tags) ? skill.tags : [];
+      const resourceCount = Math.max(0, Number(skill.resource_count || 0));
+      const badges = [];
+      if (sourceLabel) {
+        badges.push(`<span class="skill-badge">${escapeHtml(sourceLabel)}</span>`);
+      }
+      if (skill.materialized) {
+        badges.push(`<span class="skill-badge is-active">${escapeHtml(t("skills_active_label"))}</span>`);
+      }
+      if (skill.discovered) {
+        badges.push(
+          `<span class="skill-badge is-discovered">${escapeHtml(t("skills_available_label"))}</span>`
+        );
+      }
+      if (resourceCount > 0) {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(
+            `${t("skills_resources_label")}: ${resourceCount}`
+          )}</span>`
+        );
+      }
+      const tagsHtml = tags.length
+        ? `<div class="skill-tag-row">${tags
+            .map((tag) => `<span class="skill-tag">${escapeHtml(String(tag))}</span>`)
+            .join("")}</div>`
+        : "";
+      const docHtml = docPath
+        ? `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
+            t("skills_doc_label")
+          )}</span><span class="skill-card-meta-value">${escapeHtml(docPath)}</span></div>`
+        : "";
+      const sourcePath = String(skill.source_path || "").trim();
+      const sourceHtml = sourcePath
+        ? `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
+            t("skills_source_label")
+          )}</span><span class="skill-card-meta-value">${escapeHtml(sourcePath)}</span></div>`
+        : "";
+      return `
+        <article class="skill-card${isSelected ? " is-selected" : ""}">
+          <div class="skill-card-head">
+            <div class="skill-card-title-block">
+              <div class="skill-card-title">${escapeHtml(skillDisplayName(skill) || skillId)}</div>
+              <div class="skill-card-id">${escapeHtml(skillId)}</div>
+            </div>
+            <button
+              type="button"
+              class="skill-card-action"
+              data-action="toggle-skill"
+              data-skill-id="${escapeHtml(skillId)}"
+              aria-pressed="${isSelected ? "true" : "false"}"
+              ${controlsDisabled ? "disabled" : ""}
+            >${escapeHtml(isSelected ? t("skills_disable") : t("skills_enable"))}</button>
+          </div>
+          <div class="skill-badge-row">${badges.join("")}</div>
+          <div class="skill-card-description">${escapeHtml(description || t("none_value"))}</div>
+          ${tagsHtml}
+          <div class="skill-card-meta">
+            ${docHtml}
+            ${sourceHtml}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderSkillWarnings() {
+  const warnings = Array.isArray(currentSkillsState().warnings)
+    ? currentSkillsState().warnings
+    : [];
+  if (!warnings.length) {
+    dom.skillsWarnings.classList.add("hidden");
+    dom.skillsWarnings.innerHTML = "";
+    return;
+  }
+  dom.skillsWarnings.classList.remove("hidden");
+  dom.skillsWarnings.innerHTML = warnings
+    .map((warning) => {
+      const skillId = String(warning?.skill_id || "").trim();
+      const message = skillWarningMessage(warning);
+      return `
+        <div class="skill-warning-card">
+          <div class="skill-warning-head">
+            <span class="skill-warning-badge">${escapeHtml(t("skills_warnings_label"))}</span>
+            ${skillId ? `<span class="skill-warning-skill">${escapeHtml(skillId)}</span>` : ""}
+          </div>
+          <div class="skill-warning-text">${escapeHtml(message)}</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function renderControls() {
   dom.taskInput.placeholder = t("task_input");
   syncTaskInputValue();
@@ -3093,13 +3393,12 @@ function renderControls() {
   }
   dom.skillsLabel.textContent = t("skills_label");
   dom.skillsInput.placeholder = t("skills_placeholder");
-  if (document.activeElement !== dom.skillsInput) {
-    const nextSkillsValue = skillsInputValue();
-    if (dom.skillsInput.value !== nextSkillsValue) {
-      dom.skillsInput.value = nextSkillsValue;
-    }
-  }
-  dom.skillsDiscoverButton.textContent = t("skills_discover");
+  syncSkillsInputValue();
+  dom.skillsDiscoverButton.textContent = state.skillsUi.discovering
+    ? t("loading")
+    : t("skills_discover");
+  dom.skillsSelectAllButton.textContent = t("skills_select_all");
+  dom.skillsClearButton.textContent = t("skills_clear");
   autoSizeTaskInput();
   const runSubmitting = Boolean(state.runtime.runSubmitting);
   dom.runButton.textContent = runSubmitting ? t("run_submitting") : t("run");
@@ -3114,12 +3413,22 @@ function renderControls() {
   const running = Boolean(state.runtime.running);
   const syncBusy = Boolean(state.runtime.project_sync_action_in_progress);
   const setupBusy = Boolean(state.setup.busy);
+  const discovering = Boolean(state.skillsUi.discovering);
   const directMode = isDirectWorkspaceMode();
+  const controlsDisabled = running || syncBusy || setupBusy || discovering;
+  const catalog = mergedSkillCatalog();
+  const catalogIds = new Set(catalog.map((skill) => String(skill.id || "").trim()));
+  const warnings = Array.isArray(currentSkillsState().warnings)
+    ? currentSkillsState().warnings
+    : [];
+  const manualSelectedCount = selectedSkillIds().filter((skillId) => !catalogIds.has(skillId)).length;
   dom.runButton.disabled = runSubmitting || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.modelInput.disabled = syncBusy || setupBusy;
   dom.rootAgentNameInput.disabled = syncBusy || setupBusy;
-  dom.skillsInput.disabled = running || syncBusy || setupBusy;
-  dom.skillsDiscoverButton.disabled = running || syncBusy || setupBusy || !state.launchConfig.can_run;
+  dom.skillsInput.disabled = controlsDisabled;
+  dom.skillsDiscoverButton.disabled = controlsDisabled || !state.launchConfig.can_run;
+  dom.skillsSelectAllButton.disabled = controlsDisabled || catalog.length === 0;
+  dom.skillsClearButton.disabled = controlsDisabled || selectedSkillIds().length === 0;
   dom.terminalButton.disabled = syncBusy || setupBusy || !activeSessionId();
   dom.setupButton.disabled = running || syncBusy || setupBusy;
   dom.interruptButton.disabled = !running;
@@ -3133,36 +3442,14 @@ function renderControls() {
   const selectedSkillsText = selectedSkillIds().length
     ? selectedSkillIds().join(", ")
     : t("none_value");
-  const availableSkills = Array.isArray(state.runtime.available_skills)
-    ? state.runtime.available_skills
-    : [];
-  const warnings = Array.isArray(currentSkillsState().warnings)
-    ? currentSkillsState().warnings
-    : [];
-  dom.skillsStatus.textContent = `${t("skills_selected_label")}: ${selectedSkillsText} | ${t(
-    "skills_available_label"
-  )}: ${availableSkills.length} | ${t("skills_warnings_label")}: ${warnings.length}`;
-  const availableSkillsText = availableSkills.length
-    ? availableSkills
-        .map((skill) => {
-          const id = String(skill.id || "").trim();
-          const sourceType = String(skill.source_type || "").trim();
-          return sourceType ? `${id} (${sourceType})` : id;
-        })
-        .filter(Boolean)
-        .join(" | ")
-    : t("skills_none");
-  const warningText = warnings
-    .map((warning) =>
-      warning && typeof warning === "object"
-        ? String(warning.message || warning.message_cn || "").trim()
-        : ""
-    )
-    .filter(Boolean)
-    .join(" | ");
-  dom.skillsList.textContent = warningText
-    ? `${availableSkillsText} | ${warningText}`
-    : availableSkillsText;
+  dom.skillsStatus.textContent = `${t("skills_selected_label")}: ${selectedSkillIds().length} | ${t(
+    "skills_catalog_label"
+  )}: ${catalog.length} | ${t("skills_manual_label")}: ${manualSelectedCount} | ${t(
+    "skills_warnings_label"
+  )}: ${warnings.length}`;
+  renderSelectedSkillChips(catalog, controlsDisabled);
+  renderSkillsCatalog(catalog, controlsDisabled);
+  renderSkillWarnings();
   dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("skills_label")}: ${selectedSkillsText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
 }
 
@@ -6502,28 +6789,34 @@ async function runSession(task, model, rootAgentName) {
 }
 
 async function discoverSkills() {
-  const body = {};
-  const remote = activeRemoteConfig();
-  if (remote) {
-    body.remote = remote;
-    const remotePassword = resolveRemotePassword({ allowPrompt: true });
-    if (remote.auth_mode === "password" && !remotePassword && !remote.password_saved) {
-      throw new Error(t("remote_password_required"));
-    }
-    if (remotePassword) {
-      body.remote_password = remotePassword;
-    }
-  } else if (state.launchConfig.project_dir) {
-    body.project_dir = state.launchConfig.project_dir;
-  }
-  const payload = await fetchJson("/api/skills/discover", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-  applySnapshot(payload.snapshot || payload);
-  const skills = payload && Array.isArray(payload.skills) ? payload.skills : [];
-  state.runtime.status_message = `${skills.length} ${t("skills_discovered")}`;
+  state.skillsUi.discovering = true;
   scheduleRender();
+  try {
+    const body = {};
+    const remote = activeRemoteConfig();
+    if (remote) {
+      body.remote = remote;
+      const remotePassword = resolveRemotePassword({ allowPrompt: true });
+      if (remote.auth_mode === "password" && !remotePassword && !remote.password_saved) {
+        throw new Error(t("remote_password_required"));
+      }
+      if (remotePassword) {
+        body.remote_password = remotePassword;
+      }
+    } else if (state.launchConfig.project_dir) {
+      body.project_dir = state.launchConfig.project_dir;
+    }
+    const payload = await fetchJson("/api/skills/discover", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    applySnapshot(payload.snapshot || payload);
+    const skills = payload && Array.isArray(payload.skills) ? payload.skills : [];
+    state.runtime.status_message = `${skills.length} ${t("skills_discovered")}`;
+  } finally {
+    state.skillsUi.discovering = false;
+    scheduleRender();
+  }
 }
 
 async function persistLaunchConfig({
@@ -6996,8 +7289,7 @@ function bindEvents() {
   });
 
   dom.skillsInput.addEventListener("input", () => {
-    state.runtime.selected_skill_ids = normalizeSkillIdsFromText(dom.skillsInput.value);
-    scheduleRender();
+    setSelectedSkillIds(dom.skillsInput.value);
   });
 
   dom.skillsDiscoverButton.addEventListener("click", async () => {
@@ -7007,6 +7299,56 @@ function bindEvents() {
       state.runtime.status_message = String(error.message || "");
       scheduleRender();
     }
+  });
+
+  dom.skillsSelectAllButton.addEventListener("click", () => {
+    const catalogIds = mergedSkillCatalog().map((skill) => String(skill.id || "").trim());
+    setSelectedSkillIds([...selectedSkillIds(), ...catalogIds], { syncInput: true });
+  });
+
+  dom.skillsClearButton.addEventListener("click", () => {
+    setSelectedSkillIds([], { syncInput: true });
+  });
+
+  dom.skillsSelected.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='remove-skill']");
+    if (!button) {
+      return;
+    }
+    const skillId = String(button.getAttribute("data-skill-id") || "").trim();
+    if (!skillId) {
+      return;
+    }
+    setSelectedSkillIds(
+      selectedSkillIds().filter((item) => item !== skillId),
+      { syncInput: true }
+    );
+  });
+
+  dom.skillsList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='toggle-skill']");
+    if (!button) {
+      return;
+    }
+    const skillId = String(button.getAttribute("data-skill-id") || "").trim();
+    if (!skillId) {
+      return;
+    }
+    const selected = new Set(selectedSkillIds());
+    if (selected.has(skillId)) {
+      selected.delete(skillId);
+    } else {
+      selected.add(skillId);
+    }
+    setSelectedSkillIds([...selected], { syncInput: true });
   });
 
   if (dom.agentsRoleFilter) {

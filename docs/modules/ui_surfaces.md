@@ -56,9 +56,11 @@ Web UI-specific capabilities:
   - default value comes from `opencompany.toml` (`[llm.openrouter].model`)
   - user can override it per run/continue; submitted value is forwarded to runtime and applied to root/worker LLM calls for that execution
 - control-bar exposes an optional root-agent-name input; when non-empty, `/api/run` forwards it and runtime uses it as the base root agent name (still deduplicated in-session)
-- control-bar also exposes a skills input plus `Discover` action
-  - skills are submitted as `enabled_skill_ids`
+- control-bar also exposes a skills composer with manual input plus `Discover` / `Select All` / `Clear`
+  - skills are still submitted as `enabled_skill_ids`
   - discover reads project/global skills for the current local or remote launch context
+  - discovered skills render as selectable cards with source/doc metadata, selected chips, and warning cards
+  - already-materialized session skills remain visible in the selector even before a fresh discover
   - overview cards surface the current enabled ids, bundle root, and skill warning count
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
 - session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
