@@ -51,6 +51,8 @@ const state = {
   translations: {},
   launchConfig: {
     project_dir: null,
+    project_dir_display: null,
+    project_dir_is_remote: false,
     session_id: null,
     session_mode: "direct",
     session_mode_locked: false,
@@ -68,6 +70,9 @@ const state = {
     model: "",
     keep_pinned_messages: 1,
     root_agent_name: "",
+    selected_skill_ids: [],
+    skills_state: {},
+    available_skills: [],
     session_status: "idle",
     summary: "",
     status_message: "",
@@ -234,6 +239,11 @@ const dom = {
   modelInput: document.getElementById("model-input"),
   rootAgentNameLabel: document.getElementById("root-agent-name-label"),
   rootAgentNameInput: document.getElementById("root-agent-name-input"),
+  skillsLabel: document.getElementById("skills-label"),
+  skillsInput: document.getElementById("skills-input"),
+  skillsDiscoverButton: document.getElementById("skills-discover-button"),
+  skillsStatus: document.getElementById("skills-status"),
+  skillsList: document.getElementById("skills-list"),
   runButton: document.getElementById("run-button"),
   terminalButton: document.getElementById("terminal-button"),
   setupButton: document.getElementById("setup-button"),
@@ -364,6 +374,30 @@ const dom = {
 
 function t(key) {
   return state.translations[key] || key;
+}
+
+function normalizeSkillIdsFromText(text) {
+  const parts = String(text || "")
+    .split(/[\s,]+/)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(parts)];
+}
+
+function selectedSkillIds() {
+  return Array.isArray(state.runtime.selected_skill_ids)
+    ? state.runtime.selected_skill_ids.filter((item) => String(item || "").trim())
+    : [];
+}
+
+function skillsInputValue() {
+  return selectedSkillIds().join(", ");
+}
+
+function currentSkillsState() {
+  return state.runtime.skills_state && typeof state.runtime.skills_state === "object"
+    ? state.runtime.skills_state
+    : {};
 }
 
 function scheduleRender() {
@@ -675,6 +709,19 @@ function remoteWorkspaceLabel() {
     return t("unset_value");
   }
   return `${remote.ssh_target}:${remote.remote_dir}`;
+}
+
+function displayProjectDirLabel() {
+  const raw = String(
+    state.launchConfig.project_dir_display || state.launchConfig.project_dir || ""
+  ).trim();
+  if (!raw) {
+    return t("unset_value");
+  }
+  if (state.launchConfig.project_dir_is_remote) {
+    return `${raw} (${t("remote_short")})`;
+  }
+  return raw;
 }
 
 function syncRemoteDraftFromLaunch() {
@@ -3044,6 +3091,15 @@ function renderControls() {
   if (state.runtime.root_agent_name && !dom.rootAgentNameInput.value.trim()) {
     dom.rootAgentNameInput.value = state.runtime.root_agent_name;
   }
+  dom.skillsLabel.textContent = t("skills_label");
+  dom.skillsInput.placeholder = t("skills_placeholder");
+  if (document.activeElement !== dom.skillsInput) {
+    const nextSkillsValue = skillsInputValue();
+    if (dom.skillsInput.value !== nextSkillsValue) {
+      dom.skillsInput.value = nextSkillsValue;
+    }
+  }
+  dom.skillsDiscoverButton.textContent = t("skills_discover");
   autoSizeTaskInput();
   const runSubmitting = Boolean(state.runtime.runSubmitting);
   dom.runButton.textContent = runSubmitting ? t("run_submitting") : t("run");
@@ -3062,6 +3118,8 @@ function renderControls() {
   dom.runButton.disabled = runSubmitting || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.modelInput.disabled = syncBusy || setupBusy;
   dom.rootAgentNameInput.disabled = syncBusy || setupBusy;
+  dom.skillsInput.disabled = running || syncBusy || setupBusy;
+  dom.skillsDiscoverButton.disabled = running || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.terminalButton.disabled = syncBusy || setupBusy || !activeSessionId();
   dom.setupButton.disabled = running || syncBusy || setupBusy;
   dom.interruptButton.disabled = !running;
@@ -3072,7 +3130,40 @@ function renderControls() {
   const statusText = localizeStatus(state.runtime.session_status || "idle");
   const sessionIdText = activeSessionId() || t("pending_value");
   const remoteText = isRemoteWorkspaceConfigured() ? remoteWorkspaceLabel() : t("unset_value");
-  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
+  const selectedSkillsText = selectedSkillIds().length
+    ? selectedSkillIds().join(", ")
+    : t("none_value");
+  const availableSkills = Array.isArray(state.runtime.available_skills)
+    ? state.runtime.available_skills
+    : [];
+  const warnings = Array.isArray(currentSkillsState().warnings)
+    ? currentSkillsState().warnings
+    : [];
+  dom.skillsStatus.textContent = `${t("skills_selected_label")}: ${selectedSkillsText} | ${t(
+    "skills_available_label"
+  )}: ${availableSkills.length} | ${t("skills_warnings_label")}: ${warnings.length}`;
+  const availableSkillsText = availableSkills.length
+    ? availableSkills
+        .map((skill) => {
+          const id = String(skill.id || "").trim();
+          const sourceType = String(skill.source_type || "").trim();
+          return sourceType ? `${id} (${sourceType})` : id;
+        })
+        .filter(Boolean)
+        .join(" | ")
+    : t("skills_none");
+  const warningText = warnings
+    .map((warning) =>
+      warning && typeof warning === "object"
+        ? String(warning.message || warning.message_cn || "").trim()
+        : ""
+    )
+    .filter(Boolean)
+    .join(" | ");
+  dom.skillsList.textContent = warningText
+    ? `${availableSkillsText} | ${warningText}`
+    : availableSkillsText;
+  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("skills_label")}: ${selectedSkillsText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
 }
 
 function renderTabs() {
@@ -3152,6 +3243,11 @@ function renderTabs() {
 
 function renderOverviewTab() {
   const runtimeMessage = state.runtime.summary || state.runtime.status_message || "-";
+  const skillsState = currentSkillsState();
+  const skillWarnings = Array.isArray(skillsState.warnings) ? skillsState.warnings : [];
+  const enabledSkillsText = selectedSkillIds().length
+    ? selectedSkillIds().join(", ")
+    : t("none_value");
   const focusAgent = state.agentOrder
     .map((id) => state.agents.get(id))
     .filter((agent) => agent !== undefined)
@@ -3172,8 +3268,11 @@ function renderOverviewTab() {
     [t("workspace_mode_label"), localizeWorkspaceMode(activeWorkspaceMode())],
     [t("sandbox_backend_label"), localizeSandboxBackend(activeSandboxBackend())],
     [t("remote_workspace_label"), remoteWorkspaceLabel()],
-    [t("project_dir"), state.launchConfig.project_dir || t("unset_value")],
+    [t("project_dir"), displayProjectDirLabel()],
     [t("session_id"), state.launchConfig.session_id || t("unset_value")],
+    [t("skills_selected_label"), enabledSkillsText],
+    [t("skills_bundle_root_label"), String(skillsState.bundle_root || "") || t("unset_value")],
+    [t("skills_warnings_label"), String(skillWarnings.length)],
     [t("sessions_root"), state.sessionsDir || t("unset_value")],
   ])}</div>`;
 
@@ -6353,6 +6452,7 @@ async function runSession(task, model, rootAgentName) {
     task,
     model: String(model || "").trim(),
     sandbox_backend: activeSandboxBackend(),
+    enabled_skill_ids: selectedSkillIds(),
   };
   const normalizedRootAgentName = String(rootAgentName || "").trim();
   if (normalizedRootAgentName) {
@@ -6398,6 +6498,31 @@ async function runSession(task, model, rootAgentName) {
   state.toolRuns.dirty = true;
   state.steerRuns.dirty = true;
   markAgentPanelDirty();
+  scheduleRender();
+}
+
+async function discoverSkills() {
+  const body = {};
+  const remote = activeRemoteConfig();
+  if (remote) {
+    body.remote = remote;
+    const remotePassword = resolveRemotePassword({ allowPrompt: true });
+    if (remote.auth_mode === "password" && !remotePassword && !remote.password_saved) {
+      throw new Error(t("remote_password_required"));
+    }
+    if (remotePassword) {
+      body.remote_password = remotePassword;
+    }
+  } else if (state.launchConfig.project_dir) {
+    body.project_dir = state.launchConfig.project_dir;
+  }
+  const payload = await fetchJson("/api/skills/discover", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  applySnapshot(payload.snapshot || payload);
+  const skills = payload && Array.isArray(payload.skills) ? payload.skills : [];
+  state.runtime.status_message = `${skills.length} ${t("skills_discovered")}`;
   scheduleRender();
 }
 
@@ -6868,6 +6993,20 @@ function bindEvents() {
 
   dom.rootAgentNameInput.addEventListener("input", () => {
     state.runtime.root_agent_name = dom.rootAgentNameInput.value;
+  });
+
+  dom.skillsInput.addEventListener("input", () => {
+    state.runtime.selected_skill_ids = normalizeSkillIdsFromText(dom.skillsInput.value);
+    scheduleRender();
+  });
+
+  dom.skillsDiscoverButton.addEventListener("click", async () => {
+    try {
+      await discoverSkills();
+    } catch (error) {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    }
   });
 
   if (dom.agentsRoleFilter) {

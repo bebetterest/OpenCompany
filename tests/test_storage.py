@@ -9,6 +9,70 @@ from opencompany.storage import Storage
 
 
 class StorageTests(unittest.TestCase):
+    def test_migration_backfills_missing_skill_columns_with_defaults(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "opencompany.db"
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        project_dir TEXT NOT NULL,
+                        task TEXT NOT NULL,
+                        locale TEXT NOT NULL,
+                        root_agent_id TEXT NOT NULL,
+                        workspace_mode TEXT NOT NULL DEFAULT 'staged',
+                        status TEXT NOT NULL,
+                        status_reason TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        loop_index INTEGER NOT NULL DEFAULT 0,
+                        final_summary TEXT,
+                        completion_state TEXT,
+                        follow_up_needed INTEGER NOT NULL DEFAULT 0,
+                        config_snapshot_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id, project_dir, task, locale, root_agent_id, workspace_mode, status,
+                        status_reason, created_at, updated_at, loop_index, final_summary,
+                        completion_state, follow_up_needed, config_snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "session-skills-legacy",
+                        "/tmp/project",
+                        "legacy task",
+                        "en",
+                        "agent-root",
+                        "direct",
+                        "completed",
+                        None,
+                        "2026-03-14T00:00:00+00:00",
+                        "2026-03-14T00:00:00+00:00",
+                        0,
+                        None,
+                        "completed",
+                        0,
+                        "{}",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            storage = Storage(db_path)
+            row = storage.load_session("session-skills-legacy")
+
+            assert row is not None
+            self.assertEqual(row["enabled_skill_ids_json"], "[]")
+            self.assertEqual(row["skill_bundle_root"], "")
+            self.assertEqual(row["skills_state_json"], "{}")
+
     def test_migration_backfills_missing_workspace_mode_to_staged(self) -> None:
         with TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "opencompany.db"

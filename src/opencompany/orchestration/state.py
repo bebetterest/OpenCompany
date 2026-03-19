@@ -33,6 +33,9 @@ def session_state(session: RunSession) -> dict[str, Any]:
             completion_state=session.completion_state,
         ),
         "follow_up_needed": session.follow_up_needed,
+        "enabled_skill_ids": list(session.enabled_skill_ids),
+        "skill_bundle_root": session.skill_bundle_root,
+        "skills_state": session.skills_state,
         "config_snapshot": session.config_snapshot,
     }
 
@@ -79,6 +82,9 @@ def session_from_state(payload: dict[str, Any]) -> RunSession:
             completion_state=payload.get("completion_state"),
         ),
         follow_up_needed=bool(payload.get("follow_up_needed", False)),
+        enabled_skill_ids=list(payload.get("enabled_skill_ids", [])),
+        skill_bundle_root=str(payload.get("skill_bundle_root", "") or ""),
+        skills_state=payload.get("skills_state", {}) if isinstance(payload.get("skills_state"), dict) else {},
         config_snapshot=payload.get("config_snapshot", {}),
     )
 

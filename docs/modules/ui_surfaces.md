@@ -17,6 +17,7 @@ Major API groups:
 
 - bootstrap/configuration: `/api/bootstrap`, `/api/launch-config`, `/api/sessions`
 - execution control: `/api/run`, `/api/interrupt`
+- skill discovery: `/api/skills/discover`
 - sandbox terminal launch: `/api/terminal/open`
 - remote workspace validation: `/api/remote/validate`
 - observability: `/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -28,6 +29,7 @@ Execution semantics:
 
 - `/api/run` starts a new session when launch config provides `project_dir`.
 - New-session launch config also carries `session_mode` (`direct` / `staged`), defaulting to `direct`.
+- `/api/run` accepts `enabled_skill_ids`; for loaded sessions this replaces the current skill set for the new run, while omitted values keep the existing set.
 - New-session launch config may carry `remote` (SSH target + remote dir + auth policy) and request-only `remote_password`.
 - Remote workspace is accepted only when `session_mode=direct`; `staged + remote` is rejected.
 - For password auth sessions, request-time `remote_password` is used on `/api/run`, `/api/terminal/open`, and `/api/remote/validate`.
@@ -54,6 +56,10 @@ Web UI-specific capabilities:
   - default value comes from `opencompany.toml` (`[llm.openrouter].model`)
   - user can override it per run/continue; submitted value is forwarded to runtime and applied to root/worker LLM calls for that execution
 - control-bar exposes an optional root-agent-name input; when non-empty, `/api/run` forwards it and runtime uses it as the base root agent name (still deduplicated in-session)
+- control-bar also exposes a skills input plus `Discover` action
+  - skills are submitted as `enabled_skill_ids`
+  - discover reads project/global skills for the current local or remote launch context
+  - overview cards surface the current enabled ids, bundle root, and skill warning count
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
 - session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
 - initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active

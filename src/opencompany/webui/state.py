@@ -14,7 +14,12 @@ from typing import Any
 
 from opencompany.config import OpenCompanyConfig
 from opencompany.i18n import TRANSLATIONS, Translator
-from opencompany.models import RemoteSessionConfig, WorkspaceMode, normalize_workspace_mode
+from opencompany.models import (
+    RemoteSessionConfig,
+    RunSession,
+    WorkspaceMode,
+    normalize_workspace_mode,
+)
 from opencompany.orchestrator import Orchestrator, default_app_dir
 from opencompany.paths import RuntimePaths
 from opencompany.remote import (
@@ -23,6 +28,7 @@ from opencompany.remote import (
     normalize_remote_session_config,
 )
 from opencompany.sandbox.registry import available_sandbox_backends, resolve_sandbox_backend_cls
+from opencompany.skills import normalize_skill_ids
 
 from .events import EventHub
 
@@ -130,6 +136,9 @@ class WebUIRuntimeState:
         self.selected_model: str = self._default_model_from_config()
         self.keep_pinned_messages: int = self._default_keep_pinned_messages_from_config()
         self.root_agent_name: str = ""
+        self.selected_skill_ids: list[str] = []
+        self.skills_state: dict[str, Any] = {}
+        self.available_skills: list[dict[str, Any]] = []
         self.project_sync_action_in_progress: bool = False
 
         self.event_hub = EventHub()
@@ -153,11 +162,14 @@ class WebUIRuntimeState:
     def snapshot(self) -> dict[str, Any]:
         self.refresh_runtime_config()
         config = self.launch_config()
+        project_dir_display = self._project_dir_display()
         return {
             "locale": self.locale,
             "translations": TRANSLATIONS.get(self.locale, TRANSLATIONS["en"]),
             "launch_config": {
                 "project_dir": str(self.project_dir) if self.project_dir else None,
+                "project_dir_display": project_dir_display,
+                "project_dir_is_remote": self.remote_config is not None,
                 "session_id": self.configured_resume_session_id,
                 "session_mode": config.session_mode.value,
                 "session_mode_locked": config.session_mode_locked,
@@ -175,6 +187,9 @@ class WebUIRuntimeState:
                 "model": self.selected_model or self._default_model_from_config(),
                 "keep_pinned_messages": max(0, int(self.keep_pinned_messages)),
                 "root_agent_name": self.root_agent_name,
+                "selected_skill_ids": list(self.selected_skill_ids),
+                "skills_state": self.skills_state,
+                "available_skills": list(self.available_skills),
                 "session_status": self.current_session_status,
                 "summary": self.current_summary,
                 "status_message": self.status_message,
@@ -265,6 +280,9 @@ class WebUIRuntimeState:
         self.current_task = ""
         self.current_session_status = "idle"
         self.current_summary = ""
+        self.selected_skill_ids = []
+        self.skills_state = {}
+        self.available_skills = []
 
     def _load_configured_session_context(self, session_id: str) -> None:
         self._require_session_dir(session_id)
@@ -276,12 +294,32 @@ class WebUIRuntimeState:
         self.project_dir = None if loaded_remote is not None else loaded.project_dir.resolve()
         self.remote_password = ""
         self.configured_resume_session_id = loaded.id
-        self.current_session_id = loaded.id
-        self.current_task = loaded.task
-        self.current_session_status = loaded.status.value
-        self.current_summary = loaded.final_summary or ""
         self.session_mode = normalize_workspace_mode(loaded.workspace_mode)
         self.session_mode_locked = True
+        self.available_skills = []
+        self._apply_session_runtime_state(loaded)
+
+    def _apply_session_runtime_state(self, session: RunSession) -> None:
+        self.current_session_id = session.id
+        self.current_task = session.task
+        self.current_session_status = session.status.value
+        self.current_summary = session.final_summary or ""
+        self.selected_skill_ids = list(session.enabled_skill_ids)
+        self.skills_state = (
+            dict(session.skills_state) if isinstance(session.skills_state, dict) else {}
+        )
+
+    def _project_dir_display(self) -> str | None:
+        if self.remote_config is not None:
+            remote_dir = str(self.remote_config.remote_dir or "").strip()
+            return remote_dir or None
+        return str(self.project_dir) if self.project_dir else None
+
+    def _apply_session_project_location(self, session: RunSession) -> None:
+        if self.remote_config is not None:
+            self.project_dir = None
+            return
+        self.project_dir = session.project_dir.resolve()
 
     def has_running_session(self) -> bool:
         return bool(self.session_task and not self.session_task.done())
@@ -291,6 +329,7 @@ class WebUIRuntimeState:
         task: str,
         model: str | None = None,
         root_agent_name: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._state_lock:
             normalized_task = task.strip()
@@ -298,8 +337,15 @@ class WebUIRuntimeState:
                 raise RuntimeError(self.translator.text("error_task_required"))
             resolved_model = self._resolve_model_for_run(model)
             resolved_root_agent_name = str(root_agent_name or "").strip()
+            normalized_skill_ids = (
+                normalize_skill_ids(enabled_skill_ids)
+                if enabled_skill_ids is not None
+                else None
+            )
             self.selected_model = resolved_model
             self.root_agent_name = resolved_root_agent_name
+            if normalized_skill_ids is not None:
+                self.selected_skill_ids = list(normalized_skill_ids)
             resolved_session_id = self._normalize_optional_session_id(
                 self.configured_resume_session_id
             )
@@ -345,6 +391,7 @@ class WebUIRuntimeState:
                         resolved_model,
                         resolved_root_agent_name,
                         self.remote_password,
+                        normalized_skill_ids,
                     )
                 )
                 return self.snapshot()
@@ -366,9 +413,41 @@ class WebUIRuntimeState:
                     self.session_mode,
                     self.remote_config,
                     self.remote_password,
+                    normalized_skill_ids,
                 )
             )
         return self.snapshot()
+
+    async def discover_skills(
+        self,
+        *,
+        project_dir: str | None = None,
+        remote: dict[str, Any] | RemoteSessionConfig | None = None,
+        remote_password: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_remote = (
+            normalize_remote_session_config(remote)
+            if isinstance(remote, (dict, RemoteSessionConfig)) and remote
+            else None
+        )
+        normalized_project = (
+            Path(project_dir).expanduser().resolve()
+            if project_dir
+            else self.project_dir
+        )
+        if normalized_remote is None and normalized_project is None:
+            raise ValueError(self.translator.text("error_config_required"))
+        orchestrator = self._read_orchestrator(normalized_project or Path.cwd())
+        skills = await orchestrator.discover_skills(
+            project_dir=None if normalized_remote is not None else normalized_project,
+            remote_config=normalized_remote,
+            remote_password=remote_password if normalized_remote is not None else None,
+        )
+        self.available_skills = skills
+        return {
+            "skills": skills,
+            "snapshot": self.snapshot(),
+        }
 
     def interrupt(self) -> dict[str, Any]:
         orchestrator = self.orchestrator
@@ -1039,6 +1118,21 @@ class WebUIRuntimeState:
         elif event_type == "session_context_imported":
             self.current_session_status = str(details.get("session_status", self.current_session_status))
             self.status_message = self.translator.text("configuration_saved")
+        elif event_type == "session_skills_materialized":
+            if isinstance(details, dict):
+                self.selected_skill_ids = [
+                    str(item).strip()
+                    for item in details.get("enabled_skill_ids", [])
+                    if str(item).strip()
+                ]
+                self.skills_state = {
+                    **(self.skills_state if isinstance(self.skills_state, dict) else {}),
+                    "bundle_root": str(details.get("skill_bundle_root", "") or ""),
+                    "manifest_path": str(details.get("manifest_path", "") or ""),
+                    "warnings": list(details.get("warnings", []))
+                    if isinstance(details.get("warnings"), list)
+                    else [],
+                }
         elif event_type == "session_interrupted":
             self.current_session_status = "interrupted"
             self.status_message = self.translator.text("session_interrupted")
@@ -1066,6 +1160,7 @@ class WebUIRuntimeState:
         session_mode: WorkspaceMode | str | None = None,
         remote: RemoteSessionConfig | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1080,14 +1175,14 @@ class WebUIRuntimeState:
             if remote is not None:
                 run_kwargs["remote_config"] = remote
                 run_kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                run_kwargs["enabled_skill_ids"] = enabled_skill_ids
             session = await orchestrator.run_task(task, **run_kwargs)
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_completed")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"
@@ -1107,6 +1202,7 @@ class WebUIRuntimeState:
         model: str,
         root_agent_name: str | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1118,18 +1214,18 @@ class WebUIRuntimeState:
             }
             if str(remote_password or "").strip():
                 kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                kwargs["enabled_skill_ids"] = enabled_skill_ids
             session = await orchestrator.run_task_in_session(
                 session_id,
                 task,
                 **kwargs,
             )
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_completed")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"
@@ -1150,6 +1246,7 @@ class WebUIRuntimeState:
         reactivate_agent_id: str | None = None,
         run_root_agent: bool = True,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1162,18 +1259,18 @@ class WebUIRuntimeState:
             }
             if str(remote_password or "").strip():
                 kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                kwargs["enabled_skill_ids"] = enabled_skill_ids
             session = await orchestrator.resume(
                 session_id,
                 instruction,
                 **kwargs,
             )
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_resumed_done")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"

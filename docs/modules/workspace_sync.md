@@ -60,6 +60,7 @@ Child workspace creation:
 
 Ignored paths include runtime/internal noise (`.git`, `.opencompany`, caches, `.env*`, etc.).
 Symlinks are excluded end-to-end (snapshot, tree traversal, search, diff, and apply/undo sync paths).
+Session skill bundles under `.opencompany_skills/<session_id>` are intentionally **not** globally ignored, because workers need to inherit them inside staged workspaces.
 
 ## Upward Promotion
 
@@ -75,6 +76,8 @@ If promotion fails:
 - summary/recommendation are adjusted for recovery guidance
 
 In `direct` mode there is no upward promotion step because worker edits are already live in the shared root workspace. Worker diff artifacts are also skipped because per-worker diffs are no longer reliable in a shared-write session.
+
+When session skills are enabled, worker promotion and diff artifact generation exclude `.opencompany_skills/<session_id>` so runtime bundle assets are not treated as user project edits.
 
 ## Stage / Apply / Undo Model
 
@@ -99,6 +102,8 @@ In `direct` mode there is no upward promotion step because worker edits are alre
 - project-sync status is reported as `disabled`
 - diff preview/apply/undo APIs fail fast
 - Web UI and TUI disable `Diff` / `Apply` / `Undo`
+
+In `staged` mode, project-sync preview/apply/undo also exclude `.opencompany_skills/<session_id>` from the staged delta set.
 
 ## Remote Runtime Cleanup
 

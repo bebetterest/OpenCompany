@@ -31,6 +31,7 @@ Language: **English** | [中文](README_cn.md)
 - 📏 Limit policies: built-in limits cover tool-call duration, total created agents, and active agents; periodic reminder context is injected when step/context thresholds are reached, and overlong context is force-compressed.
 - 🌐 Project environments: supports both local directories and remote SSH Linux directories as execution environments.
 - 📝 Workspace modes: supports `Direct` and `Staged`; `Direct` writes to the project immediately, while `Staged` holds diffs for user approval before apply (remote supports `Direct` only).
+- 🧰 Skills: sessions can enable reusable skill bundles from project/global sources; selected skills are materialized into `.opencompany_skills/<session_id>/...` and inherited by workers.
 - 🔒 Security model: supports both `anthropic` [sandbox (SRT)](https://github.com/anthropic-experimental/sandbox-runtime) and `none` (unconstrained) runtime backends.
 - 🖥️ Three interfaces: supports Web UI / TUI / CLI, with Web UI recommended (bilingual visualization in Chinese/English covers session overview, collaboration graph, per-agent details, tool/steer traces, and operations like session create/import, config updates, agent create/steer/terminate, and opening agent terminals).
 - 🤖 LLM access: supports model calls through [OpenRouter](https://openrouter.ai/).
@@ -159,6 +160,55 @@ opencompany run \
   "Inspect this repository and propose next engineering steps."
 ```
 
+Discover available skills:
+
+```bash
+opencompany skills
+opencompany skills --project-dir /path/to/target
+opencompany skills --remote-target demo@example.com:22 --remote-dir /home/demo/workspace --remote-auth key --remote-key-path ~/.ssh/id_ed25519
+```
+
+Add a skill:
+
+- Put the skill directory under either `<project_dir>/skills/` or `<app_dir>/skills/`.
+- It is not enough to create only the folder name; a valid skill must include at least `skill.toml` and `SKILL.md`.
+- If the same `skill_id` exists in both places, the project source overrides the global source.
+
+```text
+<project_dir>/skills/<skill_id>/
+  skill.toml
+  SKILL.md
+  SKILL_cn.md        # optional
+  resources/...      # optional; may contain text, scripts, or binary files
+```
+
+Minimal `skill.toml` example:
+
+```toml
+[skill]
+id = "repo-map"
+name = "Repo Map"
+name_cn = "仓库地图"
+description = "Explain the repository layout and key entry points."
+description_cn = "解释仓库结构和关键入口。"
+tags = ["docs", "navigation"]
+```
+
+Verify discovery after adding it:
+
+```bash
+opencompany skills --project-dir /path/to/target
+```
+
+Run with explicit skills:
+
+```bash
+opencompany run \
+  --skill repo-map \
+  --skill release-notes \
+  "Inspect this repository and propose next engineering steps."
+```
+
 Run in direct mode against remote SSH workspace:
 
 ```bash
@@ -176,6 +226,7 @@ Continue an existing session:
 ```bash
 opencompany resume <session_id> "new instruction"
 opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
+opencompany resume <session_id> --skill repo-map --skill release-notes "new instruction"
 ```
 
 Clone an existing session first when you want a branch copy:

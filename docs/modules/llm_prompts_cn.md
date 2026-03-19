@@ -56,6 +56,20 @@ locale 行为：
 - `zh` 优先 `_cn` 文件
 - 缺失时回退英文
 
+## Skill Prompt 增补
+
+当 session 启用了 skills 时：
+
+- 运行时会把 `skills_catalog` 写入每个 agent 的 metadata
+- `ContextAssembler.system_prompt()` 会在角色 prompt 后追加 `Enabled Skills` 区块
+- 该区块包含：
+  - skill bundle root
+  - manifest 路径
+  - 每个 skill 的文档路径 / 本地化文档路径
+  - 漂移或缺源告警
+
+这个附加区块只提供上下文信息：skills 不会注册新工具，也不会修改 tool schema。
+
 ## 角色与语言耦合
 
 - 系统提示词按角色（`root` / `worker`）选择。

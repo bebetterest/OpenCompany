@@ -9,6 +9,22 @@ from opencompany.workspace import WorkspaceManager
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_create_root_workspace_staged_mode_excludes_existing_skill_bundles(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+            (project_dir / "visible.txt").write_text("safe\n", encoding="utf-8")
+            stale_bundle = project_dir / ".opencompany_skills" / "other-session"
+            stale_bundle.mkdir(parents=True, exist_ok=True)
+            (stale_bundle / "manifest.json").write_text("{}", encoding="utf-8")
+
+            session_dir = Path(temp_dir) / "session"
+            manager = WorkspaceManager(session_dir)
+            root = manager.create_root_workspace(project_dir, mode="staged")
+
+            self.assertTrue((root.path / "visible.txt").exists())
+            self.assertFalse((root.path / ".opencompany_skills").exists())
+
     def test_create_root_workspace_direct_mode_uses_live_project_directory(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir) / "project"

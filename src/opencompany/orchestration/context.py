@@ -7,6 +7,7 @@ from opencompany.config import OpenCompanyConfig
 from opencompany.models import AgentNode
 from opencompany.orchestration.messages import tool_result_message
 from opencompany.prompts import PromptLibrary
+from opencompany.skills import render_skills_prompt
 from opencompany.tools import tool_definitions_for_role
 
 
@@ -55,7 +56,20 @@ class ContextAssembler:
         self.prompt_library = prompt_library
 
     def system_prompt(self, agent: AgentNode) -> str:
-        return self.prompt_library.load(agent.role.value, self.locale)
+        prompt = self.prompt_library.load(agent.role.value, self.locale)
+        metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
+        skills_catalog = metadata.get("skills_catalog")
+        if not isinstance(skills_catalog, dict):
+            return prompt
+        skills_prompt = render_skills_prompt(
+            locale=self.locale,
+            bundle_root=str(skills_catalog.get("bundle_root", "") or ""),
+            manifest_path=str(skills_catalog.get("manifest_path", "") or ""),
+            skills_state=skills_catalog,
+        )
+        if not skills_prompt:
+            return prompt
+        return f"{prompt.rstrip()}\n\n{skills_prompt}"
 
     def tools(self, agent: AgentNode) -> list[dict[str, object]]:
         return tool_definitions_for_role(

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
@@ -69,6 +70,24 @@ from opencompany.prompts import PromptLibrary
 from opencompany.sandbox.anthropic import AnthropicSandboxBackend
 from opencompany.sandbox.base import SandboxBackend
 from opencompany.sandbox.registry import resolve_sandbox_backend_cls
+from opencompany.skills import (
+    SKILL_BUNDLE_DIRNAME,
+    SKILL_MAIN_DOC_CN_FILENAME,
+    SKILL_MAIN_DOC_FILENAME,
+    SKILL_MANIFEST_FILENAME,
+    SKILL_METADATA_FILENAME,
+    SkillDescriptor,
+    SkillFileRecord,
+    build_manifest_payload,
+    copy_local_skill_tree,
+    describe_skill_drift,
+    discover_local_skills,
+    normalize_skill_id,
+    normalize_skill_ids,
+    skill_bundle_root_relative,
+    skill_manifest_relative,
+    skills_catalog_for_agent,
+)
 from opencompany.status_machine import (
     AGENT_ACTIVE_STATUSES,
     AGENT_NON_SCHEDULABLE_STATUSES,
@@ -343,6 +362,7 @@ class Orchestrator:
         workspace_mode: WorkspaceMode | str | None = None,
         remote_config: RemoteSessionConfig | dict[str, Any] | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         resolved_workspace_mode = normalize_workspace_mode(
@@ -383,6 +403,8 @@ class Orchestrator:
             status=SessionStatus.RUNNING,
             created_at=now,
             updated_at=now,
+            enabled_skill_ids=normalize_skill_ids(enabled_skill_ids),
+            skill_bundle_root=skill_bundle_root_relative(session_id),
             config_snapshot=json_ready(asdict(self.config)),
         )
         self._persist_session_remote_config(session.id, normalized_remote_config)
@@ -409,6 +431,8 @@ class Orchestrator:
                 "project_dir": str(self.project_dir),
                 "root_agent_id": root_agent.id,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -425,6 +449,9 @@ class Orchestrator:
                 "root_agent_name": root_agent.name,
                 "root_agent_role": root_agent.role.value,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": 0,
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -438,6 +465,13 @@ class Orchestrator:
                 remote_config=normalized_remote_config,
                 remote_password=remote_password,
                 require_password=True,
+            )
+            await self._refresh_session_skills(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                requested_skill_ids=enabled_skill_ids,
+                remote_password=remote_password,
             )
             await self._run_session(
                 session=session,
@@ -481,6 +515,7 @@ class Orchestrator:
         model: str | None = None,
         root_agent_name: str | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         normalized_session_id = self._normalize_session_id(session_id)
@@ -505,6 +540,13 @@ class Orchestrator:
             remote_config=remote_config,
             remote_password=remote_password,
             require_password=True,
+        )
+        await self._refresh_session_skills(
+            session=session,
+            agents=agents,
+            workspace_manager=workspace_manager,
+            requested_skill_ids=enabled_skill_ids,
+            remote_password=remote_password,
         )
 
         root_agent = self._append_root_agent_for_task(
@@ -540,6 +582,8 @@ class Orchestrator:
                 "root_agent_id": root_agent.id,
                 "checkpoint_seq": checkpoint_seq,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -557,6 +601,11 @@ class Orchestrator:
                 "root_agent_role": root_agent.role.value,
                 "checkpoint_seq": checkpoint_seq,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": len(session.skills_state.get("warnings", []))
+                if isinstance(session.skills_state, dict)
+                else 0,
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -699,6 +748,7 @@ class Orchestrator:
             metadata={
                 "created_at": now,
                 "model": self.config.llm.openrouter.model_for_role(AgentRole.ROOT.value),
+                "skills_catalog": json_ready(self._session_skills_catalog(session)),
             },
         )
         root_agent.conversation = [
@@ -917,6 +967,760 @@ class Orchestrator:
             password=password,
         )
 
+    @staticmethod
+    def _skill_bundle_exclude_prefixes(session: RunSession) -> tuple[str, ...]:
+        bundle_root = str(session.skill_bundle_root or "").strip()
+        if not bundle_root:
+            return ()
+        return (bundle_root,)
+
+    def _session_skills_catalog(self, session: RunSession) -> dict[str, Any]:
+        return skills_catalog_for_agent(
+            session_id=session.id,
+            locale=self.locale,
+            skills_state=session.skills_state,
+        )
+
+    def _apply_skill_catalog_to_agents(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+    ) -> None:
+        catalog = self._session_skills_catalog(session)
+        for agent in agents.values():
+            if not isinstance(agent.metadata, dict):
+                agent.metadata = {}
+            agent.metadata["skills_catalog"] = json_ready(catalog)
+            self.storage.upsert_agent(agent)
+
+    def _skill_warning(
+        self,
+        *,
+        warning_type: str,
+        skill_id: str,
+        message: str,
+        message_cn: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "type": warning_type,
+            "skill_id": skill_id,
+            "message": message,
+            "message_cn": message_cn,
+        }
+        payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _rewrite_skills_state_for_cloned_session(
+        skills_state: Any,
+        *,
+        session_id: str,
+    ) -> dict[str, Any]:
+        bundle_root = skill_bundle_root_relative(session_id)
+        manifest_path = skill_manifest_relative(session_id)
+        if not isinstance(skills_state, dict):
+            return {
+                "bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "entries": [],
+                "warnings": [],
+            }
+        rewritten = dict(skills_state)
+        rewritten["bundle_root"] = bundle_root
+        rewritten["manifest_path"] = manifest_path
+        entries: list[dict[str, Any]] = []
+        for raw_entry in skills_state.get("entries", []):
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            skill_id = str(entry.get("id", "")).strip()
+            if skill_id:
+                bundle_path = str(Path(bundle_root) / skill_id)
+                entry["bundle_path"] = bundle_path
+                main_doc_path = str(entry.get("main_doc_path", SKILL_MAIN_DOC_FILENAME) or SKILL_MAIN_DOC_FILENAME)
+                localized_doc_path = str(
+                    entry.get("localized_doc_path", main_doc_path) or main_doc_path
+                )
+                entry["main_doc_project_path"] = str(Path(bundle_path) / main_doc_path)
+                entry["localized_doc_project_path"] = str(Path(bundle_path) / localized_doc_path)
+            entries.append(entry)
+        rewritten["entries"] = entries
+        rewritten["warnings"] = (
+            list(skills_state.get("warnings", []))
+            if isinstance(skills_state.get("warnings"), list)
+            else []
+        )
+        return rewritten
+
+    def _skill_entry_record(
+        self,
+        *,
+        descriptor: SkillDescriptor,
+        session: RunSession,
+        files: list[SkillFileRecord],
+    ) -> dict[str, Any]:
+        bundle_root = str(session.skill_bundle_root or skill_bundle_root_relative(session.id))
+        bundle_path = str(Path(bundle_root) / descriptor.id)
+        main_doc_project_path = str(Path(bundle_path) / descriptor.main_doc_path)
+        localized_doc_project_path = str(Path(bundle_path) / descriptor.localized_doc_path)
+        resource_count = sum(
+            1
+            for item in files
+            if item.relative_path
+            not in {
+                SKILL_METADATA_FILENAME,
+                SKILL_MAIN_DOC_FILENAME,
+                SKILL_MAIN_DOC_CN_FILENAME,
+            }
+        )
+        return {
+            "id": descriptor.id,
+            "name": descriptor.name,
+            "name_cn": descriptor.name_cn,
+            "description": descriptor.description,
+            "description_cn": descriptor.description_cn,
+            "tags": list(descriptor.tags),
+            "source_type": descriptor.source_type,
+            "source_root": descriptor.source_root,
+            "source_path": descriptor.source_path,
+            "bundle_path": bundle_path,
+            "main_doc_path": descriptor.main_doc_path,
+            "localized_doc_path": descriptor.localized_doc_path,
+            "main_doc_project_path": main_doc_project_path,
+            "localized_doc_project_path": localized_doc_project_path,
+            "resource_count": resource_count,
+            "files": [entry.to_record() for entry in files],
+        }
+
+    def _current_skill_descriptors(
+        self,
+        *,
+        project_dir: Path | None,
+    ) -> dict[str, SkillDescriptor]:
+        return discover_local_skills(
+            app_dir=self.app_dir,
+            project_dir=project_dir,
+        )
+
+    async def discover_skills(
+        self,
+        *,
+        project_dir: Path | None = None,
+        remote_config: RemoteSessionConfig | dict[str, Any] | None = None,
+        remote_password: str | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_remote_config = (
+            normalize_remote_session_config(remote_config)
+            if remote_config is not None
+            else None
+        )
+        descriptors = self._current_skill_descriptors(
+            project_dir=None if normalized_remote_config is not None else project_dir,
+        )
+        if normalized_remote_config is not None:
+            descriptors.update(
+                await self._discover_remote_project_skills(
+                    remote_config=normalized_remote_config,
+                    remote_password=remote_password,
+                )
+            )
+        return [
+            {
+                "id": descriptor.id,
+                "name": descriptor.name,
+                "name_cn": descriptor.name_cn,
+                "description": descriptor.description,
+                "description_cn": descriptor.description_cn,
+                "tags": list(descriptor.tags),
+                "source_type": descriptor.source_type,
+                "source_root": descriptor.source_root,
+                "source_path": descriptor.source_path,
+                "main_doc_path": descriptor.main_doc_path,
+                "localized_doc_path": descriptor.localized_doc_path,
+            }
+            for descriptor in sorted(descriptors.values(), key=lambda item: item.id)
+        ]
+
+    async def _discover_remote_project_skills(
+        self,
+        *,
+        remote_config: RemoteSessionConfig,
+        remote_password: str | None = None,
+    ) -> dict[str, SkillDescriptor]:
+        ephemeral_session_id = f"remote-skills-{uuid.uuid4().hex[:12]}"
+        self._apply_session_remote_runtime(
+            session_id=ephemeral_session_id,
+            remote_config=remote_config,
+            remote_password=remote_password,
+            require_password=True,
+        )
+        try:
+            skills_root = str(Path(remote_config.remote_dir).expanduser() / "skills")
+            result = await self._run_remote_shell_command(
+                session_id=ephemeral_session_id,
+                command=(
+                    "set -euo pipefail; "
+                    f"skills_root={shlex.quote(skills_root)}; "
+                    'if [ ! -d "$skills_root" ]; then exit 0; fi; '
+                    'find "$skills_root" -mindepth 1 -maxdepth 1 -type d -print'
+                ),
+            )
+            if result.exit_code != 0:
+                raise ValueError(result.stderr.strip() or "Failed to discover remote project skills.")
+            discovered: dict[str, SkillDescriptor] = {}
+            for raw_line in str(result.stdout or "").splitlines():
+                candidate_path = str(raw_line or "").strip()
+                if not candidate_path:
+                    continue
+                directory_id = Path(candidate_path).name
+                try:
+                    skill_id = normalize_skill_id(directory_id)
+                except ValueError:
+                    continue
+                metadata_payload = await self._remote_read_text_file(
+                    session_id=ephemeral_session_id,
+                    remote_path=str(Path(candidate_path) / SKILL_METADATA_FILENAME),
+                )
+                if metadata_payload is None:
+                    continue
+                if await self._remote_path_missing(
+                    session_id=ephemeral_session_id,
+                    remote_path=str(Path(candidate_path) / SKILL_MAIN_DOC_FILENAME),
+                ):
+                    continue
+                try:
+                    metadata = tomllib.loads(metadata_payload)
+                    skill_metadata = (
+                        metadata.get("skill")
+                        if isinstance(metadata.get("skill"), dict)
+                        else metadata
+                    )
+                    if not isinstance(skill_metadata, dict):
+                        continue
+                    metadata_id = str(skill_metadata.get("id", skill_id) or skill_id).strip()
+                    if normalize_skill_id(metadata_id) != skill_id:
+                        continue
+                    localized_doc_path = (
+                        SKILL_MAIN_DOC_CN_FILENAME
+                        if not await self._remote_path_missing(
+                            session_id=ephemeral_session_id,
+                            remote_path=str(Path(candidate_path) / SKILL_MAIN_DOC_CN_FILENAME),
+                        )
+                        else SKILL_MAIN_DOC_FILENAME
+                    )
+                    discovered[skill_id] = SkillDescriptor(
+                        id=skill_id,
+                        name=str(skill_metadata.get("name", skill_id) or skill_id).strip() or skill_id,
+                        name_cn=str(
+                            skill_metadata.get("name_cn", skill_metadata.get("name", skill_id))
+                            or skill_id
+                        ).strip()
+                        or skill_id,
+                        description=str(skill_metadata.get("description", "") or "").strip(),
+                        description_cn=str(
+                            skill_metadata.get(
+                                "description_cn",
+                                skill_metadata.get("description", ""),
+                            )
+                            or ""
+                        ).strip(),
+                        tags=tuple(
+                            str(item).strip()
+                            for item in skill_metadata.get("tags", [])
+                            if str(item).strip()
+                        ),
+                        source_type="project",
+                        source_root=skills_root,
+                        source_path=candidate_path,
+                        main_doc_path=SKILL_MAIN_DOC_FILENAME,
+                        localized_doc_path=localized_doc_path,
+                        files=(),
+                    )
+                except (tomllib.TOMLDecodeError, ValueError):
+                    continue
+            return discovered
+        finally:
+            self.tool_executor.cleanup_session_remote_runtime(ephemeral_session_id)
+            with suppress(Exception):
+                self._persist_session_remote_config(ephemeral_session_id, None)
+            with suppress(Exception):
+                shutil.rmtree(self.paths.session_dir(ephemeral_session_id, create=False))
+
+    async def _run_remote_shell_command(
+        self,
+        *,
+        session_id: str,
+        command: str,
+    ) -> ShellCommandRequest | Any:
+        normalized_session_id = self._normalize_session_id(session_id)
+        remote_context = self.tool_executor.session_remote_context(normalized_session_id)
+        if remote_context is None:
+            raise RuntimeError(f"Remote runtime context is missing for session {normalized_session_id}.")
+        remote_root = Path(remote_context.config.remote_dir).expanduser()
+        request = self.tool_executor.build_shell_request(
+            workspace_root=remote_root,
+            command=command,
+            cwd=".",
+            writable_paths=[remote_root],
+            session_id=normalized_session_id,
+            remote=remote_context,
+        )
+        return await self.tool_executor.shell_backend().run_command(request)
+
+    async def _remote_read_text_file(
+        self,
+        *,
+        session_id: str,
+        remote_path: str,
+    ) -> str | None:
+        command = (
+            "set -euo pipefail; "
+            f"target={shlex.quote(remote_path)}; "
+            'if [ ! -f "$target" ]; then exit 0; fi; '
+            '(base64 < "$target" || openssl base64 -A < "$target") | tr -d "\\n"'
+        )
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=command,
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to read remote file {remote_path}.")
+        encoded = str(result.stdout or "").strip()
+        if not encoded:
+            return None
+        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+
+    async def _remote_path_missing(
+        self,
+        *,
+        session_id: str,
+        remote_path: str,
+    ) -> bool:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(remote_path)}; "
+                'if [ -e "$target" ]; then printf "0"; else printf "1"; fi'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to stat remote path {remote_path}.")
+        return str(result.stdout or "").strip() != "0"
+
+    async def _refresh_session_skills(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+        workspace_manager: WorkspaceManager,
+        requested_skill_ids: list[str] | None,
+        remote_password: str | None = None,
+    ) -> None:
+        normalized_requested = (
+            normalize_skill_ids(requested_skill_ids)
+            if requested_skill_ids is not None
+            else normalize_skill_ids(session.enabled_skill_ids)
+        )
+        bundle_root = skill_bundle_root_relative(session.id)
+        manifest_path = skill_manifest_relative(session.id)
+        session.skill_bundle_root = bundle_root
+        previous_entries = {}
+        if isinstance(session.skills_state, dict):
+            for raw_entry in session.skills_state.get("entries", []):
+                if not isinstance(raw_entry, dict):
+                    continue
+                skill_id = str(raw_entry.get("id", "")).strip()
+                if skill_id:
+                    previous_entries[skill_id] = raw_entry
+        if not normalized_requested and not previous_entries:
+            session.enabled_skill_ids = []
+            session.skills_state = {
+                "bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "entries": [],
+                "warnings": [],
+                "updated_at": utc_now(),
+            }
+            self.storage.upsert_session(session)
+            self._apply_skill_catalog_to_agents(session=session, agents=agents)
+            return
+
+        remote_config = self._session_remote_config(session.id, load_if_missing=True)
+        descriptors = self._current_skill_descriptors(
+            project_dir=None if remote_config is not None else session.project_dir,
+        )
+        if remote_config is not None:
+            descriptors.update(
+                await self._discover_remote_project_skills(
+                    remote_config=remote_config,
+                    remote_password=remote_password,
+                )
+            )
+
+        warnings: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
+
+        if remote_config is None:
+            targets = self._local_skill_materialization_targets(
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+            self._clear_local_skill_bundle_targets(
+                targets=targets,
+                bundle_root=bundle_root,
+                clear_all_bundles=not self._is_direct_workspace_mode(session),
+            )
+        else:
+            await self._prepare_remote_skill_bundle_root(
+                session_id=session.id,
+                bundle_root=bundle_root,
+            )
+
+        for skill_id in normalized_requested:
+            descriptor = descriptors.get(skill_id)
+            if descriptor is None:
+                warnings.append(
+                    self._skill_warning(
+                        warning_type="missing_source",
+                        skill_id=skill_id,
+                        message=(
+                            f"Skill '{skill_id}' was skipped because it is missing from both project and global sources."
+                        ),
+                        message_cn=(
+                            f"skill '{skill_id}' 已被跳过，因为项目源和全局源中都找不到它。"
+                        ),
+                    )
+                )
+                continue
+            if remote_config is None:
+                for target in targets:
+                    self._materialize_local_skill_to_target(
+                        descriptor=descriptor,
+                        target_root=target,
+                        bundle_root=bundle_root,
+                    )
+                files = list(descriptor.files)
+            else:
+                files = await self._materialize_remote_skill(
+                    session_id=session.id,
+                    descriptor=descriptor,
+                    bundle_root=bundle_root,
+                )
+            entry = self._skill_entry_record(
+                descriptor=descriptor,
+                session=session,
+                files=files,
+            )
+            if describe_skill_drift(previous_entries.get(skill_id), entry):
+                warnings.append(
+                    self._skill_warning(
+                        warning_type="content_drift",
+                        skill_id=skill_id,
+                        message=(
+                            f"Skill '{skill_id}' changed since the last materialization and was rebuilt from the latest source."
+                        ),
+                        message_cn=(
+                            f"skill '{skill_id}' 与上次物化时相比已发生变化，系统已按最新来源重新构建。"
+                        ),
+                    )
+                )
+            entries.append(entry)
+
+        manifest_payload = build_manifest_payload(
+            session_id=session.id,
+            bundle_root=bundle_root,
+            entries=entries,
+            warnings=warnings,
+        )
+        if remote_config is None:
+            self._write_local_skill_manifests(
+                targets=targets,
+                bundle_root=bundle_root,
+                payload=manifest_payload,
+            )
+        else:
+            await self._write_remote_skill_manifest(
+                session_id=session.id,
+                bundle_root=bundle_root,
+                payload=manifest_payload,
+            )
+
+        session.enabled_skill_ids = [str(entry.get("id", "")).strip() for entry in entries if str(entry.get("id", "")).strip()]
+        session.skill_bundle_root = bundle_root
+        session.skills_state = {
+            "bundle_root": bundle_root,
+            "manifest_path": manifest_path,
+            "entries": entries,
+            "warnings": warnings,
+            "updated_at": utc_now(),
+        }
+        self.storage.upsert_session(session)
+        self._apply_skill_catalog_to_agents(session=session, agents=agents)
+        self._log_diagnostic(
+            "session_skills_materialized",
+            session_id=session.id,
+            agent_id=session.root_agent_id or None,
+            payload={
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "bundle_root": bundle_root,
+                "warning_count": len(warnings),
+            },
+        )
+        self._get_logger(session.id).log(
+            session_id=session.id,
+            agent_id=session.root_agent_id or "",
+            parent_agent_id=None,
+            event_type="session_skills_materialized",
+            phase="runtime",
+            payload={
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "warning_count": len(warnings),
+                "warnings": warnings,
+            },
+            workspace_id=next(
+                (
+                    agent.workspace_id
+                    for agent in agents.values()
+                    if agent.id == session.root_agent_id
+                ),
+                None,
+            ),
+        )
+
+    def _local_skill_materialization_targets(
+        self,
+        *,
+        session: RunSession,
+        workspace_manager: WorkspaceManager,
+    ) -> list[Path]:
+        if self._is_direct_workspace_mode(session):
+            root_workspace = workspace_manager.root_workspace()
+            if root_workspace is not None:
+                return [root_workspace.path.resolve()]
+            return [session.project_dir.resolve()]
+        targets: list[Path] = []
+        seen: set[str] = set()
+        for workspace in workspace_manager.all_workspaces().values():
+            normalized_path = str(workspace.path.resolve())
+            if normalized_path in seen:
+                continue
+            seen.add(normalized_path)
+            targets.append(workspace.path.resolve())
+        return targets
+
+    def _clear_local_skill_bundle_targets(
+        self,
+        *,
+        targets: list[Path],
+        bundle_root: str,
+        clear_all_bundles: bool = False,
+    ) -> None:
+        for target_root in targets:
+            skills_root = target_root / SKILL_BUNDLE_DIRNAME
+            if clear_all_bundles and skills_root.exists():
+                shutil.rmtree(skills_root)
+            bundle_path = target_root / bundle_root
+            if bundle_path.exists():
+                shutil.rmtree(bundle_path)
+            ensure_directory(bundle_path)
+
+    def _materialize_local_skill_to_target(
+        self,
+        *,
+        descriptor: SkillDescriptor,
+        target_root: Path,
+        bundle_root: str,
+    ) -> None:
+        target_dir = target_root / bundle_root / descriptor.id
+        copy_local_skill_tree(Path(descriptor.source_path), target_dir)
+
+    def _write_local_skill_manifests(
+        self,
+        *,
+        targets: list[Path],
+        bundle_root: str,
+        payload: dict[str, Any],
+    ) -> None:
+        content = stable_json_dumps(payload) + "\n"
+        for target_root in targets:
+            bundle_path = ensure_directory(target_root / bundle_root)
+            (bundle_path / SKILL_MANIFEST_FILENAME).write_text(
+                content,
+                encoding="utf-8",
+            )
+
+    async def _prepare_remote_skill_bundle_root(
+        self,
+        *,
+        session_id: str,
+        bundle_root: str,
+    ) -> None:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(str(Path(self.project_dir) / bundle_root))}; "
+                'rm -rf "$target"; '
+                'mkdir -p "$target"'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or "Failed to prepare remote skill bundle root.")
+
+    async def _materialize_remote_skill(
+        self,
+        *,
+        session_id: str,
+        descriptor: SkillDescriptor,
+        bundle_root: str,
+    ) -> list[SkillFileRecord]:
+        target_dir = str(Path(self.project_dir) / bundle_root / descriptor.id)
+        if descriptor.source_type == "project":
+            result = await self._run_remote_shell_command(
+                session_id=session_id,
+                command=(
+                    "set -euo pipefail; "
+                    f"source={shlex.quote(descriptor.source_path)}; "
+                    f"target={shlex.quote(target_dir)}; "
+                    'mkdir -p "$target"; '
+                    'cp -a "$source/." "$target/"'
+                ),
+            )
+            if result.exit_code != 0:
+                raise ValueError(result.stderr.strip() or f"Failed to copy remote skill {descriptor.id}.")
+        else:
+            await self._upload_local_skill_to_remote(
+                session_id=session_id,
+                descriptor=descriptor,
+                target_dir=target_dir,
+            )
+        return await self._collect_remote_skill_files(
+            session_id=session_id,
+            target_dir=target_dir,
+        )
+
+    async def _upload_local_skill_to_remote(
+        self,
+        *,
+        session_id: str,
+        descriptor: SkillDescriptor,
+        target_dir: str,
+    ) -> None:
+        source_dir = Path(descriptor.source_path)
+        prepare = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f'target={shlex.quote(target_dir)}; '
+                'mkdir -p "$target"'
+            ),
+        )
+        if prepare.exit_code != 0:
+            raise ValueError(prepare.stderr.strip() or f"Failed to create remote target for skill {descriptor.id}.")
+        for file_record in descriptor.files:
+            source_path = source_dir / file_record.relative_path
+            encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+            target_path = str(Path(target_dir) / file_record.relative_path)
+            command = (
+                "set -euo pipefail\n"
+                f"target={shlex.quote(target_path)}\n"
+                'mkdir -p "$(dirname "$target")"\n'
+                "cat <<'__OPENCOMPANY_SKILL_B64__' | "
+                "(base64 --decode 2>/dev/null || base64 -d 2>/dev/null) > \"$target\"\n"
+                f"{encoded}\n"
+                "__OPENCOMPANY_SKILL_B64__\n"
+                f"chmod {shlex.quote(file_record.mode)} \"$target\"\n"
+            )
+            result = await self._run_remote_shell_command(
+                session_id=session_id,
+                command=command,
+            )
+            if result.exit_code != 0:
+                raise ValueError(
+                    result.stderr.strip()
+                    or f"Failed to upload remote skill file {file_record.relative_path}."
+                )
+
+    async def _collect_remote_skill_files(
+        self,
+        *,
+        session_id: str,
+        target_dir: str,
+    ) -> list[SkillFileRecord]:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(target_dir)}; "
+                'if [ ! -d "$target" ]; then exit 0; fi; '
+                'cd "$target"; '
+                "find . -type f -print0 | while IFS= read -r -d '' path; do "
+                'rel=${path#./}; '
+                "if command -v sha256sum >/dev/null 2>&1; then "
+                'sha=$(sha256sum "$rel" | awk \'{print $1}\'); '
+                "else "
+                'sha=$(shasum -a 256 "$rel" | awk \'{print $1}\'); '
+                "fi; "
+                'size=$(wc -c < "$rel" | tr -d \' \'); '
+                'mode=$(stat -c \'%a\' "$rel" 2>/dev/null || stat -f \'%Lp\' "$rel"); '
+                'is_exec=0; if [ -x "$rel" ]; then is_exec=1; fi; '
+                'is_binary=0; if [ "$size" -gt 0 ] && ! LC_ALL=C grep -Iq . "$rel"; then is_binary=1; fi; '
+                'rel_b64=$(printf %s "$rel" | base64 | tr -d \'\\n\'); '
+                'printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$rel_b64" "$sha" "$size" "$mode" "$is_binary" "$is_exec"; '
+                "done"
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to collect remote files for {target_dir}.")
+        records: list[SkillFileRecord] = []
+        for raw_line in str(result.stdout or "").splitlines():
+            columns = raw_line.split("\t")
+            if len(columns) != 6:
+                continue
+            relative_path = base64.b64decode(columns[0].encode("ascii")).decode("utf-8")
+            records.append(
+                SkillFileRecord(
+                    relative_path=relative_path,
+                    sha256=str(columns[1]).strip(),
+                    size=int(columns[2] or 0),
+                    mode=str(columns[3]).strip() or "644",
+                    is_binary=str(columns[4]).strip() == "1",
+                    is_executable=str(columns[5]).strip() == "1",
+                )
+            )
+        records.sort(key=lambda item: item.relative_path)
+        return records
+
+    async def _write_remote_skill_manifest(
+        self,
+        *,
+        session_id: str,
+        bundle_root: str,
+        payload: dict[str, Any],
+    ) -> None:
+        manifest_path = str(Path(self.project_dir) / bundle_root / SKILL_MANIFEST_FILENAME)
+        encoded = base64.b64encode((stable_json_dumps(payload) + "\n").encode("utf-8")).decode("ascii")
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail\n"
+                f"target={shlex.quote(manifest_path)}\n"
+                'mkdir -p "$(dirname "$target")"\n'
+                "cat <<'__OPENCOMPANY_SKILL_MANIFEST__' | "
+                "(base64 --decode 2>/dev/null || base64 -d 2>/dev/null) > \"$target\"\n"
+                f"{encoded}\n"
+                "__OPENCOMPANY_SKILL_MANIFEST__\n"
+                'chmod 644 "$target"\n'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or "Failed to write remote skill manifest.")
+
     def load_session_context(self, session_id: str) -> RunSession:
         normalized_session_id = self._normalize_session_id(session_id)
         stored_session = self.storage.load_session(normalized_session_id)
@@ -965,6 +1769,9 @@ class Orchestrator:
                         completion_state=stored_session.get("completion_state"),
                     ),
                     follow_up_needed=bool(int(stored_session.get("follow_up_needed", 0) or 0)),
+                    enabled_skill_ids=[],
+                    skill_bundle_root="",
+                    skills_state={},
                     config_snapshot={},
                 )
             return self._session_from_storage_row(stored_session, fallback=fallback)
@@ -988,6 +1795,7 @@ class Orchestrator:
         reactivate_agent_id: str | None = None,
         run_root_agent: bool = True,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         normalized_session_id = self._normalize_session_id(session_id)
@@ -1014,6 +1822,13 @@ class Orchestrator:
             remote_config=remote_config,
             remote_password=remote_password,
             require_password=True,
+        )
+        await self._refresh_session_skills(
+            session=session,
+            agents=agents,
+            workspace_manager=workspace_manager,
+            requested_skill_ids=enabled_skill_ids,
+            remote_password=remote_password,
         )
         if normalized_run_root_agent and normalized_reactivate_agent_id:
             candidate = agents.get(normalized_reactivate_agent_id)
@@ -1089,6 +1904,8 @@ class Orchestrator:
                 "model": selected_model,
                 "reactivate_agent_id": normalized_reactivate_agent_id,
                 "run_root_agent": normalized_run_root_agent,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -1107,6 +1924,11 @@ class Orchestrator:
                 "model": selected_model,
                 "reactivate_agent_id": normalized_reactivate_agent_id,
                 "run_root_agent": normalized_run_root_agent,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": len(session.skills_state.get("warnings", []))
+                if isinstance(session.skills_state, dict)
+                else 0,
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -1193,6 +2015,12 @@ class Orchestrator:
             final_summary=source_session.final_summary,
             completion_state=source_session.completion_state,
             follow_up_needed=source_session.follow_up_needed,
+            enabled_skill_ids=list(source_session.enabled_skill_ids),
+            skill_bundle_root=skill_bundle_root_relative(cloned_session_id),
+            skills_state=self._rewrite_skills_state_for_cloned_session(
+                source_session.skills_state,
+                session_id=cloned_session_id,
+            ),
             config_snapshot=source_config_snapshot,
         )
         self.storage.upsert_session(cloned_session)
@@ -1598,6 +2426,8 @@ class Orchestrator:
         session_payload = rewritten_state.get("session")
         rewritten_workspace_mode = WorkspaceMode.STAGED
         rewritten_project_dir = cloned_session_dir
+        rewritten_session_locale = self.locale
+        rewritten_skills_state: dict[str, Any] = {}
         if isinstance(session_payload, dict):
             session_payload["id"] = cloned_session_id
             config_snapshot = session_payload.get("config_snapshot")
@@ -1606,6 +2436,19 @@ class Orchestrator:
                 session_payload["config_snapshot"] = config_snapshot
             config_snapshot["continued_from_session_id"] = source_session_id
             config_snapshot["continued_from_checkpoint_seq"] = source_checkpoint_seq
+            session_payload["skill_bundle_root"] = skill_bundle_root_relative(cloned_session_id)
+            session_payload["skills_state"] = self._rewrite_skills_state_for_cloned_session(
+                session_payload.get("skills_state"),
+                session_id=cloned_session_id,
+            )
+            rewritten_session_locale = str(
+                session_payload.get("locale", self.locale) or self.locale
+            )
+            rewritten_skills_state = (
+                dict(session_payload["skills_state"])
+                if isinstance(session_payload.get("skills_state"), dict)
+                else {}
+            )
             rewritten_workspace_mode = normalize_workspace_mode(
                 session_payload.get("workspace_mode")
             )
@@ -1615,10 +2458,22 @@ class Orchestrator:
 
         agents_payload = rewritten_state.get("agents")
         if isinstance(agents_payload, dict):
+            rewritten_skills_catalog = json_ready(
+                skills_catalog_for_agent(
+                    session_id=cloned_session_id,
+                    locale=rewritten_session_locale,
+                    skills_state=rewritten_skills_state,
+                )
+            )
             for payload in agents_payload.values():
                 if not isinstance(payload, dict):
                     continue
                 payload["session_id"] = cloned_session_id
+                metadata = payload.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                    payload["metadata"] = metadata
+                metadata["skills_catalog"] = rewritten_skills_catalog
 
         workspaces_payload = rewritten_state.get("workspaces")
         if isinstance(workspaces_payload, dict):
@@ -1870,6 +2725,7 @@ class Orchestrator:
                 f"Root agent {session.root_agent_id} is missing in checkpoint for session {session_id}."
             )
         self._restore_agent_conversations_from_messages(session_id, agents)
+        self._apply_skill_catalog_to_agents(session=session, agents=agents)
         normalized_workspaces = self._normalize_workspace_state_for_session(
             session_id=session_id,
             workspace_mode=session.workspace_mode,
@@ -1934,6 +2790,8 @@ class Orchestrator:
                 "checkpoint_seq": checkpoint_seq,
                 "previous_checkpoint_seq": checkpoint["seq"],
                 "project_dir": str(self.project_dir),
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
                 "pending_agent_ids": pending_agent_ids,
                 "paused_agent_ids": paused_agent_ids,
                 "cancelled_tool_run_ids": cancelled_tool_run_ids,
@@ -3765,6 +4623,9 @@ class Orchestrator:
                     locale=str(row.get("locale", self.locale) or self.locale),
                     root_agent_id=str(row.get("root_agent_id", "")),
                     workspace_mode=normalize_workspace_mode(row.get("workspace_mode")),
+                    enabled_skill_ids=[],
+                    skill_bundle_root="",
+                    skills_state={},
                 )
             return self._session_from_storage_row(row, fallback=fallback)
         return fallback
@@ -3815,7 +4676,10 @@ class Orchestrator:
 
         session, root_agent, workspace_manager = self._project_sync_context(normalized_session_id)
         workspace = workspace_manager.workspace(root_agent.workspace_id)
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         staged_changes = WorkspaceChangeSet(
             added=sorted({str(path) for path in state.get("added", [])}),
             modified=sorted({str(path) for path in state.get("modified", [])}),
@@ -3892,7 +4756,10 @@ class Orchestrator:
             )
 
         session, root_agent, workspace_manager = self._project_sync_context(normalized_session_id)
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         staged_changes = WorkspaceChangeSet(
             added=sorted({str(path) for path in state.get("added", [])}),
             modified=sorted({str(path) for path in state.get("modified", [])}),
@@ -3967,6 +4834,7 @@ class Orchestrator:
                 applied = workspace_manager.apply_workspace_changes(
                     root_agent.workspace_id,
                     session.project_dir,
+                    exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
                 )
         except Exception as exc:
             state["last_error"] = str(exc)
@@ -4190,7 +5058,10 @@ class Orchestrator:
         root_agent: AgentNode,
         workspace_manager: WorkspaceManager,
     ) -> dict[str, Any]:
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         has_changes = bool(changes.added or changes.modified or changes.deleted)
         state = {
             "version": PROJECT_SYNC_STATE_VERSION,
@@ -7626,7 +8497,11 @@ class Orchestrator:
         if direct_mode:
             diff_artifact = ""
         else:
-            diff = workspace_manager.create_diff_artifact(agent.id, agent.workspace_id)
+            diff = workspace_manager.create_diff_artifact(
+                agent.id,
+                agent.workspace_id,
+                exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+            )
             diff_artifact = str(diff.artifact_path)
         completion = WorkerCompletion(
             summary=str(payload.get("summary", "")),
@@ -7648,6 +8523,7 @@ class Orchestrator:
                         workspace_manager.apply_workspace_changes,
                         agent.workspace_id,
                         parent_workspace.path,
+                        exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
                     )
                 self._log_diagnostic(
                     "workspace_changes_promoted",
@@ -8102,6 +8978,31 @@ class Orchestrator:
             status = SessionStatus(raw_status)
         except ValueError:
             status = fallback.status
+        enabled_skill_ids = list(fallback.enabled_skill_ids)
+        raw_enabled_skill_ids = row.get("enabled_skill_ids_json")
+        if isinstance(raw_enabled_skill_ids, str) and raw_enabled_skill_ids.strip():
+            try:
+                parsed_enabled_skill_ids = json.loads(raw_enabled_skill_ids)
+            except json.JSONDecodeError:
+                parsed_enabled_skill_ids = None
+            if isinstance(parsed_enabled_skill_ids, list):
+                enabled_skill_ids = normalize_skill_ids(
+                    [str(item).strip() for item in parsed_enabled_skill_ids if str(item).strip()]
+                )
+        skill_bundle_root = str(
+            row.get("skill_bundle_root", fallback.skill_bundle_root) or fallback.skill_bundle_root
+        )
+        skills_state = (
+            dict(fallback.skills_state) if isinstance(fallback.skills_state, dict) else {}
+        )
+        raw_skills_state = row.get("skills_state_json")
+        if isinstance(raw_skills_state, str) and raw_skills_state.strip():
+            try:
+                parsed_skills_state = json.loads(raw_skills_state)
+            except json.JSONDecodeError:
+                parsed_skills_state = None
+            if isinstance(parsed_skills_state, dict):
+                skills_state = parsed_skills_state
         return RunSession(
             id=str(row.get("id", fallback.id) or fallback.id),
             project_dir=Path(str(row.get("project_dir", fallback.project_dir))),
@@ -8134,6 +9035,9 @@ class Orchestrator:
                 ),
             ),
             follow_up_needed=bool(int(row.get("follow_up_needed", int(fallback.follow_up_needed)) or 0)),
+            enabled_skill_ids=enabled_skill_ids,
+            skill_bundle_root=skill_bundle_root,
+            skills_state=skills_state,
             config_snapshot=config_snapshot,
         )
 

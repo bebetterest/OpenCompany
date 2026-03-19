@@ -146,6 +146,9 @@ def create_webui_app(
         session_mode_text = _optional_string(payload.get("session_mode"))
         sandbox_backend_text = _optional_string(payload.get("sandbox_backend"))
         remote_password = _optional_string(payload.get("remote_password"))
+        raw_enabled_skill_ids = payload.get("enabled_skill_ids")
+        if raw_enabled_skill_ids is not None and not isinstance(raw_enabled_skill_ids, list):
+            raise HTTPException(status_code=400, detail="enabled_skill_ids must be an array.")
         remote_payload = payload.get("remote")
         if remote_payload is not None and not isinstance(remote_payload, dict):
             raise HTTPException(status_code=400, detail="remote must be an object.")
@@ -189,13 +192,37 @@ def create_webui_app(
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
         task = str(payload.get("task", "")).strip()
         try:
-            return await state.start_run(
-                task,
-                model=model_text,
-                root_agent_name=root_agent_name_text,
-            )
-        except RuntimeError as exc:
+            start_run_kwargs: dict[str, Any] = {
+                "model": model_text,
+                "root_agent_name": root_agent_name_text,
+            }
+            if isinstance(raw_enabled_skill_ids, list):
+                start_run_kwargs["enabled_skill_ids"] = [
+                    str(item).strip()
+                    for item in raw_enabled_skill_ids
+                    if str(item).strip()
+                ]
+            return await state.start_run(task, **start_run_kwargs)
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/skills/discover")
+    async def api_skills_discover(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        remote_payload = body.get("remote")
+        if remote_payload is not None and not isinstance(remote_payload, dict):
+            raise HTTPException(status_code=400, detail="remote must be an object.")
+        try:
+            result = await state.discover_skills(
+                project_dir=_optional_string(body.get("project_dir")),
+                remote=remote_payload if isinstance(remote_payload, dict) else None,
+                remote_password=_optional_string(body.get("remote_password")),
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/interrupt")
     async def api_interrupt() -> dict[str, Any]:

@@ -56,6 +56,20 @@ Locale behavior:
 - `zh` uses `_cn` variants
 - fallback defaults to English assets when localized files are missing
 
+## Skill Prompt Augmentation
+
+When a session has enabled skills:
+
+- runtime stores a `skills_catalog` inside each agent's metadata
+- `ContextAssembler.system_prompt()` appends an `Enabled Skills` block after the role prompt
+- that block includes:
+  - skill bundle root
+  - manifest path
+  - per-skill doc path / localized doc path
+  - any drift or missing-source warnings
+
+The appended section is informational only: skills do not register new tools or change tool schemas.
+
 ## Role and Locale Coupling
 
 - System prompt is role-specific (`root` / `worker`).

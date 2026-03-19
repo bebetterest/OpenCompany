@@ -17,6 +17,7 @@ OpenCompany 当前提供两套本地界面：
 
 - 启动配置：`/api/bootstrap`、`/api/launch-config`、`/api/sessions`
 - 执行控制：`/api/run`、`/api/interrupt`
+- skill discover：`/api/skills/discover`
 - sandbox 终端拉起：`/api/terminal/open`
 - 远程工作目录校验：`/api/remote/validate`
 - 可观测性：`/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -28,6 +29,7 @@ OpenCompany 当前提供两套本地界面：
 
 - 当 launch config 提供 `project_dir` 时，`/api/run` 新建会话并运行。
 - 新建会话的 launch config 还会携带 `session_mode`（`direct` / `staged`），默认是 `direct`。
+- `/api/run` 接受 `enabled_skill_ids`；对于已加载 session，这会为新一轮 run 替换当前 skill 集；若省略则保留原集合。
 - 新建会话的 launch config 还可携带 `remote`（SSH 目标、远程目录、认证策略）以及仅请求态的 `remote_password`。
 - 远程工作目录仅在 `session_mode=direct` 时可用；`staged + remote` 会被拒绝。
 - 对 password auth 会话，请求态 `remote_password` 会用于 `/api/run`、`/api/terminal/open` 与 `/api/remote/validate`。
@@ -54,6 +56,10 @@ Web UI 特性：
   - 默认值来自 `opencompany.toml`（`[llm.openrouter].model`）
   - 每次运行/继续前可覆盖；提交值会透传到 runtime，并在该次执行中同时作用于 root/worker 的 LLM 调用
 - 控制栏提供可选 root-agent-name 输入框；非空时 `/api/run` 会透传该值，runtime 以它作为 root agent 命名基底（仍保留会话内去重）
+- 控制栏也提供 skills 输入框与 `Discover` 动作
+  - skills 会作为 `enabled_skill_ids` 提交
+  - discover 会按当前本地或远程 launch context 读取项目源/全局源 skills
+  - Overview 卡片会展示当前启用 id、bundle root 与告警数量
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
 - session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
 - 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示

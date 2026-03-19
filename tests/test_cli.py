@@ -92,6 +92,19 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.model, "fake/model")
         self.assertEqual(args.root_agent_name, "Demo Root")
 
+    def test_run_resume_and_skills_command_accept_skill_flags(self) -> None:
+        run_args = build_parser().parse_args(
+            ["run", "--skill", "skill-a", "--skill", "skill-b", "inspect repo"]
+        )
+        resume_args = build_parser().parse_args(
+            ["resume", "session-123", "--skill", "skill-c", "continue"]
+        )
+        skills_args = build_parser().parse_args(["skills", "--project-dir", "/tmp/demo"])
+
+        self.assertEqual(run_args.skills, ["skill-a", "skill-b"])
+        self.assertEqual(resume_args.skills, ["skill-c"])
+        self.assertEqual(skills_args.project_dir, "/tmp/demo")
+
     def test_run_tui_and_ui_accept_remote_flags(self) -> None:
         run_args = build_parser().parse_args(
             [

@@ -200,6 +200,13 @@ backend = "none"
                 remote_password="secret-pass",
             )
             self.assertEqual(state.remote_password, "secret-pass")
+            snapshot = state.snapshot()
+            self.assertIsNone(snapshot["launch_config"]["project_dir"])
+            self.assertEqual(
+                snapshot["launch_config"]["project_dir_display"],
+                "/home/demo/workspace",
+            )
+            self.assertTrue(snapshot["launch_config"]["project_dir_is_remote"])
 
             state.set_launch_config(
                 project_dir=None,
@@ -847,6 +854,70 @@ model = "openai/gpt-4o-mini"
 
         asyncio.run(run())
 
+    def test_start_run_remote_keeps_project_dir_none_after_completion(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=None,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+                state.set_launch_config(
+                    project_dir=None,
+                    session_id=None,
+                    session_mode="direct",
+                    remote={
+                        "kind": "remote_ssh",
+                        "ssh_target": "demo@example.com:2222",
+                        "remote_dir": "/home/demo/workspace",
+                        "auth_mode": "key",
+                        "identity_file": "~/.ssh/id_ed25519",
+                        "known_hosts_policy": "accept_new",
+                        "remote_os": "linux",
+                    },
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+
+                    def subscribe(self, callback) -> None:  # type: ignore[no-untyped-def]
+                        self.callback = callback
+
+                    async def run_task(
+                        self,
+                        task: str,
+                        model: str | None = None,
+                        root_agent_name: str | None = None,
+                        remote_config: RemoteSessionConfig | None = None,
+                        remote_password: str | None = None,
+                    ) -> RunSession:
+                        del task, model, root_agent_name, remote_config, remote_password
+                        return RunSession(
+                            id="session-remote-1",
+                            project_dir=Path("/home/demo/workspace"),
+                            task="demo task",
+                            locale="en",
+                            root_agent_id="agent-root",
+                            status=SessionStatus.COMPLETED,
+                        )
+
+                fake = _FakeOrchestrator()
+                state._create_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+                await state.start_run("demo task")
+                assert state.session_task is not None
+                await state.session_task
+                self.assertIsNone(state.project_dir)
+                self.assertIsNotNone(state.remote_config)
+                assert state.remote_config is not None
+                self.assertEqual(state.remote_config.remote_dir, "/home/demo/workspace")
+
+        asyncio.run(run())
+
     def test_start_run_with_configured_session_uses_run_task_in_session(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -927,6 +998,77 @@ model = "openai/gpt-4o-mini"
                 self.assertEqual(fake.model, "openai/gpt-4.1")
                 self.assertEqual(fake.root_agent_name, "Root Beta")
                 self.assertFalse(fake.run_task_called)
+                self.assertEqual(state.current_session_status, "completed")
+
+        asyncio.run(run())
+
+    def test_continue_task_remote_keeps_project_dir_none_after_resume(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=None,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+                state.set_launch_config(
+                    project_dir=None,
+                    session_id=None,
+                    session_mode="direct",
+                    remote={
+                        "kind": "remote_ssh",
+                        "ssh_target": "demo@example.com:2222",
+                        "remote_dir": "/home/demo/workspace",
+                        "auth_mode": "key",
+                        "identity_file": "~/.ssh/id_ed25519",
+                        "known_hosts_policy": "accept_new",
+                        "remote_os": "linux",
+                    },
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+
+                    async def resume(
+                        self,
+                        session_id: str,
+                        instruction: str,
+                        model: str | None = None,
+                        reactivate_agent_id: str | None = None,
+                        run_root_agent: bool = True,
+                        remote_password: str | None = None,
+                        enabled_skill_ids: list[str] | None = None,
+                    ) -> RunSession:
+                        del (
+                            session_id,
+                            instruction,
+                            model,
+                            reactivate_agent_id,
+                            run_root_agent,
+                            remote_password,
+                            enabled_skill_ids,
+                        )
+                        return RunSession(
+                            id="session-remote-2",
+                            project_dir=Path("/home/demo/workspace"),
+                            task="resume task",
+                            locale="en",
+                            root_agent_id="agent-root",
+                            status=SessionStatus.COMPLETED,
+                        )
+
+                state.orchestrator = _FakeOrchestrator()  # type: ignore[assignment]
+                await state._continue_task(
+                    "session-remote-2",
+                    "resume task",
+                    "openai/gpt-4.1",
+                )
+                self.assertIsNone(state.project_dir)
+                self.assertEqual(state.current_session_id, "session-remote-2")
                 self.assertEqual(state.current_session_status, "completed")
 
         asyncio.run(run())

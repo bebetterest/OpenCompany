@@ -112,6 +112,9 @@ class RunSession:
     final_summary: str | None = None
     completion_state: str | None = None
     follow_up_needed: bool = False
+    enabled_skill_ids: list[str] = field(default_factory=list)
+    skill_bundle_root: str = ""
+    skills_state: dict[str, Any] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 
 

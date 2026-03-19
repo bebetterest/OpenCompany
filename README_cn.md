@@ -31,6 +31,7 @@
 - 📏 限制策略：内置工具调用时长限制、可创建 agent 数限制、活跃 agent 数限制；当步数或上下文达到阈值时定期注入提醒；上下文超长会强制压缩。
 - 🌐 项目环境：支持本地目录与远程 SSH Linux 目录作为执行环境。
 - 📝 工作区模式：支持 `Direct` 与 `Staged`；`Direct` 直接写入项目目录，`Staged` 先暂存 diff 并在用户审批后应用（远程仅支持 `Direct`）。
+- 🧰 Skills：session 可启用来自项目源/全局源的可复用 skill bundle；选中的 skills 会物化到 `.opencompany_skills/<session_id>/...`，并由 workers 继承使用。
 - 🔒 安全性：支持 `anthropic` [sandbox（SRT）](https://github.com/anthropic-experimental/sandbox-runtime) 与 `none`（不受限）两种运行后端。
 - 🖥️ 三种界面：支持 Web UI / TUI / CLI，推荐 Web UI（可视化支持中英双语，可查看会话总览、协作结构、各 agent 详情、工具与引导信息，并支持创建/导入会话、修改配置、创建/引导/终止 agent、打开 agent 环境终端等操作）。
 - 🤖 LLM 接入：支持通过 [OpenRouter](https://openrouter.ai/) 调用模型。
@@ -159,6 +160,55 @@ opencompany run \
   "Inspect this repository and propose next engineering steps."
 ```
 
+发现可用 skills：
+
+```bash
+opencompany skills
+opencompany skills --project-dir /path/to/target
+opencompany skills --remote-target demo@example.com:22 --remote-dir /home/demo/workspace --remote-auth key --remote-key-path ~/.ssh/id_ed25519
+```
+
+添加 skill：
+
+- 把 skill 目录放到 `<project_dir>/skills/` 或 `<app_dir>/skills/` 下即可参与发现。
+- 但不是只有目录名就行；一个有效 skill 至少要包含 `skill.toml` 和 `SKILL.md`。
+- 如果项目源和全局源里存在同一个 `skill_id`，项目源会覆盖全局源。
+
+```text
+<project_dir>/skills/<skill_id>/
+  skill.toml
+  SKILL.md
+  SKILL_cn.md        # 可选
+  resources/...      # 可选；可包含文本、脚本或二进制文件
+```
+
+最小 `skill.toml` 示例：
+
+```toml
+[skill]
+id = "repo-map"
+name = "Repo Map"
+name_cn = "仓库地图"
+description = "Explain the repository layout and key entry points."
+description_cn = "解释仓库结构和关键入口。"
+tags = ["docs", "navigation"]
+```
+
+添加后可用下面的命令确认是否发现成功：
+
+```bash
+opencompany skills --project-dir /path/to/target
+```
+
+显式启用 skills 运行：
+
+```bash
+opencompany run \
+  --skill repo-map \
+  --skill release-notes \
+  "Inspect this repository and propose next engineering steps."
+```
+
 在 direct 模式下连接远程 SSH 工作区执行：
 
 ```bash
@@ -176,6 +226,7 @@ opencompany run \
 ```bash
 opencompany resume <session_id> "new instruction"
 opencompany resume <session_id> --sandbox-backend anthropic --model openai/gpt-4.1-mini "new instruction"
+opencompany resume <session_id> --skill repo-map --skill release-notes "new instruction"
 ```
 
 若希望先分叉出一个副本，再继续执行：

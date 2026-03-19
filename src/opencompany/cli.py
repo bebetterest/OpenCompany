@@ -158,6 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional custom display name for the root coordinator in this run.",
     )
     run_parser.add_argument(
+        "--skill",
+        action="append",
+        dest="skills",
+        default=None,
+        help="Enable a skill id for this run. Repeat to select multiple skills.",
+    )
+    run_parser.add_argument(
         "--preview-chars",
         type=int,
         default=_RUN_PREVIEW_CHARS_DEFAULT,
@@ -189,6 +196,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_parser.add_argument("--model", default=None, help="Override model for this resume")
     resume_parser.add_argument(
+        "--skill",
+        action="append",
+        dest="skills",
+        default=None,
+        help="Replace the enabled skill set for this resume. Repeat to select multiple skills.",
+    )
+    resume_parser.add_argument(
         "--preview-chars",
         type=int,
         default=_RUN_PREVIEW_CHARS_DEFAULT,
@@ -215,6 +229,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
     )
+
+    skills_parser = subparsers.add_parser(
+        "skills",
+        help="Discover available skills from project and global sources",
+    )
+    skills_parser.add_argument("--project-dir", default=".", help="Target project directory")
+    skills_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    skills_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    skills_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+    )
+    add_remote_options(skills_parser)
 
     export_parser = subparsers.add_parser(
         "export-logs",
@@ -1800,6 +1828,7 @@ async def _run_task(
     remote_password: str | None = None,
     model: str | None = None,
     root_agent_name: str | None = None,
+    enabled_skill_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1826,6 +1855,7 @@ async def _run_task(
             "sandbox_backend": resolved_sandbox_backend,
             "model": resolved_model,
             "root_agent_name": resolved_root_agent_name,
+            "enabled_skill_ids": list(enabled_skill_ids or []),
         },
     )
     session = None
@@ -1837,6 +1867,8 @@ async def _run_task(
             run_kwargs["root_agent_name"] = resolved_root_agent_name
         if workspace_mode:
             run_kwargs["workspace_mode"] = workspace_mode
+        if enabled_skill_ids is not None:
+            run_kwargs["enabled_skill_ids"] = enabled_skill_ids
         if remote_config is not None:
             run_kwargs["remote_config"] = remote_config
             if remote_password:
@@ -1871,6 +1903,7 @@ async def _resume(
     instruction: str,
     debug: bool,
     model: str | None = None,
+    enabled_skill_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1900,6 +1933,7 @@ async def _resume(
             "source_session_id": normalized_session_id,
             "sandbox_backend": resolved_sandbox_backend,
             "model": resolved_model,
+            "enabled_skill_ids": list(enabled_skill_ids or []),
         },
     )
     session = None
@@ -1911,6 +1945,8 @@ async def _resume(
         resume_kwargs: dict[str, Any] = {}
         if resolved_model:
             resume_kwargs["model"] = resolved_model
+        if enabled_skill_ids is not None:
+            resume_kwargs["enabled_skill_ids"] = enabled_skill_ids
         if remote_password:
             resume_kwargs["remote_password"] = remote_password
         session = await orchestrator.resume(
@@ -1938,6 +1974,24 @@ async def _resume(
     print(f"session_status={session.status.value}")
     print(f"completion_state={session.completion_state}")
     _maybe_apply_staged_changes(orchestrator, session.id)
+
+
+async def _skills(
+    project_dir: Path,
+    app_dir: Path | None,
+    locale: str | None,
+    debug: bool,
+    *,
+    remote_config: RemoteSessionConfig | None = None,
+    remote_password: str | None = None,
+) -> None:
+    orchestrator = Orchestrator(project_dir, locale=locale, app_dir=app_dir, debug=debug)
+    skills = await orchestrator.discover_skills(
+        project_dir=None if remote_config is not None else project_dir,
+        remote_config=remote_config,
+        remote_password=remote_password,
+    )
+    print(json.dumps(skills, ensure_ascii=False, indent=2))
 
 
 def _clone_session(
@@ -2570,6 +2624,7 @@ def main() -> None:
                     remote_password=remote_password,
                     model=getattr(args, "model", None),
                     root_agent_name=getattr(args, "root_agent_name", None),
+                    enabled_skill_ids=getattr(args, "skills", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)),
                 )
@@ -2583,10 +2638,26 @@ def main() -> None:
                     args.instruction,
                     bool(args.debug),
                     model=getattr(args, "model", None),
+                    enabled_skill_ids=getattr(args, "skills", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(
                         getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)
                     ),
+                )
+            )
+        elif args.command == "skills":
+            remote_config, remote_password = _remote_cli_config_from_args(
+                args,
+                command_name="skills",
+            )
+            asyncio.run(
+                _skills(
+                    project_dir or Path(".").resolve(),
+                    app_dir,
+                    args.locale,
+                    bool(args.debug),
+                    remote_config=remote_config,
+                    remote_password=remote_password,
                 )
             )
         elif args.command == "clone":

@@ -599,6 +599,12 @@ class ToolExecutor:
             metadata={
                 "created_at": utc_now(),
                 "model": self.config.llm.openrouter.model_for_role(AgentRole.WORKER.value),
+                **(
+                    {"skills_catalog": json_ready(parent.metadata.get("skills_catalog"))}
+                    if isinstance(parent.metadata, dict)
+                    and isinstance(parent.metadata.get("skills_catalog"), dict)
+                    else {}
+                ),
             },
         )
         child.conversation = [
