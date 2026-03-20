@@ -19,14 +19,19 @@ from opencompany.mcp.models import (
     synthetic_tool_name,
     truncate_text_payload,
 )
+from opencompany.mcp.oauth import McpOAuthStore, McpOAuthTokenProvider
 from opencompany.mcp.session import (
+    LegacySseMcpTransport,
     McpClientSession,
     McpError,
     McpRequestError,
     StdioMcpTransport,
     StreamableHttpMcpTransport,
+    derive_legacy_sse_url,
+    normalize_streamable_http_url,
 )
 from opencompany.models import AgentNode, AgentRole, RunSession
+from opencompany.paths import RuntimePaths
 from opencompany.utils import utc_now
 
 if TYPE_CHECKING:
@@ -107,8 +112,54 @@ class _AgentMcpContext:
     tool_executor: Any | None = None
     servers: dict[str, _AgentServerContext] = field(default_factory=dict)
 
+    @staticmethod
+    def _distinct_strings(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for item in values:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
     def metadata_payload(self) -> dict[str, Any]:
-        entries = [ctx.runtime_state.to_dict() for ctx in self.servers.values()]
+        entries: list[dict[str, Any]] = []
+        for _server_id, ctx in sorted(self.servers.items()):
+            entry = ctx.runtime_state.to_dict()
+            tool_names = self._distinct_strings(
+                [descriptor.tool_name for descriptor in ctx.tool_descriptors]
+            )
+            tool_items = [
+                {
+                    "tool_name": descriptor.tool_name,
+                    "title": descriptor.title,
+                    "description": descriptor.description,
+                    "synthetic_name": descriptor.synthetic_name,
+                }
+                for descriptor in ctx.tool_descriptors
+            ]
+            resource_uris = self._distinct_strings([resource.uri for resource in ctx.resources])
+            resource_names = self._distinct_strings(
+                [resource.title or resource.name or resource.uri for resource in ctx.resources]
+            )
+            resource_items = [
+                {
+                    "uri": resource.uri,
+                    "name": resource.name,
+                    "title": resource.title,
+                    "description": resource.description,
+                    "mime_type": resource.mime_type,
+                }
+                for resource in ctx.resources
+            ]
+            entry["tool_names"] = tool_names
+            entry["tool_items"] = tool_items
+            entry["resource_uris"] = resource_uris
+            entry["resource_names"] = resource_names
+            entry["resource_items"] = resource_items
+            entries.append(entry)
         warnings = [
             {
                 "server_id": server_id,
@@ -161,6 +212,8 @@ class McpManager:
                     "command": str(server.command or ""),
                     "args": list(server.args),
                     "url": str(server.url or ""),
+                    "oauth_enabled": bool(server.oauth_enabled),
+                    "oauth_scopes": list(server.oauth_scopes),
                 }
             )
         return rows
@@ -502,6 +555,12 @@ class McpManager:
                     tool_executor=tool_executor,
                 )
             except Exception as exc:
+                self._maybe_clear_oauth_on_unauthorized(
+                    server=existing.server,
+                    session_id=context.session_id,
+                    agent_id=context.agent_id,
+                    error=exc,
+                )
                 await self._mark_server_unavailable(
                     context=context,
                     server_context=existing,
@@ -544,6 +603,7 @@ class McpManager:
             workspace_is_remote=context.workspace_is_remote,
         )
         runtime_state.roots_enabled = roots_enabled
+        runtime_state.transport = server.transport
         if server.transport == "stdio" and context.workspace_is_remote:
             await self._mark_server_unavailable(
                 context=context,
@@ -590,13 +650,24 @@ class McpManager:
                 return
             pending_notifications.append((method, normalized_params))
 
-        try:
+        async def _open_session(
+            *,
+            runtime_transport: str,
+            url_override: str = "",
+        ):
+            nonlocal session, transport
+            runtime_state.transport = runtime_transport
+            runtime_url = normalize_streamable_http_url(
+                str(url_override or server.url or "").strip()
+            )
             transport = await self._build_transport(
                 context=context,
                 server=server,
                 tool_executor=tool_executor,
                 on_message=_on_message,
                 on_diagnostic=_on_diagnostic,
+                runtime_transport=runtime_transport,
+                url_override=url_override,
             )
             self._log_diagnostic(
                 "mcp_connect_started",
@@ -604,8 +675,9 @@ class McpManager:
                 agent_id=context.agent_id,
                 payload={
                     "server_id": server.id,
-                    "transport": server.transport,
+                    "transport": runtime_transport,
                     "workspace_is_remote": context.workspace_is_remote,
+                    "url": runtime_url,
                 },
             )
             session = McpClientSession(
@@ -624,7 +696,73 @@ class McpManager:
             session_ref["session"] = session
             for message in pending_messages:
                 await session.handle_message(message)
-            initialization = await session.initialize(roots_enabled=roots_enabled)
+            return await session.initialize(roots_enabled=roots_enabled)
+
+        try:
+            try:
+                initialization = await _open_session(runtime_transport=server.transport)
+            except Exception as primary_exc:
+                fallback_url = self._legacy_sse_fallback_url(
+                    server=server,
+                    error=primary_exc,
+                )
+                if not fallback_url:
+                    raise
+                self._log_diagnostic(
+                    "mcp_transport_fallback_started",
+                    session_id=context.session_id,
+                    agent_id=context.agent_id,
+                    payload={
+                        "server_id": server.id,
+                        "from_transport": server.transport,
+                        "to_transport": "sse",
+                        "fallback_url": fallback_url,
+                        "error": str(primary_exc),
+                    },
+                )
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        await session.close()
+                elif transport is not None:
+                    with contextlib.suppress(Exception):
+                        await transport.close()
+                session = None
+                transport = None
+                session_ref.pop("session", None)
+                pending_messages.clear()
+                pending_notifications.clear()
+                try:
+                    initialization = await _open_session(
+                        runtime_transport="sse",
+                        url_override=fallback_url,
+                    )
+                except Exception as fallback_exc:
+                    self._log_diagnostic(
+                        "mcp_transport_fallback_failed",
+                        level="warning",
+                        session_id=context.session_id,
+                        agent_id=context.agent_id,
+                        payload={
+                            "server_id": server.id,
+                            "from_transport": server.transport,
+                            "to_transport": "sse",
+                            "fallback_url": fallback_url,
+                            "primary_error": str(primary_exc),
+                            "fallback_error": str(fallback_exc),
+                        },
+                    )
+                    raise fallback_exc from primary_exc
+                self._log_diagnostic(
+                    "mcp_transport_fallback_succeeded",
+                    session_id=context.session_id,
+                    agent_id=context.agent_id,
+                    payload={
+                        "server_id": server.id,
+                        "from_transport": server.transport,
+                        "to_transport": "sse",
+                        "fallback_url": fallback_url,
+                    },
+                )
             server_context.session = session
             runtime_state.connected = True
             runtime_state.protocol_version = initialization.protocol_version
@@ -662,8 +800,11 @@ class McpManager:
         tool_executor: "ToolExecutor",
         on_message: Any,
         on_diagnostic: Any,
+        runtime_transport: str | None = None,
+        url_override: str = "",
     ):
-        if server.transport == "stdio":
+        normalized_transport = str(runtime_transport or server.transport or "").strip() or server.transport
+        if normalized_transport == "stdio":
             transport_box: dict[str, StdioMcpTransport] = {}
 
             async def _on_stdout(_channel: str, text: str) -> None:
@@ -703,11 +844,34 @@ class McpManager:
             for key, value in server.headers.items()
             if key
         }
+        oauth_provider = None
+        if server.oauth_enabled:
+            oauth_provider = McpOAuthTokenProvider(
+                server=server,
+                store_path=RuntimePaths.create(
+                    self.app_dir,
+                    self.config,
+                ).mcp_oauth_tokens_path,
+            )
+        resolved_url = normalize_streamable_http_url(str(url_override or server.url or "").strip())
+        user_agent = f"{(self.config.project.name or 'OpenCompany').strip() or 'OpenCompany'}/0.1.0"
+        if normalized_transport == "sse":
+            return LegacySseMcpTransport(
+                url=resolved_url,
+                headers=headers,
+                timeout_seconds=max(float(server.timeout_seconds or 30.0), 1.0),
+                oauth_provider=oauth_provider,
+                user_agent=user_agent,
+                on_message=on_message,
+                on_diagnostic=on_diagnostic,
+            )
         return StreamableHttpMcpTransport(
-            url=server.url,
+            url=resolved_url,
             headers=headers,
             protocol_version=self.config.mcp.protocol_version,
             timeout_seconds=max(float(server.timeout_seconds or 30.0), 1.0),
+            oauth_provider=oauth_provider,
+            user_agent=user_agent,
             on_message=on_message,
             on_diagnostic=on_diagnostic,
         )
@@ -802,12 +966,29 @@ class McpManager:
     ) -> None:
         if server_context.session is None:
             return
-        result = await self._list_all_pages(
-            context=context,
-            server_context=server_context,
-            method="resources/list",
-            key="resources",
-        )
+        try:
+            result = await self._list_all_pages(
+                context=context,
+                server_context=server_context,
+                method="resources/list",
+                key="resources",
+            )
+        except McpRequestError as exc:
+            if not self._is_method_not_found_error(exc):
+                raise
+            server_context.resources = []
+            server_context.runtime_state.resource_count = 0
+            server_context.runtime_state.resources_dirty = False
+            self._log_diagnostic(
+                "mcp_resources_not_supported",
+                session_id=context.session_id,
+                agent_id=context.agent_id,
+                payload={
+                    "server_id": server_context.server.id,
+                    "error": str(exc),
+                },
+            )
+            return
         descriptors: list[McpResourceDescriptor] = []
         for item in result:
             if not isinstance(item, dict):
@@ -1006,6 +1187,15 @@ class McpManager:
     def _is_session_not_found_error(error: McpError) -> bool:
         return "404" in str(error)
 
+    @staticmethod
+    def _is_method_not_found_error(error: Exception) -> bool:
+        if isinstance(error, McpRequestError):
+            with contextlib.suppress(Exception):
+                if int(error.code) == -32601:
+                    return True
+        detail = str(error or "").strip().lower()
+        return "method not found" in detail or "unsupported mcp method" in detail
+
     def _require_context(self, *, session_id: str, agent_id: str) -> _AgentMcpContext:
         context = self._agent_contexts.get((session_id, agent_id))
         if context is None:
@@ -1091,6 +1281,7 @@ class McpManager:
         server_context.tool_by_synthetic_name = {}
         server_context.resources = []
         server_context.runtime_state.connected = False
+        server_context.runtime_state.transport = server_context.server.transport
         server_context.runtime_state.protocol_version = ""
         server_context.runtime_state.warning = str(warning or "").strip()
         server_context.runtime_state.tool_count = 0
@@ -1104,6 +1295,117 @@ class McpManager:
         if detail:
             return detail
         return f"MCP server '{server_id}' is unavailable."
+
+    @staticmethod
+    def _legacy_sse_fallback_url(*, server: McpServerConfig, error: Exception) -> str:
+        if server.transport != "streamable_http":
+            return ""
+        detail = str(error or "").strip().lower()
+        if "requires oauth login" in detail or "login expired" in detail:
+            return ""
+        return derive_legacy_sse_url(server.url)
+
+    def _maybe_clear_oauth_on_unauthorized(
+        self,
+        *,
+        server: McpServerConfig,
+        session_id: str,
+        agent_id: str,
+        error: Exception,
+    ) -> None:
+        if not server.oauth_enabled:
+            return
+        detail = str(error or "").strip().lower()
+        if "401 unauthorized" not in detail:
+            return
+        should_clear = self._should_clear_oauth_after_unauthorized(detail)
+        removed = False
+        record_snapshot: dict[str, Any] = {
+            "token_record_present": False,
+            "resource": "",
+            "authorization_server": "",
+            "scope": "",
+            "expires_at": None,
+            "updated_at": "",
+            "client_id_present": False,
+            "refresh_token_present": False,
+        }
+        try:
+            token_store = McpOAuthStore(
+                RuntimePaths.create(
+                    self.app_dir,
+                    self.config,
+                ).mcp_oauth_tokens_path
+            )
+            record = token_store.load_record(server.id)
+            if record is not None:
+                record_snapshot = {
+                    "token_record_present": True,
+                    "resource": str(record.resource or "").strip(),
+                    "authorization_server": str(record.authorization_server or "").strip(),
+                    "scope": str(record.scope or "").strip(),
+                    "expires_at": record.expires_at,
+                    "updated_at": str(record.updated_at or "").strip(),
+                    "client_id_present": bool(str(record.client_id or "").strip()),
+                    "refresh_token_present": bool(str(record.refresh_token or "").strip()),
+                }
+            if should_clear:
+                removed = token_store.delete_record(server.id)
+        except Exception as clear_exc:
+            self._log_diagnostic(
+                "mcp_oauth_clear_failed",
+                level="warning",
+                session_id=session_id,
+                agent_id=agent_id,
+                payload={
+                    "server_id": server.id,
+                    "error": str(clear_exc),
+                },
+            )
+            return
+        self._log_diagnostic(
+            (
+                "mcp_oauth_cleared_due_unauthorized"
+                if should_clear
+                else "mcp_oauth_preserved_after_unauthorized"
+            ),
+            level="warning",
+            session_id=session_id,
+            agent_id=agent_id,
+            payload={
+                "server_id": server.id,
+                "should_clear": should_clear,
+                "removed": removed,
+                **record_snapshot,
+            },
+        )
+
+    @staticmethod
+    def _should_clear_oauth_after_unauthorized(detail: str) -> bool:
+        normalized = str(detail or "").lower()
+        if not normalized:
+            return False
+        # Preserve tokens for most 401 responses so users can inspect the
+        # real server-side error and retry/re-login explicitly in UI.
+        preserve_markers = (
+            "restricted from accessing the public api",
+            "insufficient scope",
+            "insufficient_scope",
+            "permission denied",
+            "not authorized",
+            "workspace",
+        )
+        if any(marker in normalized for marker in preserve_markers):
+            return False
+        clear_markers = (
+            "requires oauth login",
+            "oauth login expired",
+            "refresh token is missing",
+            "invalid_grant",
+            "invalid_token",
+            "invalid token",
+        )
+        return any(marker in normalized for marker in clear_markers)
 
     def _sanitize_json_payload(self, value: Any) -> Any:
         if isinstance(value, str):

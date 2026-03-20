@@ -85,9 +85,12 @@ const state = {
   },
   skillsUi: {
     discovering: false,
+    expanded: false,
   },
   mcpUi: {
     discovering: false,
+    expanded: false,
+    loginFlows: {},
   },
   sessionsDir: "",
   appDir: "",
@@ -248,7 +251,12 @@ const dom = {
   modelInput: document.getElementById("model-input"),
   rootAgentNameLabel: document.getElementById("root-agent-name-label"),
   rootAgentNameInput: document.getElementById("root-agent-name-input"),
+  skillsShell: document.getElementById("skills-shell"),
+  skillsToggleButton: document.getElementById("skills-toggle-button"),
   skillsLabel: document.getElementById("skills-label"),
+  skillsSummary: document.getElementById("skills-summary"),
+  skillsToggleState: document.getElementById("skills-toggle-state"),
+  skillsPanelBody: document.getElementById("skills-panel-body"),
   skillsInput: document.getElementById("skills-input"),
   skillsDiscoverButton: document.getElementById("skills-discover-button"),
   skillsSelectAllButton: document.getElementById("skills-select-all-button"),
@@ -257,12 +265,19 @@ const dom = {
   skillsSelected: document.getElementById("skills-selected"),
   skillsList: document.getElementById("skills-list"),
   skillsWarnings: document.getElementById("skills-warnings"),
+  mcpShell: document.getElementById("mcp-shell"),
+  mcpToggleButton: document.getElementById("mcp-toggle-button"),
   mcpLabel: document.getElementById("mcp-label"),
+  mcpSummary: document.getElementById("mcp-summary"),
+  mcpToggleState: document.getElementById("mcp-toggle-state"),
+  mcpPanelBody: document.getElementById("mcp-panel-body"),
   mcpInput: document.getElementById("mcp-input"),
   mcpDiscoverButton: document.getElementById("mcp-discover-button"),
+  mcpUseDefaultsButton: document.getElementById("mcp-use-defaults-button"),
   mcpSelectAllButton: document.getElementById("mcp-select-all-button"),
   mcpClearButton: document.getElementById("mcp-clear-button"),
   mcpStatus: document.getElementById("mcp-status"),
+  mcpInsight: document.getElementById("mcp-insight"),
   mcpSelected: document.getElementById("mcp-selected"),
   mcpList: document.getElementById("mcp-list"),
   mcpWarnings: document.getElementById("mcp-warnings"),
@@ -514,6 +529,10 @@ function availableMcpServers() {
     : [];
 }
 
+function truthyFlag(value) {
+  return value === true || String(value) === "true";
+}
+
 function mergedMcpServerCatalog() {
   const catalog = new Map();
   availableMcpServers().forEach((server) => {
@@ -523,6 +542,7 @@ function mergedMcpServerCatalog() {
     }
     catalog.set(serverId, {
       ...server,
+      config_enabled: truthyFlag(server.enabled),
       discovered: true,
     });
   });
@@ -536,6 +556,9 @@ function mergedMcpServerCatalog() {
       ...current,
       ...entry,
       id: serverId,
+      config_enabled:
+        typeof current.config_enabled === "boolean" ? current.config_enabled : undefined,
+      session_enabled: truthyFlag(entry.enabled),
       discovered: Boolean(current.discovered),
       materialized: true,
     });
@@ -543,6 +566,605 @@ function mergedMcpServerCatalog() {
   return [...catalog.values()].sort((left, right) =>
     String(left.id || "").localeCompare(String(right.id || ""))
   );
+}
+
+function configDefaultMcpServerIds(catalog = mergedMcpServerCatalog()) {
+  return catalog
+    .filter((server) => typeof server?.config_enabled === "boolean" && server.config_enabled)
+    .map((server) => String(server.id || "").trim())
+    .filter(Boolean);
+}
+
+function nonNegativeCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(parsed));
+}
+
+function mcpToolCount(server) {
+  const explicitCount = nonNegativeCount(server?.tool_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const runtimeItems = mcpRuntimeToolItems(server);
+  if (runtimeItems.length > 0) {
+    return runtimeItems.length;
+  }
+  if (Array.isArray(server?.tools)) {
+    return server.tools.filter((item) => item && typeof item === "object").length;
+  }
+  return 0;
+}
+
+function mcpResourceCount(server) {
+  const explicitCount = nonNegativeCount(server?.resource_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const runtimeItems = mcpRuntimeResourceItems(server);
+  if (runtimeItems.length > 0) {
+    return runtimeItems.length;
+  }
+  if (Array.isArray(server?.resources)) {
+    return server.resources.filter((item) => item && typeof item === "object").length;
+  }
+  return 0;
+}
+
+function mcpConnectedCount(entries = currentMcpEntries()) {
+  return entries.filter((entry) => truthyFlag(entry?.connected)).length;
+}
+
+function totalMcpToolCount(entries = currentMcpEntries()) {
+  return entries.reduce((total, entry) => total + mcpToolCount(entry), 0);
+}
+
+function totalMcpResourceCount(entries = currentMcpEntries()) {
+  return entries.reduce((total, entry) => total + mcpResourceCount(entry), 0);
+}
+
+function sameIdSet(leftValues, rightValues) {
+  const left = [...new Set((Array.isArray(leftValues) ? leftValues : []).map((item) => String(item || "").trim()).filter(Boolean))].sort();
+  const right = [...new Set((Array.isArray(rightValues) ? rightValues : []).map((item) => String(item || "").trim()).filter(Boolean))].sort();
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
+}
+
+function uniqueTextValues(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  const seen = new Set();
+  const normalized = [];
+  for (const item of values) {
+    const text = String(item || "").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    normalized.push(text);
+  }
+  return normalized;
+}
+
+function mcpConfigStateText(server) {
+  if (typeof server?.config_enabled !== "boolean") {
+    return t("unset_value");
+  }
+  return server.config_enabled ? t("mcp_config_enabled") : t("mcp_config_disabled");
+}
+
+function mcpEndpointLabel(server) {
+  return String(server?.transport || "").trim() === "stdio"
+    ? t("mcp_command_label")
+    : t("mcp_endpoint_label");
+}
+
+function mcpEndpointValue(server) {
+  if (!server || typeof server !== "object") {
+    return "";
+  }
+  const transport = String(server.transport || "").trim();
+  if (transport === "stdio") {
+    const command = String(server.command || "").trim();
+    const args = Array.isArray(server.args)
+      ? server.args.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    return [command, ...args].filter(Boolean).join(" ");
+  }
+  return String(server.url || "").trim();
+}
+
+function mcpRootsPolicyText(server) {
+  if (!server || typeof server !== "object") {
+    return t("unset_value");
+  }
+  if (server.expose_roots === true || String(server.expose_roots) === "true") {
+    return t("mcp_roots_on");
+  }
+  if (server.expose_roots === false || String(server.expose_roots) === "false") {
+    return t("mcp_roots_off");
+  }
+  return t("mcp_roots_auto");
+}
+
+function mcpRootsRuntimeText(server) {
+  if (!server || typeof server !== "object" || !server.materialized) {
+    return t("mcp_pending_materialization");
+  }
+  return truthyFlag(server.roots_enabled) ? t("mcp_roots_exposed") : t("mcp_roots_not_exposed");
+}
+
+function mcpAllowedToolsText(server) {
+  const allowedTools = uniqueTextValues(server?.allowed_tools);
+  return allowedTools.length ? allowedTools.join(", ") : t("mcp_allowed_tools_all");
+}
+
+function mcpRuntimeToolItems(server) {
+  const runtimeItems = [];
+  const seen = new Set();
+  if (Array.isArray(server?.tool_items)) {
+    for (const item of server.tool_items) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const toolName = String(item.tool_name || "").trim();
+      const title = String(item.title || "").trim();
+      const syntheticName = String(item.synthetic_name || "").trim();
+      const description = String(item.description || "").trim();
+      const label = toolName || title || syntheticName;
+      if (!label || seen.has(label)) {
+        continue;
+      }
+      seen.add(label);
+      runtimeItems.push({
+        label,
+        tool_name: toolName,
+        title,
+        synthetic_name: syntheticName,
+        description,
+      });
+    }
+  }
+  if (runtimeItems.length) {
+    return runtimeItems;
+  }
+  const names = uniqueTextValues(server?.tool_names);
+  for (const name of names) {
+    if (seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    runtimeItems.push({
+      label: name,
+      tool_name: name,
+      title: "",
+      synthetic_name: "",
+      description: "",
+    });
+  }
+  return runtimeItems;
+}
+
+function mcpRuntimeResourceItems(server) {
+  const runtimeItems = [];
+  const seen = new Set();
+  if (Array.isArray(server?.resource_items)) {
+    for (const item of server.resource_items) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const uri = String(item.uri || "").trim();
+      const name = String(item.name || "").trim();
+      const title = String(item.title || "").trim();
+      const description = String(item.description || "").trim();
+      const mimeType = String(item.mime_type || "").trim();
+      const label = title || name || uri;
+      if (!label || seen.has(label)) {
+        continue;
+      }
+      seen.add(label);
+      runtimeItems.push({
+        label,
+        uri,
+        name,
+        title,
+        description,
+        mime_type: mimeType,
+      });
+    }
+  }
+  if (runtimeItems.length) {
+    return runtimeItems;
+  }
+  const names = uniqueTextValues(server?.resource_names);
+  const uris = uniqueTextValues(server?.resource_uris);
+  const fallbackRefs = names.length ? names : uris;
+  for (const ref of fallbackRefs) {
+    if (seen.has(ref)) {
+      continue;
+    }
+    seen.add(ref);
+    runtimeItems.push({
+      label: ref,
+      uri: uris.includes(ref) ? ref : "",
+      name: "",
+      title: "",
+      description: "",
+      mime_type: "",
+    });
+  }
+  return runtimeItems;
+}
+
+function mcpToolHoverText(toolItem) {
+  const description = String(toolItem?.description || "").trim();
+  if (description) {
+    return description;
+  }
+  const title = String(toolItem?.title || "").trim();
+  if (title) {
+    return title;
+  }
+  return t("mcp_definition_unavailable");
+}
+
+function mcpResourceHoverText(resourceItem) {
+  const description = String(resourceItem?.description || "").trim();
+  if (description) {
+    return description;
+  }
+  const parts = [];
+  const uri = String(resourceItem?.uri || "").trim();
+  if (uri) {
+    parts.push(uri);
+  }
+  const mimeType = String(resourceItem?.mime_type || "").trim();
+  if (mimeType) {
+    parts.push(mimeType);
+  }
+  if (parts.length) {
+    return parts.join(" · ");
+  }
+  return t("mcp_definition_unavailable");
+}
+
+function renderMcpStructurePills(items, hoverTextFn) {
+  if (!items.length) {
+    return escapeHtml(t("none_value"));
+  }
+  return `<div class="structure-pill-row">${items
+    .map((item) => {
+      const label = String(item?.label || "").trim();
+      if (!label) {
+        return "";
+      }
+      const hover = String(hoverTextFn(item) || "").trim() || t("mcp_definition_unavailable");
+      return `<span class="structure-pill" title="${escapeHtml(hover)}">${escapeHtml(label)}</span>`;
+    })
+    .join("")}</div>`;
+}
+
+function skillFileRelativePaths(skill) {
+  if (!skill || typeof skill !== "object" || !Array.isArray(skill.files)) {
+    return [];
+  }
+  return uniqueTextValues(
+    skill.files.map((file) => (file && typeof file === "object" ? file.relative_path : ""))
+  );
+}
+
+function skillResourceCount(skill) {
+  const explicitCount = nonNegativeCount(skill?.resource_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const files = skillFileRelativePaths(skill);
+  if (files.length > 0) {
+    return files.length;
+  }
+  return 0;
+}
+
+function skillPathsBySegment(paths, segment) {
+  const needle = String(segment || "").trim();
+  if (!needle) {
+    return [];
+  }
+  return uniqueTextValues(
+    paths.filter((path) => {
+      const normalized = String(path || "").trim();
+      if (!normalized) {
+        return false;
+      }
+      return normalized === needle || normalized.startsWith(`${needle}/`) || normalized.includes(`/${needle}/`);
+    })
+  );
+}
+
+function skillDocPaths(skill) {
+  return uniqueTextValues([skill?.main_doc_path, skill?.localized_doc_path]);
+}
+
+function skillStructureRows(skill) {
+  const rows = [];
+  const docs = skillDocPaths(skill);
+  if (docs.length) {
+    rows.push([t("docs_label"), docs.join(", ")]);
+  }
+  const files = skillFileRelativePaths(skill);
+  if (files.length) {
+    rows.push([t("files_label"), String(files.length)]);
+    const scripts = skillPathsBySegment(files, "scripts");
+    if (scripts.length) {
+      rows.push([t("scripts_label"), scripts.join(", ")]);
+    }
+    const assets = skillPathsBySegment(files, "assets");
+    if (assets.length) {
+      rows.push([t("assets_label"), assets.join(", ")]);
+    }
+  } else {
+    const resourceHint = skillResourceCount(skill);
+    if (resourceHint > 0) {
+      rows.push([t("files_label"), String(resourceHint)]);
+    }
+  }
+  if (!rows.length) {
+    rows.push([t("structure_label"), t("skills_structure_unavailable")]);
+  }
+  return rows;
+}
+
+function mcpStructureRows(server) {
+  const rows = [];
+  const toolItems = mcpRuntimeToolItems(server);
+  const resourceItems = mcpRuntimeResourceItems(server);
+  const toolCount = mcpToolCount(server);
+  const resourceCount = mcpResourceCount(server);
+  const toolsValueHtml = toolItems.length
+    ? renderMcpStructurePills(toolItems, mcpToolHoverText)
+    : escapeHtml(toolCount > 0 ? String(toolCount) : mcpAllowedToolsText(server));
+  const resourcesValueHtml = resourceItems.length
+    ? renderMcpStructurePills(resourceItems, mcpResourceHoverText)
+    : escapeHtml(resourceCount > 0 ? String(resourceCount) : t("none_value"));
+  rows.push([t("tools_label"), toolsValueHtml, true]);
+  rows.push([t("resources_label"), resourcesValueHtml, true]);
+  return rows;
+}
+
+function mcpTimeoutText(server) {
+  const timeoutSeconds = Number(server?.timeout_seconds || 0);
+  return timeoutSeconds > 0 ? `${timeoutSeconds}s` : t("unset_value");
+}
+
+function mcpAuthStateText(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return t("none_value");
+  }
+  if (truthyFlag(server.oauth_login_pending)) {
+    return t("mcp_oauth_pending");
+  }
+  if (truthyFlag(server.oauth_authorized)) {
+    return t("mcp_oauth_authorized");
+  }
+  return t("mcp_oauth_required");
+}
+
+function mcpOauthScopeText(server) {
+  const scope = String(server?.oauth_scope || "").trim();
+  return scope || t("none_value");
+}
+
+function mcpOauthExpiresText(server) {
+  const expiresAtSeconds = Number(server?.oauth_expires_at || 0);
+  if (!Number.isFinite(expiresAtSeconds) || expiresAtSeconds <= 0) {
+    return t("unset_value");
+  }
+  const timestamp = new Date(expiresAtSeconds * 1000);
+  if (Number.isNaN(timestamp.getTime())) {
+    return t("unset_value");
+  }
+  return `${timestamp.getFullYear()}-${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(
+    timestamp.getDate()
+  ).padStart(2, "0")} ${String(timestamp.getHours()).padStart(2, "0")}:${String(
+    timestamp.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
+function mcpOauthButtonText(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return "";
+  }
+  if (truthyFlag(server.oauth_login_pending)) {
+    return t("mcp_oauth_continue");
+  }
+  return truthyFlag(server.oauth_authorized) ? t("mcp_oauth_relogin") : t("mcp_oauth_login");
+}
+
+function canClearMcpOauth(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return false;
+  }
+  return truthyFlag(server.oauth_authorized) || truthyFlag(server.oauth_login_pending);
+}
+
+function mcpEnvAuthKeys(server) {
+  if (!server || typeof server !== "object" || !Array.isArray(server.env_auth_keys)) {
+    return [];
+  }
+  return server.env_auth_keys
+    .map((item) => String(item || "").trim())
+    .filter((item) => item.length > 0);
+}
+
+function hasMcpEnvAuth(server) {
+  return truthyFlag(server?.env_auth_required) || mcpEnvAuthKeys(server).length > 0;
+}
+
+function mcpEnvAuthConfigured(server) {
+  return truthyFlag(server?.env_auth_configured);
+}
+
+function mcpEnvAuthStateText(server) {
+  if (!hasMcpEnvAuth(server)) {
+    return t("none_value");
+  }
+  return mcpEnvAuthConfigured(server) ? t("mcp_env_auth_configured") : t("mcp_env_auth_required");
+}
+
+function mcpSessionStateText(server) {
+  if (!server || typeof server !== "object" || !server.materialized) {
+    return t("mcp_pending_materialization");
+  }
+  const parts = [truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected")];
+  const protocolVersion = String(server.protocol_version || "").trim();
+  if (protocolVersion) {
+    parts.push(protocolVersion);
+  }
+  return parts.join(" · ");
+}
+
+function renderMcpInsight(catalog) {
+  if (!dom.mcpInsight) {
+    return;
+  }
+  const selectedIds = selectedMcpServerIds();
+  const defaultIds = configDefaultMcpServerIds(catalog);
+  const entries = currentMcpEntries();
+  const summaryEntries = entries.length ? entries : catalog;
+  const hasMaterialized = summaryEntries.some((entry) => truthyFlag(entry?.materialized));
+  const warnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  const cards = [
+    {
+      label: t("mcp_defaults_label"),
+      value: String(defaultIds.length),
+      sub: defaultIds.length ? shortDisplayText(defaultIds.join(", "), 52) : t("none_value"),
+    },
+    {
+      label: t("mcp_selected_label"),
+      value: String(selectedIds.length),
+      sub: selectedIds.length ? shortDisplayText(selectedIds.join(", "), 52) : t("none_value"),
+    },
+    {
+      label: t("mcp_connected_count_label"),
+      value: String(mcpConnectedCount(summaryEntries)),
+      sub: hasMaterialized ? t("mcp_materialized") : t("mcp_pending_materialization"),
+    },
+    {
+      label: t("tools_label"),
+      value: String(totalMcpToolCount(summaryEntries)),
+      sub: hasMaterialized ? t("mcp_materialized") : t("mcp_pending_materialization"),
+    },
+    {
+      label: t("resources_label"),
+      value: String(totalMcpResourceCount(summaryEntries)),
+      sub: hasMaterialized ? t("mcp_materialized") : t("mcp_pending_materialization"),
+    },
+    {
+      label: t("mcp_warnings_label"),
+      value: String(warnings.length),
+      sub: warnings.length ? t("mcp_help_warning") : t("none_value"),
+    },
+  ];
+
+  let note = "";
+  if (!catalog.length) {
+    note = t("mcp_help_empty_catalog");
+  } else if (!selectedIds.length && defaultIds.length) {
+    note = t("mcp_help_use_defaults");
+  } else if (!selectedIds.length) {
+    note = t("mcp_help_manual_selection");
+  } else if (warnings.length) {
+    note = t("mcp_help_warning");
+  } else if (!hasMaterialized) {
+    note = t("mcp_help_materialize");
+  } else if (defaultIds.length && !sameIdSet(selectedIds, defaultIds)) {
+    note = t("mcp_help_manual_override");
+  } else {
+    note = t("mcp_help_defaults_active");
+  }
+
+  dom.mcpInsight.innerHTML = `
+    <div class="mcp-insight-grid">
+      ${cards
+        .map(
+          (card) => `
+            <div class="mcp-insight-card">
+              <div class="mcp-insight-label">${escapeHtml(card.label)}</div>
+              <div class="mcp-insight-value">${escapeHtml(card.value)}</div>
+              <div class="mcp-insight-sub">${escapeHtml(card.sub)}</div>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+    <div class="mcp-insight-note">${escapeHtml(note)}</div>
+  `;
+}
+
+function openMcpOauthPopup(authorizationUrl, existingPopup = null) {
+  const normalizedUrl = String(authorizationUrl || "").trim();
+  if (!normalizedUrl) {
+    return existingPopup;
+  }
+  let popup = existingPopup;
+  if (!popup || popup.closed) {
+    try {
+      popup = window.open("", "_blank");
+    } catch (_error) {
+      popup = null;
+    }
+  }
+  if (popup && !popup.closed) {
+    popup.location.href = normalizedUrl;
+    popup.focus();
+    return popup;
+  }
+  window.open(normalizedUrl, "_blank");
+  return null;
+}
+
+function seedMcpOauthPopup(popup) {
+  if (!popup || popup.closed) {
+    return;
+  }
+  try {
+    const doc = popup.document;
+    if (!doc) {
+      return;
+    }
+    doc.open();
+    doc.write(
+      "<!doctype html><html><head><meta charset='utf-8'><title>OpenCompany MCP Login</title></head>" +
+        "<body><p>Preparing OAuth login...</p></body></html>"
+    );
+    doc.close();
+  } catch (_error) {
+    // Ignore cross-origin and popup write failures; redirect will still be attempted.
+  }
+}
+
+function ensureMcpOauthFlowPolling(flowId) {
+  const flow = state.mcpUi.loginFlows[flowId];
+  if (!flow || flow.polling) {
+    return;
+  }
+  flow.polling = true;
+  void pollMcpOauthFlow(flowId)
+    .catch((error) => {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    })
+    .finally(() => {
+      const currentFlow = state.mcpUi.loginFlows[flowId];
+      if (currentFlow) {
+        currentFlow.polling = false;
+      }
+    });
 }
 
 function mergeSkillCatalogRecord(current, rawSkill, flags = {}) {
@@ -708,6 +1330,12 @@ async function fetchJson(path, options = {}) {
     throw new Error(message);
   }
   return payload;
+}
+
+function waitMs(delayMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+  });
 }
 
 async function bootstrap() {
@@ -3330,6 +3958,49 @@ function syncTaskInputValue() {
   }
 }
 
+function renderCardMetaLines(rows) {
+  const normalizedRows = Array.isArray(rows) ? rows : [];
+  return normalizedRows
+    .map(([key, value, valueIsHtml]) => {
+      const hasValue = value !== null && value !== undefined && value !== "";
+      const text = hasValue ? String(value) : t("none_value");
+      const valueHtml = valueIsHtml ? text : escapeHtml(text);
+      return `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
+        String(key || "")
+      )}</span><span class="skill-card-meta-value">${valueHtml}</span></div>`;
+    })
+    .join("");
+}
+
+function selectedSkillSummaryText(catalog) {
+  const selectedIds = selectedSkillIds();
+  if (!selectedIds.length) {
+    return t("none_value");
+  }
+  const catalogById = new Map(catalog.map((skill) => [String(skill.id || "").trim(), skill]));
+  return selectedIds
+    .map((skillId) => {
+      const skill = catalogById.get(skillId);
+      return skillDisplayName(skill) || skillId;
+    })
+    .join(", ");
+}
+
+function selectedMcpSummaryText(catalog) {
+  const selectedIds = selectedMcpServerIds();
+  if (!selectedIds.length) {
+    return t("none_value");
+  }
+  const catalogById = new Map(catalog.map((server) => [String(server.id || "").trim(), server]));
+  return selectedIds
+    .map((serverId) => {
+      const server = catalogById.get(serverId);
+      const title = String(server?.title || "").trim();
+      return title || serverId;
+    })
+    .join(", ");
+}
+
 function renderSelectedSkillChips(catalog, controlsDisabled) {
   const selectedIds = selectedSkillIds();
   if (!selectedIds.length) {
@@ -3393,7 +4064,7 @@ function renderSkillsCatalog(catalog, controlsDisabled) {
       const docPath = skillPreferredDocPath(skill);
       const sourceLabel = skillSourceLabel(skill);
       const tags = Array.isArray(skill.tags) ? skill.tags : [];
-      const resourceCount = Math.max(0, Number(skill.resource_count || 0));
+      const resourceCount = skillResourceCount(skill);
       const badges = [];
       if (sourceLabel) {
         badges.push(`<span class="skill-badge">${escapeHtml(sourceLabel)}</span>`);
@@ -3419,35 +4090,46 @@ function renderSkillsCatalog(catalog, controlsDisabled) {
             .join("")}</div>`
         : "";
       const docHtml = docPath
-        ? `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
-            t("skills_doc_label")
-          )}</span><span class="skill-card-meta-value">${escapeHtml(docPath)}</span></div>`
+        ? renderCardMetaLines([[t("skills_doc_label"), docPath]])
         : "";
       const sourcePath = String(skill.source_path || "").trim();
       const sourceHtml = sourcePath
-        ? `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
-            t("skills_source_label")
-          )}</span><span class="skill-card-meta-value">${escapeHtml(sourcePath)}</span></div>`
+        ? renderCardMetaLines([[t("skills_source_label"), sourcePath]])
         : "";
+      const structureRows = skillStructureRows(skill);
+      const structureHtml = `
+        <div class="skill-card-structure">
+          <div class="skill-card-structure-title">${escapeHtml(t("structure_label"))}</div>
+          <div class="skill-card-meta">
+            ${renderCardMetaLines(structureRows)}
+          </div>
+        </div>
+      `;
       return `
-        <article class="skill-card${isSelected ? " is-selected" : ""}">
+        <article
+          class="skill-card skill-card-toggle${isSelected ? " is-selected" : ""}${
+            controlsDisabled ? " is-disabled" : ""
+          }"
+          data-action="toggle-skill"
+          data-skill-id="${escapeHtml(skillId)}"
+          role="button"
+          tabindex="${controlsDisabled ? "-1" : "0"}"
+          aria-pressed="${isSelected ? "true" : "false"}"
+          aria-disabled="${controlsDisabled ? "true" : "false"}"
+        >
           <div class="skill-card-head">
             <div class="skill-card-title-block">
               <div class="skill-card-title">${escapeHtml(skillDisplayName(skill) || skillId)}</div>
               <div class="skill-card-id">${escapeHtml(skillId)}</div>
             </div>
-            <button
-              type="button"
-              class="skill-card-action"
-              data-action="toggle-skill"
-              data-skill-id="${escapeHtml(skillId)}"
-              aria-pressed="${isSelected ? "true" : "false"}"
-              ${controlsDisabled ? "disabled" : ""}
-            >${escapeHtml(isSelected ? t("skills_disable") : t("skills_enable"))}</button>
+            <span class="skill-card-toggle-state">${escapeHtml(
+              isSelected ? t("skills_disable") : t("skills_enable")
+            )}</span>
           </div>
           <div class="skill-badge-row">${badges.join("")}</div>
           <div class="skill-card-description">${escapeHtml(description || t("none_value"))}</div>
           ${tagsHtml}
+          ${structureHtml}
           <div class="skill-card-meta">
             ${docHtml}
             ${sourceHtml}
@@ -3510,7 +4192,12 @@ function renderSelectedMcpServerChips(catalog, controlsDisabled) {
           meta.push(transport);
         }
         if (server.materialized) {
-          meta.push(String(server.connected) === "true" || server.connected ? t("mcp_connected") : t("mcp_disconnected"));
+          meta.push(truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected"));
+        } else {
+          meta.push(t("mcp_pending_materialization"));
+        }
+        if (typeof server.config_enabled === "boolean" && server.config_enabled) {
+          meta.push(t("mcp_defaults_label"));
         }
       }
       return `
@@ -3546,17 +4233,44 @@ function renderMcpServerCatalog(catalog, controlsDisabled) {
       const title = String(server.title || serverId).trim() || serverId;
       const isSelected = selected.has(serverId);
       const transport = String(server.transport || "").trim();
-      const toolCount = Math.max(0, Number(server.tool_count || 0));
-      const resourceCount = Math.max(0, Number(server.resource_count || 0));
+      const toolCount = mcpToolCount(server);
+      const resourceCount = mcpResourceCount(server);
       const warning = String(server.warning || "").trim();
+      const endpointValue = mcpEndpointValue(server);
       const badges = [];
       if (transport) {
         badges.push(`<span class="skill-badge">${escapeHtml(transport)}</span>`);
       }
+      if (typeof server.config_enabled === "boolean") {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(
+            server.config_enabled ? t("mcp_config_enabled") : t("mcp_config_disabled")
+          )}</span>`
+        );
+      }
+      if (truthyFlag(server.oauth_enabled)) {
+        badges.push(
+          `<span class="skill-badge ${truthyFlag(server.oauth_authorized) ? "is-active" : ""}">${escapeHtml(
+            mcpAuthStateText(server)
+          )}</span>`
+        );
+      }
+      if (hasMcpEnvAuth(server)) {
+        badges.push(
+          `<span class="skill-badge ${mcpEnvAuthConfigured(server) ? "is-active" : ""}">${escapeHtml(
+            mcpEnvAuthStateText(server)
+          )}</span>`
+        );
+      }
+      badges.push(
+        `<span class="skill-badge ${server.materialized ? "is-active" : ""}">${escapeHtml(
+          server.materialized ? t("mcp_materialized") : t("mcp_pending_materialization")
+        )}</span>`
+      );
       if (server.materialized) {
         badges.push(
-          `<span class="skill-badge ${server.connected ? "is-active" : ""}">${escapeHtml(
-            server.connected ? t("mcp_connected") : t("mcp_disconnected")
+          `<span class="skill-badge ${truthyFlag(server.connected) ? "is-active" : ""}">${escapeHtml(
+            truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected")
           )}</span>`
         );
       }
@@ -3568,26 +4282,108 @@ function renderMcpServerCatalog(catalog, controlsDisabled) {
           `<span class="skill-badge">${escapeHtml(`${t("resources_label")}: ${resourceCount}`)}</span>`
         );
       }
+      const infoRows = [
+        [t("mcp_config_state_label"), mcpConfigStateText(server)],
+        [t("mcp_session_state_label"), mcpSessionStateText(server)],
+      ];
+      if (truthyFlag(server.oauth_enabled)) {
+        infoRows.push([t("mcp_auth_label"), mcpAuthStateText(server)]);
+        infoRows.push([t("mcp_oauth_scope_label"), mcpOauthScopeText(server)]);
+        infoRows.push([t("mcp_oauth_expires_label"), mcpOauthExpiresText(server)]);
+      }
+      if (hasMcpEnvAuth(server)) {
+        infoRows.push([t("mcp_env_auth_label"), mcpEnvAuthStateText(server)]);
+        const envKeysText = mcpEnvAuthKeys(server).join(", ");
+        infoRows.push([t("mcp_env_auth_keys_label"), envKeysText || t("none_value")]);
+      }
+      infoRows.push(
+        [t("mcp_roots_policy_label"), mcpRootsPolicyText(server)],
+        [t("mcp_roots_runtime_label"), mcpRootsRuntimeText(server)],
+        [mcpEndpointLabel(server), endpointValue || t("none_value")],
+        [t("mcp_timeout_label"), mcpTimeoutText(server)],
+        [t("mcp_allowed_tools_label"), mcpAllowedToolsText(server)]
+      );
+      const structureRows = mcpStructureRows(server);
+      const structureHtml = `
+        <div class="skill-card-structure">
+          <div class="skill-card-structure-title">${escapeHtml(t("structure_label"))}</div>
+          <div class="skill-card-meta">
+            ${renderCardMetaLines(structureRows)}
+          </div>
+        </div>
+      `;
+      const oauthButtonText = mcpOauthButtonText(server);
+      const showClearOauth = canClearMcpOauth(server);
+      const showEnvAuthConfig = hasMcpEnvAuth(server);
+      const actionButtons = [];
+      if (oauthButtonText) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-oauth-login"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+          >
+            ${escapeHtml(oauthButtonText)}
+          </button>
+        `);
+      }
+      if (showClearOauth) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-oauth-clear"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+          >
+            ${escapeHtml(t("mcp_oauth_clear"))}
+          </button>
+        `);
+      }
+      if (showEnvAuthConfig) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-env-auth-configure"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+          >
+            ${escapeHtml(t("mcp_env_auth_configure"))}
+          </button>
+        `);
+      }
       return `
-        <article class="skill-card${isSelected ? " is-selected" : ""}">
+        <article
+          class="skill-card mcp-card skill-card-toggle${isSelected ? " is-selected" : ""}${
+            controlsDisabled ? " is-disabled" : ""
+          }"
+          data-action="toggle-mcp-server"
+          data-mcp-server-id="${escapeHtml(serverId)}"
+          role="button"
+          tabindex="${controlsDisabled ? "-1" : "0"}"
+          aria-pressed="${isSelected ? "true" : "false"}"
+          aria-disabled="${controlsDisabled ? "true" : "false"}"
+        >
           <div class="skill-card-head">
             <div class="skill-card-title-block">
               <div class="skill-card-title">${escapeHtml(title)}</div>
               <div class="skill-card-id">${escapeHtml(serverId)}</div>
             </div>
-            <button
-              type="button"
-              class="skill-card-action"
-              data-action="toggle-mcp-server"
-              data-mcp-server-id="${escapeHtml(serverId)}"
-              aria-pressed="${isSelected ? "true" : "false"}"
-              ${controlsDisabled ? "disabled" : ""}
-            >${escapeHtml(isSelected ? t("mcp_disable") : t("mcp_enable"))}</button>
+            <span class="skill-card-toggle-state">${escapeHtml(
+              isSelected ? t("mcp_disable") : t("mcp_enable")
+            )}</span>
           </div>
           <div class="skill-badge-row">${badges.join("")}</div>
           <div class="skill-card-description">${escapeHtml(
-            warning || String(server.url || server.command || "").trim() || t("none_value")
+            warning || endpointValue || t("none_value")
           )}</div>
+          ${structureHtml}
+          <div class="skill-card-meta">${renderInfoRows(infoRows)}</div>
+          ${
+            actionButtons.length
+              ? `<div class="skill-card-actions">${actionButtons.join("")}</div>`
+              : ""
+          }
         </article>
       `;
     })
@@ -3619,6 +4415,24 @@ function renderMcpWarnings() {
     .join("");
 }
 
+function renderControlSection(shell, button, summary, toggleState, body, expanded, summaryText) {
+  if (summary) {
+    summary.textContent = summaryText;
+  }
+  if (toggleState) {
+    toggleState.textContent = expanded ? t("collapse") : t("expand");
+  }
+  if (button) {
+    button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
+  if (shell) {
+    shell.classList.toggle("is-collapsed", !expanded);
+  }
+  if (body) {
+    body.classList.toggle("hidden", !expanded);
+  }
+}
+
 function renderControls() {
   dom.taskInput.placeholder = t("task_input");
   syncTaskInputValue();
@@ -3633,7 +4447,6 @@ function renderControls() {
     dom.rootAgentNameInput.value = state.runtime.root_agent_name;
   }
   dom.skillsLabel.textContent = t("skills_label");
-  dom.skillsInput.placeholder = t("skills_placeholder");
   syncSkillsInputValue();
   dom.skillsDiscoverButton.textContent = state.skillsUi.discovering
     ? t("loading")
@@ -3641,9 +4454,9 @@ function renderControls() {
   dom.skillsSelectAllButton.textContent = t("skills_select_all");
   dom.skillsClearButton.textContent = t("skills_clear");
   dom.mcpLabel.textContent = t("mcp_servers_label");
-  dom.mcpInput.placeholder = t("mcp_servers_placeholder");
   syncMcpInputValue();
   dom.mcpDiscoverButton.textContent = state.mcpUi.discovering ? t("loading") : t("mcp_discover");
+  dom.mcpUseDefaultsButton.textContent = t("mcp_use_defaults");
   dom.mcpSelectAllButton.textContent = t("mcp_select_all");
   dom.mcpClearButton.textContent = t("mcp_clear");
   autoSizeTaskInput();
@@ -3671,18 +4484,37 @@ function renderControls() {
     : [];
   const mcpCatalog = mergedMcpServerCatalog();
   const mcpCatalogIds = new Set(mcpCatalog.map((server) => String(server.id || "").trim()));
+  const defaultMcpIds = configDefaultMcpServerIds(mcpCatalog);
   const mcpWarnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
   const manualSelectedCount = selectedSkillIds().filter((skillId) => !catalogIds.has(skillId)).length;
   const manualSelectedMcpCount = selectedMcpServerIds().filter((serverId) => !mcpCatalogIds.has(serverId)).length;
+  const mcpEntries = currentMcpEntries();
+  const mcpSummarySource = mcpEntries.length ? mcpEntries : mcpCatalog;
+  const connectedMcpCount = mcpConnectedCount(mcpSummarySource);
+  const totalMcpTools = totalMcpToolCount(mcpSummarySource);
+  const totalMcpResources = totalMcpResourceCount(mcpSummarySource);
+  const selectedSkillSummary = selectedSkillSummaryText(catalog);
+  const selectedMcpSummary = selectedMcpSummaryText(mcpCatalog);
+  const skillsSummaryText = `${selectedSkillIds().length} ${t("skills_selected_label")} · ${catalog.length} ${t(
+    "skills_catalog_label"
+  )} · ${warnings.length} ${t("skills_warnings_label")} · ${t("selected_items_label")}: ${selectedSkillSummary}`;
+  const mcpSummaryText = `${selectedMcpServerIds().length} ${t("mcp_selected_label")} · ${mcpCatalog.length} ${t(
+    "mcp_catalog_label"
+  )} · ${mcpWarnings.length} ${t("mcp_warnings_label")} · ${t("selected_items_label")}: ${selectedMcpSummary}`;
   dom.runButton.disabled = runSubmitting || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.modelInput.disabled = syncBusy || setupBusy;
   dom.rootAgentNameInput.disabled = syncBusy || setupBusy;
-  dom.skillsInput.disabled = controlsDisabled;
+  if (dom.skillsInput) {
+    dom.skillsInput.disabled = controlsDisabled;
+  }
   dom.skillsDiscoverButton.disabled = controlsDisabled || !state.launchConfig.can_run;
   dom.skillsSelectAllButton.disabled = controlsDisabled || catalog.length === 0;
   dom.skillsClearButton.disabled = controlsDisabled || selectedSkillIds().length === 0;
-  dom.mcpInput.disabled = controlsDisabled;
+  if (dom.mcpInput) {
+    dom.mcpInput.disabled = controlsDisabled;
+  }
   dom.mcpDiscoverButton.disabled = controlsDisabled;
+  dom.mcpUseDefaultsButton.disabled = controlsDisabled || defaultMcpIds.length === 0;
   dom.mcpSelectAllButton.disabled = controlsDisabled || mcpCatalog.length === 0;
   dom.mcpClearButton.disabled = controlsDisabled || selectedMcpServerIds().length === 0;
   dom.terminalButton.disabled = syncBusy || setupBusy || !activeSessionId();
@@ -3690,6 +4522,24 @@ function renderControls() {
   dom.interruptButton.disabled = !running;
   dom.applyButton.disabled = running || syncBusy || setupBusy || directMode || !activeSessionId();
   dom.undoButton.disabled = running || syncBusy || setupBusy || directMode || !activeSessionId();
+  renderControlSection(
+    dom.skillsShell,
+    dom.skillsToggleButton,
+    dom.skillsSummary,
+    dom.skillsToggleState,
+    dom.skillsPanelBody,
+    Boolean(state.skillsUi.expanded),
+    skillsSummaryText
+  );
+  renderControlSection(
+    dom.mcpShell,
+    dom.mcpToggleButton,
+    dom.mcpSummary,
+    dom.mcpToggleState,
+    dom.mcpPanelBody,
+    Boolean(state.mcpUi.expanded),
+    mcpSummaryText
+  );
 
   const stats = agentStats();
   const statusText = localizeStatus(state.runtime.session_status || "idle");
@@ -3710,10 +4560,13 @@ function renderControls() {
   renderSkillsCatalog(catalog, controlsDisabled);
   renderSkillWarnings();
   dom.mcpStatus.textContent = `${t("mcp_selected_label")}: ${selectedMcpServerIds().length} | ${t(
-    "mcp_catalog_label"
-  )}: ${mcpCatalog.length} | ${t("skills_manual_label")}: ${manualSelectedMcpCount} | ${t(
-    "mcp_warnings_label"
-  )}: ${mcpWarnings.length}`;
+    "mcp_defaults_label"
+  )}: ${defaultMcpIds.length} | ${t("mcp_connected_count_label")}: ${connectedMcpCount} | ${t(
+    "tools_label"
+  )}: ${totalMcpTools} | ${t("resources_label")}: ${totalMcpResources} | ${t(
+    "skills_manual_label"
+  )}: ${manualSelectedMcpCount} | ${t("mcp_warnings_label")}: ${mcpWarnings.length}`;
+  renderMcpInsight(mcpCatalog);
   renderSelectedMcpServerChips(mcpCatalog, controlsDisabled);
   renderMcpServerCatalog(mcpCatalog, controlsDisabled);
   renderMcpWarnings();
@@ -3799,8 +4652,7 @@ function renderOverviewTab() {
   const runtimeMessage = state.runtime.summary || state.runtime.status_message || "-";
   const skillsState = currentSkillsState();
   const skillWarnings = Array.isArray(skillsState.warnings) ? skillsState.warnings : [];
-  const mcpState = currentMcpState();
-  const mcpWarnings = Array.isArray(mcpState.warnings) ? mcpState.warnings : [];
+  const mcpWarnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
   const enabledSkillsText = selectedSkillIds().length
     ? selectedSkillIds().join(", ")
     : t("none_value");
@@ -3812,6 +4664,7 @@ function renderOverviewTab() {
     .filter((agent) => agent !== undefined)
     .at(-1);
   const recentActivity = state.activityEntries.slice(-16).reverse();
+  const mcpEntries = currentMcpEntries();
   const stats = agentStats();
   const statusClass = `status-${normalizeStatus(state.runtime.session_status || "idle")}`;
   const currentSessionId = activeSessionId() || t("pending_value");
@@ -3833,7 +4686,9 @@ function renderOverviewTab() {
     [t("skills_bundle_root_label"), String(skillsState.bundle_root || "") || t("unset_value")],
     [t("skills_warnings_label"), String(skillWarnings.length)],
     [t("mcp_selected_label"), enabledMcpText],
-    [t("mcp_connected_count_label"), String(currentMcpEntries().filter((item) => item.connected).length)],
+    [t("mcp_connected_count_label"), String(mcpConnectedCount(mcpEntries))],
+    [t("tools_label"), String(totalMcpToolCount(mcpEntries))],
+    [t("resources_label"), String(totalMcpResourceCount(mcpEntries))],
     [t("mcp_warnings_label"), String(mcpWarnings.length)],
     [t("sessions_root"), state.sessionsDir || t("unset_value")],
   ])}</div>`;
@@ -7105,9 +7960,188 @@ async function discoverMcpServers() {
     });
     applySnapshot(payload.snapshot || payload);
     const servers = payload && Array.isArray(payload.mcp_servers) ? payload.mcp_servers : [];
-    state.runtime.status_message = `${servers.length} ${t("mcp_servers_discovered")}`;
+    const defaultCount = servers.filter((server) => truthyFlag(server?.enabled)).length;
+    state.runtime.status_message = `${servers.length} ${t("mcp_servers_discovered")} | ${t(
+      "mcp_defaults_label"
+    )}: ${defaultCount}`;
   } finally {
     state.mcpUi.discovering = false;
+    scheduleRender();
+  }
+}
+
+async function pollMcpOauthFlow(flowId) {
+  for (;;) {
+    const payload = await fetchJson(`/api/mcp/oauth/${encodeURIComponent(flowId)}`);
+    applySnapshot(payload.snapshot || payload);
+    const flow = state.mcpUi.loginFlows[flowId];
+    if (flow) {
+      const authorizationUrl = String(
+        payload.authorization_url || flow.authorizationUrl || ""
+      ).trim();
+      if (authorizationUrl && authorizationUrl !== flow.authorizationUrl) {
+        flow.authorizationUrl = authorizationUrl;
+      }
+      if (authorizationUrl && !flow.popupOpened) {
+        flow.popup = openMcpOauthPopup(authorizationUrl, flow.popup || null);
+        flow.popupOpened = true;
+      }
+    }
+    const status = String(payload.status || "").trim().toLowerCase();
+    if (status === "completed") {
+      if (flow && flow.popup && !flow.popup.closed) {
+        try {
+          flow.popup.close();
+        } catch (_error) {
+          // Ignore popup close failures.
+        }
+      }
+      delete state.mcpUi.loginFlows[flowId];
+      state.runtime.status_message = `${payload.server_id || ""} · ${t("mcp_oauth_completed")}`.trim();
+      scheduleRender();
+      return payload;
+    }
+    if (status === "failed" || status === "cancelled") {
+      if (flow && flow.popup && !flow.popup.closed) {
+        try {
+          flow.popup.close();
+        } catch (_error) {
+          // Ignore popup close failures.
+        }
+      }
+      delete state.mcpUi.loginFlows[flowId];
+      const detail = String(payload.error || "").trim();
+      throw new Error(
+        detail
+          ? `${t("mcp_oauth_failed")}: ${detail}`
+          : t("mcp_oauth_failed")
+      );
+    }
+    await waitMs(1000);
+  }
+}
+
+async function startMcpOauthLogin(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  let popup = null;
+  try {
+    popup = window.open("about:blank", "_blank");
+  } catch (_error) {
+    popup = null;
+  }
+  seedMcpOauthPopup(popup);
+  try {
+    const payload = await fetchJson("/api/mcp/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({ server_id: normalizedServerId }),
+    });
+    const flowId = String(payload.flow_id || "").trim();
+    const authorizationUrl = String(payload.authorization_url || "").trim();
+    if (!flowId) {
+      throw new Error(t("mcp_oauth_failed"));
+    }
+    const existingFlow = state.mcpUi.loginFlows[flowId];
+    const mergedAuthorizationUrl = String(
+      authorizationUrl || (existingFlow && existingFlow.authorizationUrl) || ""
+    ).trim();
+    let popupRef = (existingFlow && existingFlow.popup) || popup;
+    let popupOpened = Boolean(existingFlow && existingFlow.popupOpened);
+    if (mergedAuthorizationUrl) {
+      popupRef = openMcpOauthPopup(mergedAuthorizationUrl, popupRef);
+      popupOpened = true;
+    }
+    state.mcpUi.loginFlows[flowId] = {
+      serverId: normalizedServerId,
+      authorizationUrl: mergedAuthorizationUrl,
+      polling: Boolean(existingFlow && existingFlow.polling),
+      popup: popupRef || null,
+      popupOpened,
+    };
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_oauth_started")}`;
+    scheduleRender();
+    ensureMcpOauthFlowPolling(flowId);
+  } catch (error) {
+    if (popup && !popup.closed) {
+      popup.close();
+    }
+    state.runtime.status_message = String(error.message || "");
+    scheduleRender();
+  }
+}
+
+async function clearMcpOauthLogin(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/api/mcp/oauth/clear", {
+      method: "POST",
+      body: JSON.stringify({ server_id: normalizedServerId }),
+    });
+    Object.entries(state.mcpUi.loginFlows).forEach(([flowId, flow]) => {
+      if (flow && String(flow.serverId || "").trim() === normalizedServerId) {
+        if (flow.popup && !flow.popup.closed) {
+          flow.popup.close();
+        }
+        delete state.mcpUi.loginFlows[flowId];
+      }
+    });
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_oauth_cleared")}`;
+    scheduleRender();
+  } catch (error) {
+    state.runtime.status_message = String(error.message || "");
+    scheduleRender();
+  }
+}
+
+async function configureMcpEnvAuth(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  const server = mergedMcpServerCatalog().find(
+    (item) => String(item?.id || "").trim() === normalizedServerId
+  );
+  const envKeys = mcpEnvAuthKeys(server);
+  if (!envKeys.length) {
+    state.runtime.status_message = t("mcp_env_auth_missing");
+    scheduleRender();
+    return;
+  }
+  const values = {};
+  for (const envKey of envKeys) {
+    const promptMessage = `${t("mcp_env_auth_prompt")} ${envKey}`;
+    const inputValue = window.prompt(promptMessage, "");
+    if (inputValue === null) {
+      return;
+    }
+    const normalizedValue = String(inputValue || "").trim();
+    if (!normalizedValue) {
+      state.runtime.status_message = `${t("mcp_env_auth_failed")}: ${envKey}`;
+      scheduleRender();
+      return;
+    }
+    values[envKey] = normalizedValue;
+  }
+  try {
+    const payload = await fetchJson("/api/mcp/env-auth/configure", {
+      method: "POST",
+      body: JSON.stringify({
+        server_id: normalizedServerId,
+        values,
+      }),
+    });
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_env_auth_saved")}`;
+    scheduleRender();
+  } catch (error) {
+    state.runtime.status_message = String(error.message || "");
     scheduleRender();
   }
 }
@@ -7581,9 +8615,16 @@ function bindEvents() {
     state.runtime.root_agent_name = dom.rootAgentNameInput.value;
   });
 
-  dom.skillsInput.addEventListener("input", () => {
-    setSelectedSkillIds(dom.skillsInput.value);
+  dom.skillsToggleButton.addEventListener("click", () => {
+    state.skillsUi.expanded = !state.skillsUi.expanded;
+    scheduleRender();
   });
+
+  if (dom.skillsInput) {
+    dom.skillsInput.addEventListener("input", () => {
+      setSelectedSkillIds(dom.skillsInput.value);
+    });
+  }
 
   dom.skillsDiscoverButton.addEventListener("click", async () => {
     try {
@@ -7627,11 +8668,14 @@ function bindEvents() {
     if (!(target instanceof Element)) {
       return;
     }
-    const button = target.closest("button[data-action='toggle-skill']");
-    if (!button) {
+    const card = target.closest("[data-action='toggle-skill']");
+    if (!card) {
       return;
     }
-    const skillId = String(button.getAttribute("data-skill-id") || "").trim();
+    if (card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    const skillId = String(card.getAttribute("data-skill-id") || "").trim();
     if (!skillId) {
       return;
     }
@@ -7644,8 +8688,31 @@ function bindEvents() {
     setSelectedSkillIds([...selected], { syncInput: true });
   });
 
-  dom.mcpInput.addEventListener("input", () => {
-    setSelectedMcpServerIds(dom.mcpInput.value);
+  dom.skillsList.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    const card = target.closest("[data-action='toggle-skill']");
+    if (!card || card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    event.preventDefault();
+    card.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+
+  if (dom.mcpInput) {
+    dom.mcpInput.addEventListener("input", () => {
+      setSelectedMcpServerIds(dom.mcpInput.value);
+    });
+  }
+
+  dom.mcpToggleButton.addEventListener("click", () => {
+    state.mcpUi.expanded = !state.mcpUi.expanded;
+    scheduleRender();
   });
 
   dom.mcpDiscoverButton.addEventListener("click", async () => {
@@ -7655,6 +8722,14 @@ function bindEvents() {
       state.runtime.status_message = String(error.message || "");
       scheduleRender();
     }
+  });
+
+  dom.mcpUseDefaultsButton.addEventListener("click", () => {
+    const defaultIds = configDefaultMcpServerIds();
+    if (!defaultIds.length) {
+      return;
+    }
+    setSelectedMcpServerIds(defaultIds, { syncInput: true });
   });
 
   dom.mcpSelectAllButton.addEventListener("click", () => {
@@ -7690,11 +8765,38 @@ function bindEvents() {
     if (!(target instanceof Element)) {
       return;
     }
-    const button = target.closest("button[data-action='toggle-mcp-server']");
-    if (!button) {
+    const clearButton = target.closest("button[data-action='mcp-oauth-clear']");
+    if (clearButton) {
+      const serverId = String(clearButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void clearMcpOauthLogin(serverId);
+      }
       return;
     }
-    const serverId = String(button.getAttribute("data-mcp-server-id") || "").trim();
+    const loginButton = target.closest("button[data-action='mcp-oauth-login']");
+    if (loginButton) {
+      const serverId = String(loginButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void startMcpOauthLogin(serverId);
+      }
+      return;
+    }
+    const envAuthButton = target.closest("button[data-action='mcp-env-auth-configure']");
+    if (envAuthButton) {
+      const serverId = String(envAuthButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void configureMcpEnvAuth(serverId);
+      }
+      return;
+    }
+    const card = target.closest("[data-action='toggle-mcp-server']");
+    if (!card) {
+      return;
+    }
+    if (card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    const serverId = String(card.getAttribute("data-mcp-server-id") || "").trim();
     if (!serverId) {
       return;
     }
@@ -7705,6 +8807,29 @@ function bindEvents() {
       selected.add(serverId);
     }
     setSelectedMcpServerIds([...selected], { syncInput: true });
+  });
+
+  dom.mcpList.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (
+      target.closest("button[data-action='mcp-oauth-login']") ||
+      target.closest("button[data-action='mcp-oauth-clear']") ||
+      target.closest("button[data-action='mcp-env-auth-configure']")
+    ) {
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    const card = target.closest("[data-action='toggle-mcp-server']");
+    if (!card || card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    event.preventDefault();
+    card.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
 
   if (dom.agentsRoleFilter) {

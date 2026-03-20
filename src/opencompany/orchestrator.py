@@ -242,6 +242,7 @@ class Orchestrator:
         self.latest_session_id: str | None = None
         self._loggers: dict[str, StructuredLogger] = {}
         self._message_loggers: dict[str, AgentMessageLogger] = {}
+        self._debug_timing_paths: dict[str, Path] = {}
         self._run_loop_task: asyncio.Task[Any] | None = None
         self._workspace_merge_lock = asyncio.Lock()
         self._worker_semaphore: asyncio.Semaphore | None = None
@@ -468,31 +469,82 @@ class Orchestrator:
         self._tool_run_shell_streams = {}
         self._run_loop_task = asyncio.current_task()
         try:
-            self._apply_session_remote_runtime(
-                session_id=session.id,
-                remote_config=normalized_remote_config,
-                remote_password=remote_password,
-                require_password=True,
-            )
-            await self._refresh_session_skills(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                requested_skill_ids=enabled_skill_ids,
-                remote_password=remote_password,
-            )
-            await self._refresh_session_mcp(
-                session=session,
-                agents=agents,
-                requested_server_ids=enabled_mcp_server_ids,
-            )
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=[],
-                root_loop=0,
-            )
+            apply_remote_started_monotonic = time.perf_counter()
+            apply_remote_succeeded = False
+            try:
+                self._apply_session_remote_runtime(
+                    session_id=session.id,
+                    remote_config=normalized_remote_config,
+                    remote_password=remote_password,
+                    require_password=True,
+                )
+                apply_remote_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.setup_remote_runtime",
+                    started_monotonic=apply_remote_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": apply_remote_succeeded},
+                )
+
+            refresh_skills_started_monotonic = time.perf_counter()
+            refresh_skills_succeeded = False
+            try:
+                await self._refresh_session_skills(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    requested_skill_ids=enabled_skill_ids,
+                    remote_password=remote_password,
+                )
+                refresh_skills_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.refresh_skills",
+                    started_monotonic=refresh_skills_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": refresh_skills_succeeded},
+                )
+
+            refresh_mcp_started_monotonic = time.perf_counter()
+            refresh_mcp_succeeded = False
+            try:
+                await self._refresh_session_mcp(
+                    session=session,
+                    agents=agents,
+                    requested_server_ids=enabled_mcp_server_ids,
+                )
+                refresh_mcp_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.refresh_mcp",
+                    started_monotonic=refresh_mcp_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": refresh_mcp_succeeded},
+                )
+
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=[],
+                    root_loop=0,
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": run_session_succeeded},
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -549,24 +601,60 @@ class Orchestrator:
             checkpoint_seq,
         ) = self._import_session_context(normalized_session_id, source="run")
         remote_config = self._session_remote_config(normalized_session_id)
-        self._apply_session_remote_runtime(
-            session_id=normalized_session_id,
-            remote_config=remote_config,
-            remote_password=remote_password,
-            require_password=True,
-        )
-        await self._refresh_session_skills(
-            session=session,
-            agents=agents,
-            workspace_manager=workspace_manager,
-            requested_skill_ids=enabled_skill_ids,
-            remote_password=remote_password,
-        )
-        await self._refresh_session_mcp(
-            session=session,
-            agents=agents,
-            requested_server_ids=enabled_mcp_server_ids,
-        )
+        apply_remote_started_monotonic = time.perf_counter()
+        apply_remote_succeeded = False
+        try:
+            self._apply_session_remote_runtime(
+                session_id=normalized_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+            apply_remote_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.setup_remote_runtime",
+                started_monotonic=apply_remote_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": apply_remote_succeeded},
+            )
+        refresh_skills_started_monotonic = time.perf_counter()
+        refresh_skills_succeeded = False
+        try:
+            await self._refresh_session_skills(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                requested_skill_ids=enabled_skill_ids,
+                remote_password=remote_password,
+            )
+            refresh_skills_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_skills",
+                started_monotonic=refresh_skills_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_skills_succeeded},
+            )
+        refresh_mcp_started_monotonic = time.perf_counter()
+        refresh_mcp_succeeded = False
+        try:
+            await self._refresh_session_mcp(
+                session=session,
+                agents=agents,
+                requested_server_ids=enabled_mcp_server_ids,
+            )
+            refresh_mcp_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_mcp",
+                started_monotonic=refresh_mcp_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_mcp_succeeded},
+            )
 
         root_agent = self._append_root_agent_for_task(
             session=session,
@@ -633,13 +721,25 @@ class Orchestrator:
         self._tool_run_shell_streams = {}
         self._run_loop_task = asyncio.current_task()
         try:
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=[],
-                root_loop=max(0, int(root_loop)),
-            )
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=[],
+                    root_loop=max(0, int(root_loop)),
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": run_session_succeeded},
+                )
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -1180,6 +1280,7 @@ class Orchestrator:
                 "source_path": descriptor.source_path,
                 "main_doc_path": descriptor.main_doc_path,
                 "localized_doc_path": descriptor.localized_doc_path,
+                "resource_count": len(descriptor.files),
             }
             for descriptor in sorted(descriptors.values(), key=lambda item: item.id)
         ]
@@ -1987,24 +2088,60 @@ class Orchestrator:
             checkpoint_seq,
         ) = self._import_session_context(normalized_session_id, source="resume")
         remote_config = self._session_remote_config(normalized_session_id)
-        self._apply_session_remote_runtime(
-            session_id=normalized_session_id,
-            remote_config=remote_config,
-            remote_password=remote_password,
-            require_password=True,
-        )
-        await self._refresh_session_skills(
-            session=session,
-            agents=agents,
-            workspace_manager=workspace_manager,
-            requested_skill_ids=enabled_skill_ids,
-            remote_password=remote_password,
-        )
-        await self._refresh_session_mcp(
-            session=session,
-            agents=agents,
-            requested_server_ids=enabled_mcp_server_ids,
-        )
+        apply_remote_started_monotonic = time.perf_counter()
+        apply_remote_succeeded = False
+        try:
+            self._apply_session_remote_runtime(
+                session_id=normalized_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+            apply_remote_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.setup_remote_runtime",
+                started_monotonic=apply_remote_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": apply_remote_succeeded},
+            )
+        refresh_skills_started_monotonic = time.perf_counter()
+        refresh_skills_succeeded = False
+        try:
+            await self._refresh_session_skills(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                requested_skill_ids=enabled_skill_ids,
+                remote_password=remote_password,
+            )
+            refresh_skills_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_skills",
+                started_monotonic=refresh_skills_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_skills_succeeded},
+            )
+        refresh_mcp_started_monotonic = time.perf_counter()
+        refresh_mcp_succeeded = False
+        try:
+            await self._refresh_session_mcp(
+                session=session,
+                agents=agents,
+                requested_server_ids=enabled_mcp_server_ids,
+            )
+            refresh_mcp_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_mcp",
+                started_monotonic=refresh_mcp_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_mcp_succeeded},
+            )
         if normalized_run_root_agent and normalized_reactivate_agent_id:
             candidate = agents.get(normalized_reactivate_agent_id)
             if candidate is not None and candidate.role == AgentRole.ROOT:
@@ -2109,17 +2246,29 @@ class Orchestrator:
         )
         self._run_loop_task = asyncio.current_task()
         try:
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=pending_agent_ids,
-                root_loop=root_loop,
-                run_root_agent=normalized_run_root_agent,
-                focus_agent_id=(
-                    None if normalized_run_root_agent else normalized_reactivate_agent_id
-                ),
-            )
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=pending_agent_ids,
+                    root_loop=root_loop,
+                    run_root_agent=normalized_run_root_agent,
+                    focus_agent_id=(
+                        None if normalized_run_root_agent else normalized_reactivate_agent_id
+                    ),
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent_id=session.root_agent_id,
+                    payload={"success": run_session_succeeded},
+                )
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -5167,11 +5316,71 @@ class Orchestrator:
             self.paths.existing_session_dir(normalized_session_id) / PROJECT_SYNC_STATE_FILENAME
         )
 
+    def _debug_timing_path(self, session_id: str) -> Path | None:
+        if not self.debug:
+            return None
+        normalized_session_id = self._normalize_session_id(session_id)
+        cached_path = self._debug_timing_paths.get(normalized_session_id)
+        if cached_path is not None:
+            return cached_path
+        debug_dir = ensure_directory(self.paths.session_dir(normalized_session_id, create=True) / "debug")
+        timing_path = debug_dir / "timings.jsonl"
+        self._debug_timing_paths[normalized_session_id] = timing_path
+        return timing_path
+
+    def _log_debug_timing(
+        self,
+        *,
+        stage: str,
+        started_monotonic: float,
+        session_id: str | None = None,
+        agent: AgentNode | None = None,
+        agent_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.debug:
+            return
+        resolved_session_id = str(
+            session_id or (agent.session_id if agent is not None else "") or self.latest_session_id or ""
+        ).strip()
+        if not resolved_session_id:
+            return
+        normalized_session_id = self._normalize_session_id(resolved_session_id)
+        resolved_agent_id = str(agent_id or (agent.id if agent is not None else "")).strip() or None
+        duration_ms = max(0, int((time.perf_counter() - started_monotonic) * 1000))
+        record_payload = dict(payload or {})
+        record_payload["stage"] = str(stage or "").strip()
+        record_payload["duration_ms"] = duration_ms
+        if agent is not None:
+            record_payload.setdefault("agent_role", agent.role.value)
+            record_payload.setdefault("step_count", int(agent.step_count))
+        self._log_diagnostic(
+            "debug_timing",
+            session_id=normalized_session_id,
+            agent_id=resolved_agent_id,
+            payload=record_payload,
+        )
+        timing_path = self._debug_timing_path(normalized_session_id)
+        if timing_path is None:
+            return
+        append_jsonl(
+            timing_path,
+            {
+                "timestamp": utc_now(),
+                "session_id": normalized_session_id,
+                "agent_id": resolved_agent_id,
+                "stage": record_payload["stage"],
+                "duration_ms": duration_ms,
+                "payload": json_ready(record_payload),
+            },
+        )
+
     def _configure_llm_debug_log(self, session_id: str) -> None:
         if not self.debug or self.llm_client is None:
             return
         normalized_session_id = self._normalize_session_id(session_id)
         debug_dir = ensure_directory(self.paths.session_dir(normalized_session_id, create=True) / "debug")
+        timing_path = self._debug_timing_path(normalized_session_id)
         log_path = debug_dir / "requests_responses.jsonl"
         if hasattr(self.llm_client, "request_response_log_dir"):
             setattr(self.llm_client, "request_response_log_dir", debug_dir)
@@ -5181,7 +5390,11 @@ class Orchestrator:
         self._log_diagnostic(
             "llm_debug_log_configured",
             session_id=normalized_session_id,
-            payload={"path": str(log_path), "dir": str(debug_dir)},
+            payload={
+                "path": str(log_path),
+                "dir": str(debug_dir),
+                "timing_path": str(timing_path) if timing_path is not None else None,
+            },
         )
 
     def _load_project_sync_state(self, session_id: str) -> dict[str, Any] | None:
@@ -5444,7 +5657,20 @@ class Orchestrator:
                     break
                 if session.status != SessionStatus.RUNNING:
                     break
+                wait_started_monotonic = time.perf_counter()
                 await self._wait_for_runtime_change()
+                self._log_debug_timing(
+                    stage="session.wait_for_runtime_change",
+                    started_monotonic=wait_started_monotonic,
+                    session_id=session.id,
+                    agent_id=session.root_agent_id,
+                    payload={
+                        "root_loop": int(session.loop_index),
+                        "active_root_tasks": len(self._active_root_tasks),
+                        "active_worker_tasks": len(self._active_worker_tasks),
+                        "active_tool_run_tasks": len(self._active_tool_run_tasks),
+                    },
+                )
                 if session.status == SessionStatus.RUNNING:
                     session.updated_at = utc_now()
                     self.storage.upsert_session(session)
@@ -5815,30 +6041,80 @@ class Orchestrator:
 
             if self.interrupt_requested:
                 return pending_agent_ids
-            actions = await ask_root_agent(root_agent)
+            actions: list[dict[str, Any]] = []
+            ask_succeeded = False
+            ask_started_monotonic = time.perf_counter()
+            try:
+                actions = await ask_root_agent(root_agent)
+                ask_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="root_cycle.ask_agent",
+                    started_monotonic=ask_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "success": ask_succeeded,
+                        "actions_count": len(actions) if ask_succeeded else None,
+                    },
+                )
             if self.interrupt_requested:
                 return pending_agent_ids
-            action_result = await self._execute_agent_actions(
-                session=session,
-                agent=root_agent,
-                actions=actions,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=pending_agent_ids,
-            )
+            action_result = ActionBatchResult(finish_payload=None)
+            execute_succeeded = False
+            execute_started_monotonic = time.perf_counter()
+            try:
+                action_result = await self._execute_agent_actions(
+                    session=session,
+                    agent=root_agent,
+                    actions=actions,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=pending_agent_ids,
+                )
+                execute_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="root_cycle.execute_actions",
+                    started_monotonic=execute_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "success": execute_succeeded,
+                        "actions_count": len(actions),
+                        "has_finish_payload": bool(action_result.finish_payload),
+                    },
+                )
             if self.interrupt_requested:
                 return pending_agent_ids
             if action_result.finish_payload:
-                await self._finalize_root(
-                    session=session,
-                    root_agent=root_agent,
-                    payload=action_result.finish_payload,
-                    agents=agents,
-                    workspace_manager=workspace_manager,
-                    pending_agent_ids=pending_agent_ids,
-                    root_loop=root_loop,
-                )
+                finalize_succeeded = False
+                finalize_started_monotonic = time.perf_counter()
+                try:
+                    await self._finalize_root(
+                        session=session,
+                        root_agent=root_agent,
+                        payload=action_result.finish_payload,
+                        agents=agents,
+                        workspace_manager=workspace_manager,
+                        pending_agent_ids=pending_agent_ids,
+                        root_loop=root_loop,
+                    )
+                    finalize_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="root_cycle.finalize_root",
+                        started_monotonic=finalize_started_monotonic,
+                        session_id=session.id,
+                        agent=root_agent,
+                        payload={
+                            "root_loop": root_loop,
+                            "success": finalize_succeeded,
+                        },
+                    )
                 return pending_agent_ids
             return pending_agent_ids
         finally:
@@ -5874,29 +6150,79 @@ class Orchestrator:
                     session=session,
                     agent=agent,
                 )
-                actions = await ask_worker_agent(agent)
+                actions: list[dict[str, Any]] = []
+                ask_succeeded = False
+                ask_started_monotonic = time.perf_counter()
+                try:
+                    actions = await ask_worker_agent(agent)
+                    ask_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="worker_cycle.ask_agent",
+                        started_monotonic=ask_started_monotonic,
+                        session_id=session.id,
+                        agent=agent,
+                        payload={
+                            "root_loop": current_root_loop,
+                            "success": ask_succeeded,
+                            "actions_count": len(actions) if ask_succeeded else None,
+                        },
+                    )
                 if self.interrupt_requested or not self._is_active_agent(agent):
                     return
-                loop_result = await self._execute_agent_actions(
-                    session=session,
-                    agent=agent,
-                    actions=actions,
-                    agents=agents,
-                    workspace_manager=workspace_manager,
-                    root_loop=current_root_loop,
-                    tracked_pending_ids=tracked_children,
-                )
+                loop_result = ActionBatchResult(finish_payload=None)
+                execute_succeeded = False
+                execute_started_monotonic = time.perf_counter()
+                try:
+                    loop_result = await self._execute_agent_actions(
+                        session=session,
+                        agent=agent,
+                        actions=actions,
+                        agents=agents,
+                        workspace_manager=workspace_manager,
+                        root_loop=current_root_loop,
+                        tracked_pending_ids=tracked_children,
+                    )
+                    execute_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="worker_cycle.execute_actions",
+                        started_monotonic=execute_started_monotonic,
+                        session_id=session.id,
+                        agent=agent,
+                        payload={
+                            "root_loop": current_root_loop,
+                            "success": execute_succeeded,
+                            "actions_count": len(actions),
+                            "has_finish_payload": bool(loop_result.finish_payload),
+                        },
+                    )
                 if self.interrupt_requested or not self._is_active_agent(agent):
                     return
                 if loop_result.finish_payload:
-                    await self._complete_worker(
-                        session=session,
-                        agent=agent,
-                        payload=loop_result.finish_payload,
-                        workspace_manager=workspace_manager,
-                        agents=agents,
-                        root_loop=current_root_loop,
-                    )
+                    complete_succeeded = False
+                    complete_started_monotonic = time.perf_counter()
+                    try:
+                        await self._complete_worker(
+                            session=session,
+                            agent=agent,
+                            payload=loop_result.finish_payload,
+                            workspace_manager=workspace_manager,
+                            agents=agents,
+                            root_loop=current_root_loop,
+                        )
+                        complete_succeeded = True
+                    finally:
+                        self._log_debug_timing(
+                            stage="worker_cycle.complete_worker",
+                            started_monotonic=complete_started_monotonic,
+                            session_id=session.id,
+                            agent=agent,
+                            payload={
+                                "root_loop": current_root_loop,
+                                "success": complete_succeeded,
+                            },
+                        )
                     return
                 await asyncio.sleep(0)
         finally:
@@ -6031,16 +6357,45 @@ class Orchestrator:
             if agent.role == AgentRole.WORKER and not self._is_active_agent(agent):
                 break
             action_type = str(action.get("type", "")).strip()
-            submit_result = await self._submit_tool_run(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-                force_wait=has_deferred_compress and action_type not in {"compress_context", "finish"},
-            )
+            submit_result: dict[str, Any] = {}
+            submit_succeeded = False
+            submit_started_monotonic = time.perf_counter()
+            try:
+                submit_result = await self._submit_tool_run(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                    force_wait=has_deferred_compress and action_type not in {"compress_context", "finish"},
+                )
+                submit_succeeded = True
+            finally:
+                maybe_submit_result = (
+                    submit_result if isinstance(submit_result, dict) else {}
+                )
+                maybe_agent_result = maybe_submit_result.get("agent_result")
+                projected_agent_result = maybe_agent_result if isinstance(maybe_agent_result, dict) else {}
+                self._log_debug_timing(
+                    stage="execute_action.submit",
+                    started_monotonic=submit_started_monotonic,
+                    session_id=session.id,
+                    agent=agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "action_type": action_type or None,
+                        "success": submit_succeeded
+                        and not str(projected_agent_result.get("error", "")).strip(),
+                        "submit_succeeded": submit_succeeded,
+                        "tool_run_id": str(projected_agent_result.get("tool_run_id", "")).strip()
+                        or None,
+                        "has_finish_payload": isinstance(
+                            maybe_submit_result.get("finish_payload"), dict
+                        ),
+                    },
+                )
             agent_result = submit_result.get("agent_result")
             if not isinstance(agent_result, dict):
                 agent_result = {}
@@ -6102,6 +6457,9 @@ class Orchestrator:
             if isinstance(session.mcp_state, dict)
             else {}
         )
+        mcp_prepare_started_monotonic = time.perf_counter()
+        mcp_prepare_succeeded = False
+        mcp_prepare_error: str | None = None
         try:
             mcp_payload = await self.mcp_manager.prepare_agent(
                 session=session,
@@ -6111,6 +6469,7 @@ class Orchestrator:
                 tool_executor=self.tool_executor,
             )
         except McpError as exc:
+            mcp_prepare_error = str(exc)
             if not isinstance(agent.metadata, dict):
                 agent.metadata = {}
             agent.metadata["mcp"] = {
@@ -6143,6 +6502,7 @@ class Orchestrator:
                 payload={"error": str(exc)},
             )
         else:
+            mcp_prepare_succeeded = True
             if not isinstance(agent.metadata, dict):
                 agent.metadata = {}
             agent.metadata["mcp"] = mcp_payload
@@ -6170,12 +6530,41 @@ class Orchestrator:
                     agent_id=agent.id,
                     workspace_id=agent.workspace_id,
                 )
+        finally:
+            self._log_debug_timing(
+                stage="ask_agent.prepare_mcp",
+                started_monotonic=mcp_prepare_started_monotonic,
+                session_id=session.id,
+                agent=agent,
+                payload={
+                    "success": mcp_prepare_succeeded,
+                    "error": mcp_prepare_error,
+                    "enabled_mcp_server_count": len(session.enabled_mcp_server_ids),
+                },
+            )
         self.storage.upsert_agent(agent)
-        return await self.agent_runtime.ask(
-            agent,
-            self.llm_client,
-            model_override=self._runtime_model_override,
-        )
+        actions: list[dict[str, Any]] = []
+        llm_ask_succeeded = False
+        llm_ask_started_monotonic = time.perf_counter()
+        try:
+            actions = await self.agent_runtime.ask(
+                agent,
+                self.llm_client,
+                model_override=self._runtime_model_override,
+            )
+            llm_ask_succeeded = True
+            return actions
+        finally:
+            self._log_debug_timing(
+                stage="ask_agent.llm_roundtrip",
+                started_monotonic=llm_ask_started_monotonic,
+                session_id=session.id,
+                agent=agent,
+                payload={
+                    "success": llm_ask_succeeded,
+                    "actions_count": len(actions) if llm_ask_succeeded else None,
+                },
+            )
 
     def _consume_waiting_steers_for_agent(self, agent: AgentNode) -> None:
         waiting_runs = self._list_steer_runs_all(
@@ -6494,97 +6883,119 @@ class Orchestrator:
         root_loop: int,
         tracked_pending_ids: list[str] | None,
     ) -> dict[str, Any]:
-        raw_result: dict[str, Any]
+        raw_result: dict[str, Any] = {}
         action_type = str(action.get("type", "")).strip()
-        if self._is_dynamic_mcp_tool(agent=agent, action_type=action_type):
-            raw_result = await self._execute_mcp_dynamic_tool(
+        execute_started_monotonic = time.perf_counter()
+        execute_succeeded = False
+        execute_error: str | None = None
+        try:
+            if self._is_dynamic_mcp_tool(agent=agent, action_type=action_type):
+                raw_result = await self._execute_mcp_dynamic_tool(
+                    agent=agent,
+                    action=action,
+                )
+            elif action_type == "shell":
+                raw_result = await self._execute_shell_action(
+                    agent,
+                    action,
+                    workspace_manager,
+                    tool_run_id=run.id,
+                )
+            elif action_type == "list_mcp_servers":
+                raw_result = await self._list_mcp_servers_result(agent=agent, action=action)
+            elif action_type == "list_mcp_resources":
+                raw_result = await self._list_mcp_resources_result(agent=agent, action=action)
+            elif action_type == "read_mcp_resource":
+                raw_result = await self._read_mcp_resource_result(agent=agent, action=action)
+            elif action_type == "spawn_agent":
+                raw_result = await self._execute_spawn_tool_run(
+                    run=run,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    session=session,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "steer_agent":
+                raw_result = self._steer_agent_tool_result(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                )
+            elif action_type == "list_tool_runs":
+                raw_result = self._tool_run_list_result(agent=agent, action=action, agents=agents)
+            elif action_type == "get_tool_run":
+                raw_result = self._tool_run_get_result(agent=agent, action=action, agents=agents)
+            elif action_type == "wait_run":
+                raw_result = await self._run_wait_result(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                )
+            elif action_type == "cancel_tool_run":
+                raw_result = await self._tool_run_cancel_result(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "cancel_agent":
+                raw_result = await self._execute_read_only_action_with_timeout(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    tool_run_id=run.id,
+                )
+                await self._apply_cancel_agent_side_effects(
+                    session=session,
+                    requesting_agent=agent,
+                    action=action,
+                    raw_result=raw_result,
+                    agents=agents,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "wait_time":
+                raw_result = await self._wait_time_result(action=action)
+            elif action_type == "compress_context":
+                raw_result = await self.agent_runtime.compress_context(
+                    agent,
+                    llm_client=self.llm_client,
+                    reason="manual",
+                )
+            elif action_type == "finish":
+                raw_result = self._finish_tool_result(agent=agent, action=action, agents=agents)
+            else:
+                raw_result = await self._execute_read_only_action_with_timeout(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    tool_run_id=run.id,
+                )
+            execute_error = str(raw_result.get("error", "")).strip() or None
+            execute_succeeded = execute_error is None
+        except Exception as exc:
+            execute_error = str(exc)
+            raise
+        finally:
+            self._log_debug_timing(
+                stage="tool_run.execute",
+                started_monotonic=execute_started_monotonic,
+                session_id=session.id,
                 agent=agent,
-                action=action,
-            )
-        elif action_type == "shell":
-            raw_result = await self._execute_shell_action(
-                agent,
-                action,
-                workspace_manager,
-                tool_run_id=run.id,
-            )
-        elif action_type == "list_mcp_servers":
-            raw_result = await self._list_mcp_servers_result(agent=agent, action=action)
-        elif action_type == "list_mcp_resources":
-            raw_result = await self._list_mcp_resources_result(agent=agent, action=action)
-        elif action_type == "read_mcp_resource":
-            raw_result = await self._read_mcp_resource_result(agent=agent, action=action)
-        elif action_type == "spawn_agent":
-            raw_result = await self._execute_spawn_tool_run(
-                run=run,
-                agent=agent,
-                action=action,
-                agents=agents,
-                session=session,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "steer_agent":
-            raw_result = self._steer_agent_tool_result(
-                agent=agent,
-                action=action,
-                agents=agents,
-            )
-        elif action_type == "list_tool_runs":
-            raw_result = self._tool_run_list_result(agent=agent, action=action, agents=agents)
-        elif action_type == "get_tool_run":
-            raw_result = self._tool_run_get_result(agent=agent, action=action, agents=agents)
-        elif action_type == "wait_run":
-            raw_result = await self._run_wait_result(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-            )
-        elif action_type == "cancel_tool_run":
-            raw_result = await self._tool_run_cancel_result(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "cancel_agent":
-            raw_result = await self._execute_read_only_action_with_timeout(
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                tool_run_id=run.id,
-            )
-            await self._apply_cancel_agent_side_effects(
-                session=session,
-                requesting_agent=agent,
-                action=action,
-                raw_result=raw_result,
-                agents=agents,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "wait_time":
-            raw_result = await self._wait_time_result(action=action)
-        elif action_type == "compress_context":
-            raw_result = await self.agent_runtime.compress_context(
-                agent,
-                llm_client=self.llm_client,
-                reason="manual",
-            )
-        elif action_type == "finish":
-            raw_result = self._finish_tool_result(agent=agent, action=action, agents=agents)
-        else:
-            raw_result = await self._execute_read_only_action_with_timeout(
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                tool_run_id=run.id,
+                payload={
+                    "tool_run_id": run.id,
+                    "action_type": action_type or None,
+                    "success": execute_succeeded,
+                    "error": execute_error,
+                },
             )
 
         refreshed = self.storage.load_tool_run(run.id)

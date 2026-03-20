@@ -13,6 +13,7 @@
 - ✨ 功能
 - 📸 界面截图
 - 🚀 快速上手（推荐 Web UI）
+- 🔌 MCP 使用指南
 - 🖥️ TUI
 - 💻 CLI 常用命令
 - ⚙️ 配置与调试
@@ -33,7 +34,6 @@
 - 📝 工作区模式：支持 `Direct` 与 `Staged`；`Direct` 直接写入项目目录，`Staged` 先暂存 diff 并在用户审批后应用（远程仅支持 `Direct`）。
 - 🧰 Skills：session 可启用来自项目源/全局源的可复用 skill bundle；选中的 skills 会物化到 `.opencompany_skills/<session_id>/...`，并由 workers 继承使用。
 - 🔌 MCP client：session 可启用已配置的 MCP servers，把发现到的 MCP tools 直接暴露给 agents，并支持 MCP resources 浏览/读取，以及在安全前提下暴露 workspace roots。
-- 📦 默认内置 skills：本仓库默认在 `skills/` 下提供一组从 Codex 改造为 OpenCompany 结构的 skills（当前包括 `pdf`、`openai-docs`、`skill-creator` 和 `skill-installer`）。
 - 🔒 安全性：支持 `anthropic` [sandbox（SRT）](https://github.com/anthropic-experimental/sandbox-runtime) 与 `none`（不受限）两种运行后端。
 - 🖥️ 三种界面：支持 Web UI / TUI / CLI，推荐 Web UI（可视化支持中英双语，可查看会话总览、协作结构、各 agent 详情、工具与引导信息，并支持创建/导入会话、修改配置、创建/引导/终止 agent、打开 agent 环境终端等操作）。
 - 🤖 LLM 接入：支持通过 [OpenRouter](https://openrouter.ai/) 调用模型。
@@ -112,6 +112,113 @@ opencompany ui
 opencompany ui --host 0.0.0.0 --port 9090
 ```
 
+## 🔌 MCP 使用指南
+
+当前仓库已在 `opencompany.toml` 预置四个 MCP：两个默认启用的官方 hosted MCP（`huggingface`、`notion`），以及两个可选预置（`github`、`duckduckgo`）。
+
+1. 先在 `opencompany.toml` 里定义 MCP servers：
+
+```toml
+[mcp]
+protocol_version = "2025-11-25"
+
+[mcp.servers.huggingface]
+transport = "streamable_http"
+enabled = true
+title = "Hugging Face MCP"
+timeout_seconds = 30
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+
+[mcp.servers.notion]
+transport = "streamable_http"
+enabled = true
+title = "Notion MCP"
+timeout_seconds = 30
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+oauth_authorization_prompt = "consent"
+oauth_use_resource_param = false
+
+[mcp.servers.github]
+transport = "streamable_http"
+enabled = false
+title = "GitHub MCP"
+timeout_seconds = 30
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
+
+[mcp.servers.duckduckgo]
+transport = "stdio"
+enabled = false
+title = "DuckDuckGo MCP"
+timeout_seconds = 45
+command = "duckduckgo-mcp-server"
+args = []
+env = { DDG_SAFE_SEARCH = "MODERATE", DDG_REGION = "wt-wt" }
+```
+
+2. 准备环境变量与本地 MCP 依赖：
+
+```bash
+# GitHub MCP 鉴权头（必须包含 "Bearer " 前缀）
+export GITHUB_MCP_AUTHORIZATION="Bearer <your_github_pat>"
+
+# 或持久化写入 .env
+echo 'GITHUB_MCP_AUTHORIZATION=Bearer <your_github_pat>' >> .env
+
+# DuckDuckGo MCP 依赖（社区 server）
+# 方案 A：在 OpenCompany Conda 环境中安装
+conda run -n OpenCompany python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"
+
+# 方案 B：在当前激活的 Python 环境安装
+python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"
+```
+
+3. 打开 UI 前，可先用 CLI 校验配置：
+
+```bash
+opencompany mcp-servers
+opencompany mcp-servers --mcp-server filesystem
+```
+
+4. 对 Hugging Face、Notion 这类启用了 OAuth 的 hosted MCP，先登录一次：
+
+```bash
+opencompany mcp-login --mcp-server huggingface
+opencompany mcp-login --mcp-server notion
+```
+
+5. Web UI 中的使用方式：
+
+- `Skills` 和 `MCP Servers` 两块默认折叠；先展开对应标题栏，再进行选择和操作。
+- 页面加载时就会从 `opencompany.toml` 预加载已配置的 MCP servers；`发现` 用于刷新目录。
+- skills 和 MCP servers 都改成了直接点卡片启用/停用，不再需要手动输入。
+- 对启用了 OAuth 的 MCP 卡片，界面会直接显示 `登录` / `继续登录` / `重新登录` 和 `清除登录`；当登录仍在处理中时按钮不会被锁死，误关授权页后可直接重新打开，而 `清除登录` 会删除本地保存的 OAuth 记录，便于彻底重新授权。
+- 点击 `用默认项` 可同步 `enabled = true` 的默认集合；也可以用 `全选` 覆盖本次运行的配置默认项。
+- 完成选择后再启动或继续 session；此时 MCP 面板会显示每个 server 的连接状态、roots 暴露情况、tool/resource 数量、协议版本与告警信息。
+
+6. CLI 中对应的 run/resume 写法：
+
+```bash
+opencompany run --mcp-server huggingface --mcp-server notion "Inspect this repository and propose next engineering steps."
+opencompany run --mcp-server github --mcp-server duckduckgo "Research dependency risks and summarize latest references."
+opencompany resume <session_id> --mcp-server github "new instruction"
+```
+
+补充说明：
+
+- Web UI 中的选择只覆盖当前这次运行，不会回写 `opencompany.toml`。
+- Web UI 启动时就会加载已配置的 MCP servers；`发现` 负责刷新配置目录。真正的连接状态以及 tool/resource 运行态，要等 session 为 agent 完成 MCP 物化后才会出现。
+- `opencompany mcp-login --mcp-server <id>` 会执行 MCP OAuth discovery、PKCE 授权、可用时的动态 client 注册，并把 token 持久化给后续运行复用。
+- OpenCompany 现在会在同一运行进程内按 server 串行化 OAuth refresh，避免多个并发 agent 在 hosted MCP 返回 `401` 后抢用同一份 refresh token。
+- 当某个启用 OAuth 的 hosted MCP 在连接初始化阶段持续返回 `401`（例如 `invalid_token`、登录过期或缺少 refresh token）时，OpenCompany 会自动清理该 server 的本地 OAuth 记录，确保下一次登录从干净状态开始。
+- GitHub 的 hosted MCP 地址是 `https://api.githubcopilot.com/mcp/`。预置配置通过环境变量 `GITHUB_MCP_AUTHORIZATION` 提供 `Authorization` 头（值需为完整头值，例如 `Bearer <token>`）。请保持 `headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }`，这样 Web UI 的 MCP 卡片才会显示“登录配置”动作。
+- DuckDuckGo MCP 预置使用社区 `duckduckgo-mcp-server` 可执行程序。请先在当前运行环境安装（例如：`python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"`）。在默认受约束 sandbox 下，其搜索/抓取能力仍受网络策略限制。
+- Hugging Face 官方提供 hosted Streamable HTTP MCP，基础地址是 `https://huggingface.co/mcp`；官方也提供 `https://huggingface.co/mcp?login` 作为 OAuth 登录入口。OpenCompany 支持在配置中使用 `?login`，但在运行态发起 MCP 传输请求时会自动去掉该查询标记。
+- Notion 官方提供 hosted MCP，地址是 `https://mcp.notion.com/mcp`；其官方接入文档采用 OAuth 2.0 Authorization Code + PKCE + token refresh，并通过 `Authorization: Bearer` 连接 MCP。OpenCompany 仍保持 `oauth_authorization_prompt = "consent"`，并启用 OAuth `resource` 参数，让 token 交换/刷新与 Notion 暴露的受保护资源元数据保持一致。
+- 对于配置成 `.../mcp` 的 hosted server，若初次 Streamable HTTP MCP 初始化失败，OpenCompany 现在会自动重试同级的 `.../sse` 端点。这与 Notion 官方“先试 Streamable HTTP，不行再回退 SSE”的建议一致。
+
 ## 🖥️ TUI
 
 TUI 仍然可用，可作为回退界面：
@@ -175,7 +282,7 @@ opencompany skills --remote-target demo@example.com:22 --remote-dir /home/demo/w
 - 把 skill 目录放到 `<project_dir>/skills/` 或 `<app_dir>/skills/` 下即可参与发现。
 - 但不是只有目录名就行；一个有效 skill 至少要包含 `skill.toml` 和 `SKILL.md`。
 - 如果项目源和全局源里存在同一个 `skill_id`，项目源会覆盖全局源。
-- 本仓库已经在 `skills/` 下内置了一组从 Codex 适配到 OpenCompany 结构的默认 skills。
+- 本仓库已经在 `skills/` 下内置一组默认 skills（包含从 Hugging Face Skills 适配的 `hf-cli`）。
 
 ```text
 <project_dir>/skills/<skill_id>/
@@ -201,6 +308,15 @@ tags = ["docs", "navigation"]
 
 ```bash
 opencompany skills --project-dir /path/to/target
+```
+
+从 Hugging Face Skills 导入示例：
+
+```bash
+python3 skills/skill-installer/resources/scripts/install-skill-from-github.py \
+  --repo huggingface/skills \
+  --path skills/hf-cli \
+  --dest skills
 ```
 
 显式启用 skills 运行：
@@ -350,7 +466,7 @@ opencompany ui --debug
 opencompany tui --debug
 ```
 
-启用 `--debug` 后，API 请求/响应追踪会写入 `.opencompany/sessions/<session_id>/debug/`。
+启用 `--debug` 后，API 请求/响应追踪与分阶段耗时追踪会写入 `.opencompany/sessions/<session_id>/debug/`。
 
 ## 🔒 运行时安全模型
 
@@ -395,6 +511,7 @@ opencompany tui --debug
 - 会话事件：`.opencompany/sessions/<session_id>/events.jsonl`
 - 每个 agent 的消息：`.opencompany/sessions/<session_id>/<agent_id>_messages.jsonl`
 - 可选 API 调试追踪：`.opencompany/sessions/<session_id>/debug/<agent_id>__<module>.jsonl`
+- 可选调试耗时追踪：`.opencompany/sessions/<session_id>/debug/timings.jsonl`
 - 远程会话配置（远程模式）：`.opencompany/sessions/<session_id>/remote_session.json`
 - 跨会话诊断日志：`.opencompany/diagnostics.jsonl`
 

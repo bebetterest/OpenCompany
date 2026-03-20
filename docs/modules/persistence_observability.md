@@ -31,6 +31,7 @@ Per session:
 - `events.jsonl`: runtime status/activity stream
 - `<agent_id>_messages.jsonl`: message-first conversation source
 - optional `debug/<agent_id>__<module>.jsonl`: LLM debug request/response tracing (scoped per agent+module)
+- optional `debug/timings.jsonl`: stage-level runtime timing tracing (`--debug` only)
 
 Global:
 

@@ -314,6 +314,11 @@ enabled = false
 title = "Docs"
 url = "http://127.0.0.1:8787/mcp"
 headers = { Authorization = "env:DOCS_TOKEN", "X-Test" = "demo" }
+oauth_enabled = true
+oauth_scopes = ["search", "read"]
+oauth_client_name = "Docs Client"
+oauth_authorization_prompt = "consent"
+oauth_use_resource_param = false
 """.strip(),
                 encoding="utf-8",
             )
@@ -334,6 +339,11 @@ headers = { Authorization = "env:DOCS_TOKEN", "X-Test" = "demo" }
             self.assertEqual(docs.url, "http://127.0.0.1:8787/mcp")
             self.assertEqual(docs.headers["Authorization"], "env:DOCS_TOKEN")
             self.assertFalse(docs.enabled)
+            self.assertTrue(docs.oauth_enabled)
+            self.assertEqual(docs.oauth_scopes, ["search", "read"])
+            self.assertEqual(docs.oauth_client_name, "Docs Client")
+            self.assertEqual(docs.oauth_authorization_prompt, "consent")
+            self.assertFalse(docs.oauth_use_resource_param)
 
     def test_mcp_rejects_invalid_transport_configuration(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -347,4 +357,20 @@ command = "python -m demo"
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "requires non-empty url"):
+                OpenCompanyConfig.load(project_dir)
+
+    def test_mcp_rejects_oauth_secret_without_client_id(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            (project_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.docs]
+transport = "streamable_http"
+url = "https://example.com/mcp"
+oauth_enabled = true
+oauth_client_secret = "secret"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "oauth_client_secret requires oauth_client_id"):
                 OpenCompanyConfig.load(project_dir)

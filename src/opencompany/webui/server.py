@@ -243,6 +243,62 @@ def create_webui_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @app.post("/api/mcp/oauth/start")
+    async def api_mcp_oauth_start(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        try:
+            result = await state.start_mcp_oauth_login(
+                _optional_string(body.get("server_id")) or "",
+                timeout_seconds=float(body.get("timeout_seconds") or 300.0),
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/api/mcp/oauth/{flow_id}")
+    async def api_mcp_oauth_status(flow_id: str) -> JSONResponse:
+        try:
+            result = await state.mcp_oauth_login_status(flow_id)
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/oauth/clear")
+    async def api_mcp_oauth_clear(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        try:
+            result = await state.clear_mcp_oauth_login(
+                _optional_string(body.get("server_id")) or ""
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/env-auth/configure")
+    async def api_mcp_env_auth_configure(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        raw_values = body.get("values")
+        if not isinstance(raw_values, dict):
+            raise HTTPException(status_code=400, detail="values must be an object.")
+        try:
+            result = await state.configure_mcp_env_auth(
+                _optional_string(body.get("server_id")) or "",
+                raw_values,
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @app.post("/api/interrupt")
     async def api_interrupt() -> dict[str, Any]:
         return state.interrupt()

@@ -31,6 +31,7 @@
 - `events.jsonl`：运行状态/活动流
 - `<agent_id>_messages.jsonl`：message-first 主对话源
 - 可选 `debug/<agent_id>__<module>.jsonl`：LLM 请求/响应调试追踪（按 agent+module 分文件）
+- 可选 `debug/timings.jsonl`：阶段级运行耗时追踪（仅 `--debug`）
 
 全局：
 

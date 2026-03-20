@@ -716,6 +716,51 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(llm_client.scopes_seen)
             self.assertTrue(all(scope[0].startswith("agent-") for scope in llm_client.scopes_seen))
 
+    async def test_debug_timings_are_written_per_session(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(
+                project_dir,
+                locale="en",
+                app_dir=project_dir,
+                debug=True,
+            )
+            orchestrator.llm_client = FakeLLMClient(
+                [
+                    json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "done",
+                                }
+                            ]
+                        }
+                    )
+                ]
+            )
+
+            session = await orchestrator.run_task("Run with debug timings")
+            timings_path = orchestrator.paths.session_logs_path(
+                session.id,
+                "debug/timings.jsonl",
+            )
+            self.assertTrue(timings_path.exists())
+            records = [
+                json.loads(line)
+                for line in timings_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(records)
+            stages = {str(record.get("stage", "")).strip() for record in records}
+            self.assertIn("ask_agent.llm_roundtrip", stages)
+            self.assertIn("execute_action.submit", stages)
+            self.assertIn("tool_run.execute", stages)
+            for record in records:
+                self.assertGreaterEqual(int(record.get("duration_ms", -1)), 0)
+
     async def test_subscriber_errors_do_not_abort_session(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)

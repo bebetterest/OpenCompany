@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 from pathlib import Path
@@ -16,6 +17,14 @@ from opencompany.mcp.manager import (
     _AgentMcpContext,
     _AgentServerContext,
     render_mcp_prompt,
+)
+from opencompany.mcp.oauth import (
+    McpOAuthError,
+    McpOAuthSessionRecord,
+    McpOAuthStore,
+    McpOAuthTokenProvider,
+    complete_mcp_oauth_login,
+    discover_oauth_metadata,
 )
 from opencompany.mcp.models import (
     MCP_MAX_INLINE_BINARY_BYTES,
@@ -33,6 +42,7 @@ from opencompany.mcp.models import (
     truncate_text_payload,
 )
 from opencompany.mcp.session import (
+    LegacySseMcpTransport,
     McpClientSession,
     McpError,
     McpProtocolError,
@@ -41,6 +51,8 @@ from opencompany.mcp.session import (
     StdioMcpTransport,
     StreamableHttpMcpTransport,
     _SseParser,
+    derive_legacy_sse_url,
+    normalize_streamable_http_url,
 )
 from opencompany.models import AgentNode, AgentRole, RunSession
 
@@ -281,6 +293,26 @@ class McpTransportTests(unittest.TestCase):
             ],
         )
 
+    def test_normalize_streamable_http_url_strips_login_query_flag(self) -> None:
+        self.assertEqual(
+            normalize_streamable_http_url("https://huggingface.co/mcp?login"),
+            "https://huggingface.co/mcp",
+        )
+        self.assertEqual(
+            normalize_streamable_http_url("https://example.com/mcp?login=true&mode=fast"),
+            "https://example.com/mcp?mode=fast",
+        )
+        self.assertEqual(
+            normalize_streamable_http_url("https://example.com/mcp?mode=fast"),
+            "https://example.com/mcp?mode=fast",
+        )
+
+    def test_derive_legacy_sse_url_ignores_login_query_flag(self) -> None:
+        self.assertEqual(
+            derive_legacy_sse_url("https://huggingface.co/mcp?login"),
+            "https://huggingface.co/sse",
+        )
+
     def test_stdio_transport_parses_stdout_and_stderr(self) -> None:
         async def run() -> None:
             messages: list[dict[str, Any]] = []
@@ -425,7 +457,7 @@ class McpTransportTests(unittest.TestCase):
             self.assertIsNone(transport._reader_task)
             self.assertEqual(
                 client.deleted,
-                [("http://127.0.0.1:8787/mcp", transport._request_headers())],
+                [("http://127.0.0.1:8787/mcp", await transport._request_headers())],
             )
             self.assertTrue(client.closed)
 
@@ -446,6 +478,579 @@ class McpTransportTests(unittest.TestCase):
                 await transport._handle_event_data("{")
             with self.assertRaisesRegex(McpProtocolError, "must be a JSON object"):
                 await transport._handle_event_data("[]")
+
+        asyncio.run(run())
+
+    def test_legacy_sse_transport_discovers_message_endpoint_and_posts(self) -> None:
+        async def run() -> None:
+            messages: list[dict[str, Any]] = []
+            transport = LegacySseMcpTransport(
+                url="http://127.0.0.1:8787/sse",
+                headers={},
+                timeout_seconds=5,
+                on_message=lambda message: messages.append(message),
+                on_diagnostic=lambda _event_type, _payload: None,
+            )
+            client = _FakeHttpClient(
+                {
+                    "GET": [
+                        _FakeHttpResponse(
+                            headers={"Content-Type": "text/event-stream"},
+                            text_chunks=[
+                                "event: endpoint\ndata: /messages?session_id=demo\n\n",
+                                'data: {"jsonrpc":"2.0","method":"server-ping"}\n\n',
+                            ],
+                        )
+                    ],
+                    "POST": [_FakeHttpResponse(status_code=202)],
+                }
+            )
+            transport._client = client  # type: ignore[assignment]
+
+            await transport.start()
+            await transport.send({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+            self.assertEqual(
+                transport.post_url,
+                "http://127.0.0.1:8787/messages?session_id=demo",
+            )
+            self.assertEqual(messages, [{"jsonrpc": "2.0", "method": "server-ping"}])
+            self.assertEqual(client.calls[0][0], "GET")
+            self.assertEqual(
+                client.calls[1][1],
+                "http://127.0.0.1:8787/messages?session_id=demo",
+            )
+
+            await transport.close()
+
+        asyncio.run(run())
+
+    def test_http_transport_refreshes_oauth_token_after_401(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                store_path = Path(temp_dir) / "mcp_oauth_tokens.json"
+                store = McpOAuthStore(store_path)
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.example.com/mcp",
+                        resource="https://mcp.example.com/mcp",
+                        resource_metadata_url=(
+                            "https://mcp.example.com/mcp/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://auth.example.com",
+                        issuer="https://auth.example.com",
+                        authorization_endpoint="https://auth.example.com/authorize",
+                        token_endpoint="https://auth.example.com/token",
+                        client_id="client-123",
+                        access_token="old-access",
+                        refresh_token="refresh-123",
+                    )
+                )
+
+                def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                    self.assertEqual(str(request.url), "https://auth.example.com/token")
+                    body = request.content.decode("utf-8")
+                    self.assertIn("grant_type=refresh_token", body)
+                    self.assertIn("resource=https%3A%2F%2Fmcp.example.com%2Fmcp", body)
+                    return httpx.Response(
+                        200,
+                        json={
+                            "access_token": "new-access",
+                            "refresh_token": "refresh-456",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        },
+                        request=request,
+                    )
+
+                provider = McpOAuthTokenProvider(
+                    server=McpServerConfig(
+                        id="notion",
+                        transport="streamable_http",
+                        url="https://mcp.example.com/mcp",
+                        oauth_enabled=True,
+                    ),
+                    store_path=store_path,
+                    http_client_factory=lambda: httpx.AsyncClient(
+                        transport=httpx.MockTransport(_oauth_handler)
+                    ),
+                )
+                transport = StreamableHttpMcpTransport(
+                    url="https://mcp.example.com/mcp",
+                    headers={},
+                    protocol_version="2025-11-25",
+                    timeout_seconds=5,
+                    oauth_provider=provider,
+                    on_message=lambda _message: None,
+                    on_diagnostic=lambda _event_type, _payload: None,
+                )
+                transport._client = _FakeHttpClient(
+                    {
+                        "POST": [
+                            _FakeHttpResponse(
+                                status_code=401,
+                                headers={"WWW-Authenticate": "Bearer realm=\"demo\""},
+                            ),
+                            _FakeHttpResponse(
+                                headers={"Content-Type": "application/json"},
+                                raw_content=b'{"jsonrpc":"2.0","id":1,"result":{}}',
+                            ),
+                        ]
+                    }
+                )  # type: ignore[assignment]
+
+                await transport.send({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+                first_call = transport._client.calls[0]
+                second_call = transport._client.calls[1]
+                self.assertEqual(first_call[2]["Authorization"], "Bearer old-access")
+                self.assertEqual(second_call[2]["Authorization"], "Bearer new-access")
+                stored = store.load_record("notion")
+                assert stored is not None
+                self.assertEqual(stored.refresh_token, "refresh-456")
+
+        asyncio.run(run())
+
+    def test_oauth_provider_normalizes_lowercase_bearer_scheme(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                store_path = Path(temp_dir) / "mcp_oauth_tokens.json"
+                store = McpOAuthStore(store_path)
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.example.com/mcp",
+                        resource="https://mcp.example.com",
+                        resource_metadata_url=(
+                            "https://mcp.example.com/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://auth.example.com",
+                        issuer="https://auth.example.com",
+                        authorization_endpoint="https://auth.example.com/authorize",
+                        token_endpoint="https://auth.example.com/token",
+                        client_id="client-123",
+                        access_token="access-xyz",
+                        refresh_token="refresh-xyz",
+                        token_type="bearer",
+                    )
+                )
+                provider = McpOAuthTokenProvider(
+                    server=McpServerConfig(
+                        id="notion",
+                        transport="streamable_http",
+                        url="https://mcp.example.com/mcp",
+                        oauth_enabled=True,
+                    ),
+                    store_path=store_path,
+                )
+
+                header = await provider.authorization_header()
+                self.assertEqual(header, "Bearer access-xyz")
+
+        asyncio.run(run())
+
+    def test_http_transport_unauthorized_error_includes_response_details(self) -> None:
+        async def run() -> None:
+            transport = StreamableHttpMcpTransport(
+                url="https://mcp.notion.com/mcp",
+                headers={},
+                protocol_version="2025-11-25",
+                timeout_seconds=5,
+                on_message=lambda _message: None,
+                on_diagnostic=lambda _event_type, _payload: None,
+            )
+            transport._client = _FakeHttpClient(
+                {
+                    "POST": [
+                        _FakeHttpResponse(
+                            status_code=401,
+                            headers={
+                                "Content-Type": "application/json",
+                                "WWW-Authenticate": 'Bearer realm="OAuth", error="invalid_token"',
+                            },
+                            raw_content=(
+                                b'{"error":"invalid_token","error_description":"Invalid token format"}'
+                            ),
+                        ),
+                    ]
+                }
+            )  # type: ignore[assignment]
+
+            with self.assertRaisesRegex(McpError, "error_description=Invalid token format"):
+                await transport.send({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+
+        asyncio.run(run())
+
+    def test_oauth_refresh_coalesces_concurrent_token_rotation(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                store_path = Path(temp_dir) / "mcp_oauth_tokens.json"
+                store = McpOAuthStore(store_path)
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.example.com/mcp",
+                        resource="https://mcp.example.com/mcp",
+                        resource_metadata_url=(
+                            "https://mcp.example.com/mcp/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://auth.example.com",
+                        issuer="https://auth.example.com",
+                        authorization_endpoint="https://auth.example.com/authorize",
+                        token_endpoint="https://auth.example.com/token",
+                        client_id="client-123",
+                        access_token="old-access",
+                        refresh_token="refresh-123",
+                    )
+                )
+                refresh_calls = 0
+
+                def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal refresh_calls
+                    refresh_calls += 1
+                    return httpx.Response(
+                        200,
+                        json={
+                            "access_token": "new-access",
+                            "refresh_token": "refresh-456",
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        },
+                        request=request,
+                    )
+
+                def _http_client_factory() -> httpx.AsyncClient:
+                    return httpx.AsyncClient(transport=httpx.MockTransport(_oauth_handler))
+
+                provider_a = McpOAuthTokenProvider(
+                    server=McpServerConfig(
+                        id="notion",
+                        transport="streamable_http",
+                        url="https://mcp.example.com/mcp",
+                        oauth_enabled=True,
+                    ),
+                    store_path=store_path,
+                    http_client_factory=_http_client_factory,
+                )
+                provider_b = McpOAuthTokenProvider(
+                    server=McpServerConfig(
+                        id="notion",
+                        transport="streamable_http",
+                        url="https://mcp.example.com/mcp",
+                        oauth_enabled=True,
+                    ),
+                    store_path=store_path,
+                    http_client_factory=_http_client_factory,
+                )
+
+                refreshed = await asyncio.gather(
+                    provider_a.refresh_on_unauthorized(
+                        failed_authorization="Bearer old-access"
+                    ),
+                    provider_b.refresh_on_unauthorized(
+                        failed_authorization="Bearer old-access"
+                    ),
+                )
+
+                self.assertEqual(refreshed, [True, True])
+                self.assertEqual(refresh_calls, 1)
+                stored = store.load_record("notion")
+                assert stored is not None
+                self.assertEqual(stored.access_token, "new-access")
+                self.assertEqual(stored.refresh_token, "refresh-456")
+
+        asyncio.run(run())
+
+    def test_discover_oauth_metadata_prefers_protected_resource_value(self) -> None:
+        async def run() -> None:
+            def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                url = str(request.url)
+                if url == "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource":
+                    return httpx.Response(
+                        401,
+                        json={
+                            "error": "invalid_token",
+                            "error_description": "Missing or invalid access token",
+                        },
+                        request=request,
+                    )
+                if url == "https://mcp.notion.com/.well-known/oauth-protected-resource":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "resource": "https://mcp.notion.com",
+                            "authorization_servers": ["https://mcp.notion.com"],
+                        },
+                        request=request,
+                    )
+                if url == "https://mcp.notion.com/.well-known/oauth-authorization-server":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "issuer": "https://mcp.notion.com",
+                            "authorization_endpoint": "https://mcp.notion.com/authorize",
+                            "token_endpoint": "https://mcp.notion.com/token",
+                            "registration_endpoint": "https://mcp.notion.com/register",
+                            "code_challenge_methods_supported": ["S256"],
+                        },
+                        request=request,
+                    )
+                raise AssertionError(f"Unexpected OAuth URL: {url}")
+
+            metadata = await discover_oauth_metadata(
+                "https://mcp.notion.com/mcp",
+                http_client_factory=lambda: httpx.AsyncClient(
+                    transport=httpx.MockTransport(_oauth_handler)
+                ),
+            )
+
+            self.assertEqual(metadata.resource, "https://mcp.notion.com")
+            self.assertEqual(
+                metadata.resource_metadata_url,
+                "https://mcp.notion.com/.well-known/oauth-protected-resource",
+            )
+            self.assertEqual(metadata.authorization_server, "https://mcp.notion.com")
+
+        asyncio.run(run())
+
+    def test_discover_oauth_metadata_skips_non_json_protected_resource_candidate(self) -> None:
+        async def run() -> None:
+            def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                url = str(request.url)
+                if url == "https://huggingface.co/mcp/.well-known/oauth-protected-resource":
+                    return httpx.Response(
+                        200,
+                        text="<html><body>HF MCP Server</body></html>",
+                        headers={"content-type": "text/html; charset=utf-8"},
+                        request=request,
+                    )
+                if url == "https://huggingface.co/.well-known/oauth-protected-resource":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "resource": "https://huggingface.co/mcp",
+                            "authorization_servers": ["https://huggingface.co"],
+                        },
+                        request=request,
+                    )
+                if url == "https://huggingface.co/.well-known/oauth-authorization-server":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "issuer": "https://huggingface.co",
+                            "authorization_endpoint": "https://huggingface.co/oauth/authorize",
+                            "token_endpoint": "https://huggingface.co/oauth/token",
+                        },
+                        request=request,
+                    )
+                raise AssertionError(f"Unexpected OAuth URL: {url}")
+
+            metadata = await discover_oauth_metadata(
+                "https://huggingface.co/mcp",
+                http_client_factory=lambda: httpx.AsyncClient(
+                    transport=httpx.MockTransport(_oauth_handler)
+                ),
+            )
+
+            self.assertEqual(metadata.resource, "https://huggingface.co/mcp")
+            self.assertEqual(
+                metadata.resource_metadata_url,
+                "https://huggingface.co/.well-known/oauth-protected-resource",
+            )
+            self.assertEqual(metadata.authorization_server, "https://huggingface.co")
+            self.assertEqual(
+                metadata.authorization_endpoint,
+                "https://huggingface.co/oauth/authorize",
+            )
+            self.assertEqual(
+                metadata.token_endpoint,
+                "https://huggingface.co/oauth/token",
+            )
+
+        asyncio.run(run())
+
+    def test_complete_mcp_oauth_login_reports_timeout_with_actionable_error(self) -> None:
+        async def run() -> None:
+            seen: dict[str, str] = {}
+
+            def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                url = str(request.url)
+                if url == "https://mcp.example.com/mcp/.well-known/oauth-protected-resource":
+                    return httpx.Response(
+                        200,
+                        json={"authorization_servers": ["https://auth.example.com"]},
+                        request=request,
+                    )
+                if url == "https://auth.example.com/.well-known/oauth-authorization-server":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "issuer": "https://auth.example.com",
+                            "authorization_endpoint": "https://auth.example.com/authorize",
+                            "token_endpoint": "https://auth.example.com/token",
+                        },
+                        request=request,
+                    )
+                raise AssertionError(f"Unexpected OAuth URL: {url}")
+
+            class _TimeoutCallbackServer:
+                def __init__(self) -> None:
+                    self.redirect_uri = "http://127.0.0.1/fake-callback"
+
+                async def __aenter__(self) -> "_TimeoutCallbackServer":
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb) -> None:
+                    del exc_type, exc, tb
+
+                async def wait_for_callback(self, *, timeout_seconds: float) -> dict[str, str]:
+                    del timeout_seconds
+                    raise TimeoutError()
+
+            with self.assertRaisesRegex(
+                McpOAuthError,
+                "OAuth login timed out for server 'docs' after 8s",
+            ):
+                await complete_mcp_oauth_login(
+                    server=McpServerConfig(
+                        id="docs",
+                        transport="streamable_http",
+                        url="https://mcp.example.com/mcp",
+                        oauth_enabled=True,
+                        oauth_client_id="client-123",
+                    ),
+                    store_path=Path("/tmp/unused-mcp-oauth-timeout.json"),
+                    timeout_seconds=8.0,
+                    open_browser=False,
+                    authorization_url_callback=lambda url: seen.__setitem__(
+                        "authorization_url", url
+                    ),
+                    http_client_factory=lambda: httpx.AsyncClient(
+                        transport=httpx.MockTransport(_oauth_handler)
+                    ),
+                    callback_server_factory=_TimeoutCallbackServer,
+                )
+
+            self.assertTrue(
+                str(seen.get("authorization_url", "")).startswith(
+                    "https://auth.example.com/authorize?"
+                )
+            )
+
+        asyncio.run(run())
+
+    def test_complete_mcp_oauth_login_registers_client_and_persists_tokens(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                store_path = Path(temp_dir) / "mcp_oauth_tokens.json"
+                seen: dict[str, str] = {}
+
+                def _oauth_handler(request: httpx.Request) -> httpx.Response:
+                    url = str(request.url)
+                    if url == "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource":
+                        return httpx.Response(
+                            200,
+                            json={"authorization_servers": ["https://auth.notion.com"]},
+                            request=request,
+                        )
+                    if url == "https://auth.notion.com/.well-known/oauth-authorization-server":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "issuer": "https://auth.notion.com",
+                                "authorization_endpoint": "https://auth.notion.com/authorize",
+                                "token_endpoint": "https://auth.notion.com/token",
+                                "registration_endpoint": "https://auth.notion.com/register",
+                                "code_challenge_methods_supported": ["S256"],
+                            },
+                            request=request,
+                        )
+                    if url == "https://auth.notion.com/register":
+                        seen["registration_body"] = request.content.decode("utf-8")
+                        return httpx.Response(
+                            200,
+                            json={"client_id": "client-xyz"},
+                            request=request,
+                        )
+                    if url == "https://auth.notion.com/token":
+                        seen["token_body"] = request.content.decode("utf-8")
+                        seen["token_user_agent"] = request.headers.get("User-Agent", "")
+                        return httpx.Response(
+                            200,
+                            json={
+                                "access_token": "access-xyz",
+                                "refresh_token": "refresh-xyz",
+                                "token_type": "Bearer",
+                                "expires_in": 3600,
+                            },
+                            request=request,
+                        )
+                    raise AssertionError(f"Unexpected OAuth URL: {url}")
+
+                def _browser_opener(url: str) -> bool:
+                    parsed = httpx.URL(url)
+                    seen["redirect_uri"] = parsed.params["redirect_uri"]
+                    seen["state"] = parsed.params["state"]
+                    seen["authorization_url"] = url
+                    return True
+
+                class _FakeCallbackServer:
+                    def __init__(self) -> None:
+                        self.redirect_uri = "http://127.0.0.1/fake-callback"
+
+                    async def __aenter__(self) -> "_FakeCallbackServer":
+                        return self
+
+                    async def __aexit__(self, exc_type, exc, tb) -> None:
+                        del exc_type, exc, tb
+
+                    async def wait_for_callback(self, *, timeout_seconds: float) -> dict[str, str]:
+                        del timeout_seconds
+                        return {
+                            "code": "code-xyz",
+                            "state": seen["state"],
+                        }
+
+                result = await complete_mcp_oauth_login(
+                    server=McpServerConfig(
+                        id="notion",
+                        transport="streamable_http",
+                        url="https://mcp.notion.com/mcp",
+                        oauth_enabled=True,
+                        oauth_client_name="OpenCompany Test Client",
+                        oauth_authorization_prompt="consent",
+                        oauth_use_resource_param=False,
+                    ),
+                    store_path=store_path,
+                    timeout_seconds=10.0,
+                    open_browser=True,
+                    browser_opener=_browser_opener,
+                    http_client_factory=lambda: httpx.AsyncClient(
+                        transport=httpx.MockTransport(_oauth_handler)
+                    ),
+                    callback_server_factory=_FakeCallbackServer,
+                )
+
+                self.assertTrue(result.browser_opened)
+                self.assertIn("prompt=consent", seen["authorization_url"])
+                self.assertNotIn("resource=", seen["authorization_url"])
+                registration_payload = json.loads(seen["registration_body"])
+                self.assertEqual(
+                    registration_payload["token_endpoint_auth_method"],
+                    "none",
+                )
+                self.assertEqual(
+                    registration_payload["redirect_uris"],
+                    ["http://127.0.0.1/fake-callback"],
+                )
+                self.assertNotIn("resource=", seen["token_body"])
+                self.assertEqual(seen["token_user_agent"], "OpenCompany/0.1.0")
+                stored = McpOAuthStore(store_path).load_record("notion")
+                assert stored is not None
+                self.assertEqual(stored.client_id, "client-xyz")
+                self.assertEqual(stored.access_token, "access-xyz")
+                self.assertEqual(stored.refresh_token, "refresh-xyz")
 
         asyncio.run(run())
 
@@ -926,6 +1531,45 @@ title = "Docs"
                 "MCP server 'missing-server' is not defined in opencompany.toml.",
             )
 
+    def test_build_transport_normalizes_huggingface_login_url(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.huggingface]
+transport = "streamable_http"
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+""".strip(),
+                    encoding="utf-8",
+                )
+                manager = self._manager(project_dir)
+                server = manager.config.mcp.servers["huggingface"]
+                context = _AgentMcpContext(
+                    session_id="session-1",
+                    agent_id="agent-1",
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    enabled_server_ids=["huggingface"],
+                )
+
+                transport = await manager._build_transport(  # type: ignore[attr-defined]
+                    context=context,
+                    server=server,
+                    tool_executor=object(),
+                    on_message=lambda _message: None,
+                    on_diagnostic=lambda _event_type, _payload: None,
+                    runtime_transport="streamable_http",
+                    url_override="",
+                )
+
+                self.assertIsInstance(transport, StreamableHttpMcpTransport)
+                self.assertEqual(transport.url, "https://huggingface.co/mcp")
+                await transport.close()
+
+        asyncio.run(run())
+
     def test_prepare_agent_skips_stdio_server_for_remote_workspace(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -1049,6 +1693,66 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
                 )
                 self.assertFalse(server_context.runtime_state.tools_dirty)
                 self.assertFalse(server_context.runtime_state.resources_dirty)
+
+        asyncio.run(run())
+
+    def test_refresh_resources_treats_method_not_found_as_optional_capability(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                manager, diagnostics = self._manager_with_diagnostics(project_dir)
+                context = _AgentMcpContext(
+                    session_id="session-1",
+                    agent_id="agent-1",
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    enabled_server_ids=["huggingface"],
+                )
+                server_context = _AgentServerContext(
+                    server=McpServerConfig(
+                        id="huggingface",
+                        title="Hugging Face MCP",
+                        transport="streamable_http",
+                        url="https://huggingface.co/mcp",
+                    ),
+                    runtime_state=McpServerRuntimeState(
+                        server_id="huggingface",
+                        title="Hugging Face MCP",
+                        transport="streamable_http",
+                        enabled=True,
+                        connected=True,
+                        resources_dirty=True,
+                    ),
+                )
+
+                class _Session:
+                    async def request(
+                        self,
+                        method: str,
+                        params: dict[str, Any] | None,
+                    ) -> dict[str, Any]:
+                        del params
+                        if method == "resources/list":
+                            raise McpRequestError(code=-32601, message="Method not found")
+                        raise AssertionError(method)
+
+                server_context.session = _Session()  # type: ignore[assignment]
+
+                await manager._refresh_resources(  # type: ignore[attr-defined]
+                    context=context,
+                    server_context=server_context,
+                )
+
+                self.assertEqual(server_context.resources, [])
+                self.assertEqual(server_context.runtime_state.resource_count, 0)
+                self.assertFalse(server_context.runtime_state.resources_dirty)
+                self.assertTrue(server_context.runtime_state.connected)
+                self.assertEqual(server_context.runtime_state.warning, "")
+                self.assertIn(
+                    "mcp_resources_not_supported",
+                    [event_type for event_type, _payload in diagnostics],
+                )
 
         asyncio.run(run())
 
@@ -1235,6 +1939,280 @@ url = "http://127.0.0.1:8788/mcp"
 
         asyncio.run(run())
 
+    def test_prepare_agent_preserves_oauth_record_after_generic_unauthorized_failure(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                    encoding="utf-8",
+                )
+                manager, diagnostics = self._manager_with_diagnostics(project_dir)
+                store = McpOAuthStore(project_dir / ".opencompany" / "mcp_oauth_tokens.json")
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.notion.com/mcp",
+                        resource="https://mcp.notion.com/mcp",
+                        resource_metadata_url=(
+                            "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://mcp.notion.com",
+                        issuer="https://mcp.notion.com",
+                        authorization_endpoint="https://mcp.notion.com/authorize",
+                        token_endpoint="https://mcp.notion.com/token",
+                        client_id="client-1",
+                        access_token="access-1",
+                        refresh_token="refresh-1",
+                    )
+                )
+                session = RunSession(
+                    id="session-1",
+                    project_dir=project_dir,
+                    task="demo",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    enabled_mcp_server_ids=["notion"],
+                )
+                agent = AgentNode(
+                    id="agent-root",
+                    session_id="session-1",
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="demo",
+                    workspace_id="workspace-root",
+                )
+
+                async def _raise_unauthorized(*, context, server_context, tool_executor) -> None:  # type: ignore[no-untyped-def]
+                    del context, server_context, tool_executor
+                    raise RuntimeError(
+                        "Client error '401 Unauthorized' for url 'https://mcp.notion.com/mcp'"
+                    )
+
+                manager._ensure_server_connected = _raise_unauthorized  # type: ignore[method-assign]
+                payload = await manager.prepare_agent(
+                    session=session,
+                    agent=agent,
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    tool_executor=object(),
+                )
+
+                self.assertFalse(payload["entries"][0]["connected"])
+                self.assertIsNotNone(store.load_record("notion"))
+                self.assertIn(
+                    "mcp_oauth_preserved_after_unauthorized",
+                    [event for event, _payload in diagnostics],
+                )
+
+        asyncio.run(run())
+
+    def test_prepare_agent_clears_oauth_record_after_invalid_token_unauthorized_failure(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.huggingface]
+transport = "streamable_http"
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+""".strip(),
+                    encoding="utf-8",
+                )
+                manager, diagnostics = self._manager_with_diagnostics(project_dir)
+                store = McpOAuthStore(project_dir / ".opencompany" / "mcp_oauth_tokens.json")
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="huggingface",
+                        server_url="https://huggingface.co/mcp",
+                        resource="https://huggingface.co/mcp",
+                        resource_metadata_url=(
+                            "https://huggingface.co/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://huggingface.co",
+                        issuer="https://huggingface.co",
+                        authorization_endpoint="https://huggingface.co/oauth/authorize",
+                        token_endpoint="https://huggingface.co/oauth/token",
+                        client_id="client-1",
+                        access_token="access-1",
+                        refresh_token="refresh-1",
+                    )
+                )
+                session = RunSession(
+                    id="session-1",
+                    project_dir=project_dir,
+                    task="demo",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    enabled_mcp_server_ids=["huggingface"],
+                )
+                agent = AgentNode(
+                    id="agent-root",
+                    session_id="session-1",
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="demo",
+                    workspace_id="workspace-root",
+                )
+
+                async def _raise_invalid_token(*, context, server_context, tool_executor) -> None:  # type: ignore[no-untyped-def]
+                    del context, server_context, tool_executor
+                    raise RuntimeError(
+                        "Client error '401 Unauthorized' for url 'https://huggingface.co/mcp'. "
+                        "response=error=invalid_token, error_description=Invalid token format"
+                    )
+
+                manager._ensure_server_connected = _raise_invalid_token  # type: ignore[method-assign]
+                payload = await manager.prepare_agent(
+                    session=session,
+                    agent=agent,
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    tool_executor=object(),
+                )
+
+                self.assertFalse(payload["entries"][0]["connected"])
+                self.assertIsNone(store.load_record("huggingface"))
+                self.assertIn(
+                    "mcp_oauth_cleared_due_unauthorized",
+                    [event for event, _payload in diagnostics],
+                )
+
+        asyncio.run(run())
+
+    def test_prepare_agent_falls_back_to_sse_when_streamable_http_init_fails(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+""".strip(),
+                    encoding="utf-8",
+                )
+                manager, diagnostics = self._manager_with_diagnostics(project_dir)
+                session = RunSession(
+                    id="session-1",
+                    project_dir=project_dir,
+                    task="demo",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    enabled_mcp_server_ids=["notion"],
+                )
+                agent = AgentNode(
+                    id="agent-root",
+                    session_id="session-1",
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="demo",
+                    workspace_id="workspace-root",
+                )
+                attempts: list[tuple[str | None, str]] = []
+
+                async def _noop_refresh(*, context, server_context) -> None:  # type: ignore[no-untyped-def]
+                    del context, server_context
+
+                class _FailingTransport(McpTransport):
+                    def __init__(self, *, on_message, on_diagnostic) -> None:  # type: ignore[no-untyped-def]
+                        super().__init__(on_message=on_message, on_diagnostic=on_diagnostic)
+
+                    async def start(self) -> None:
+                        return None
+
+                    async def send(self, message: dict[str, Any]) -> None:
+                        del message
+                        request = httpx.Request("POST", "https://mcp.notion.com/mcp")
+                        raise httpx.HTTPStatusError(
+                            "401 Unauthorized",
+                            request=request,
+                            response=httpx.Response(401, request=request),
+                        )
+
+                    async def close(self) -> None:
+                        return None
+
+                class _HealthyTransport(McpTransport):
+                    def __init__(self, *, on_message, on_diagnostic) -> None:  # type: ignore[no-untyped-def]
+                        super().__init__(on_message=on_message, on_diagnostic=on_diagnostic)
+
+                    async def start(self) -> None:
+                        return None
+
+                    async def send(self, message: dict[str, Any]) -> None:
+                        if message.get("method") == "initialize" and "id" in message:
+                            await self.emit_message(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": message["id"],
+                                    "result": {
+                                        "protocolVersion": "2025-11-25",
+                                        "serverInfo": {"name": "Notion", "version": "1.0.0"},
+                                        "capabilities": {},
+                                    },
+                                }
+                            )
+
+                    async def close(self) -> None:
+                        return None
+
+                async def _fake_build_transport(  # type: ignore[no-untyped-def]
+                    *,
+                    context,
+                    server,
+                    tool_executor,
+                    on_message,
+                    on_diagnostic,
+                    runtime_transport=None,
+                    url_override="",
+                ):
+                    del context, server, tool_executor
+                    attempts.append((runtime_transport, url_override))
+                    if runtime_transport == "sse":
+                        return _HealthyTransport(
+                            on_message=on_message,
+                            on_diagnostic=on_diagnostic,
+                        )
+                    return _FailingTransport(
+                        on_message=on_message,
+                        on_diagnostic=on_diagnostic,
+                    )
+
+                manager._build_transport = _fake_build_transport  # type: ignore[method-assign]
+                manager._refresh_tools = _noop_refresh  # type: ignore[method-assign]
+                manager._refresh_resources = _noop_refresh  # type: ignore[method-assign]
+
+                payload = await manager.prepare_agent(
+                    session=session,
+                    agent=agent,
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    tool_executor=object(),
+                )
+
+                self.assertTrue(payload["entries"][0]["connected"])
+                self.assertEqual(payload["entries"][0]["transport"], "sse")
+                self.assertEqual(
+                    attempts,
+                    [
+                        ("streamable_http", ""),
+                        ("sse", "https://mcp.notion.com/sse"),
+                    ],
+                )
+                self.assertIn(
+                    "mcp_transport_fallback_succeeded",
+                    [event for event, _payload in diagnostics],
+                )
+
+        asyncio.run(run())
+
     def test_list_resources_paginates_and_filters_by_server(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -1379,6 +2357,12 @@ url = "http://127.0.0.1:8787/mcp"
                 self.assertEqual(len(healthy_payload["dynamic_tools"]), 1)
                 self.assertEqual(healthy_payload["entries"][0]["tool_count"], 1)
                 self.assertEqual(healthy_payload["entries"][0]["resource_count"], 1)
+                self.assertEqual(healthy_payload["entries"][0]["tool_names"], ["search"])
+                self.assertEqual(healthy_payload["entries"][0]["resource_uris"], ["file:///demo.txt"])
+                self.assertEqual(healthy_payload["entries"][0]["tool_items"][0]["tool_name"], "search")
+                self.assertEqual(
+                    healthy_payload["entries"][0]["resource_items"][0]["uri"], "file:///demo.txt"
+                )
 
                 async def _raise_server_failure(*, context, server_context, tool_executor) -> None:  # type: ignore[no-untyped-def]
                     del context, server_context, tool_executor
@@ -1397,6 +2381,10 @@ url = "http://127.0.0.1:8787/mcp"
                 self.assertFalse(degraded_payload["entries"][0]["connected"])
                 self.assertEqual(degraded_payload["entries"][0]["tool_count"], 0)
                 self.assertEqual(degraded_payload["entries"][0]["resource_count"], 0)
+                self.assertEqual(degraded_payload["entries"][0]["tool_names"], [])
+                self.assertEqual(degraded_payload["entries"][0]["resource_uris"], [])
+                self.assertEqual(degraded_payload["entries"][0]["tool_items"], [])
+                self.assertEqual(degraded_payload["entries"][0]["resource_items"], [])
                 self.assertEqual(
                     degraded_payload["warnings"][0]["message"],
                     "filesystem server unavailable",

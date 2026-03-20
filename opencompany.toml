@@ -199,9 +199,19 @@ allowed_domains = [
   # GitHub hosting and source download
   "github.com",
   "api.github.com",
+  "api.githubcopilot.com",
   "raw.githubusercontent.com",
   "codeload.github.com",
   "objects.githubusercontent.com",
+  # DuckDuckGo 与网页搜索相关域名（DuckDuckGo MCP）
+  # DuckDuckGo/web-search domains (DuckDuckGo MCP)
+  "duckduckgo.com",
+  "html.duckduckgo.com",
+  "links.duckduckgo.com",
+  # Hugging Face Hub / CLI
+  # Hugging Face Hub / CLI
+  "hf.co",
+  "huggingface.co",
   # 常用包仓库（Node / Python）
   # Common package registries (Node / Python)
   "registry.npmjs.org",
@@ -244,17 +254,69 @@ timeout_seconds = 300
 # initialize 阶段向 server 宣告的 MCP 协议版本
 protocol_version = "2025-11-25"
 
-# Example stdio MCP server
-# 示例：stdio MCP server
-#[mcp.servers.filesystem]
-#transport = "stdio"
+[mcp.servers.huggingface]
+transport = "streamable_http"
+enabled = true
+title = "Hugging Face MCP"
+timeout_seconds = 30
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+expose_roots = false
+allowed_tools = []
+
+[mcp.servers.notion]
+transport = "streamable_http"
+enabled = true
+title = "Notion MCP"
+timeout_seconds = 30
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+oauth_authorization_prompt = "consent"
+oauth_use_resource_param = false
+expose_roots = false
+allowed_tools = []
+
+# Optional GitHub official MCP (remote)
+# 可选：GitHub 官方 MCP（远程托管）
+[mcp.servers.github]
+transport = "streamable_http"
+enabled = true
+title = "GitHub MCP"
+timeout_seconds = 30
+url = "https://api.githubcopilot.com/mcp/"
+# Keep Authorization as env-backed value so Web UI can show "Login Config".
+# 请保持 Authorization 使用 env 变量，这样 Web UI 才会显示“登录配置”。
+# Set env var to a full auth header value, e.g.:
+# export GITHUB_MCP_AUTHORIZATION="Bearer <github_pat>"
+# 环境变量请填写完整头值，例如：
+# export GITHUB_MCP_AUTHORIZATION="Bearer <github_pat>"
+headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
+oauth_enabled = false
+expose_roots = false
+allowed_tools = []
+
+# Optional DuckDuckGo MCP (community, stdio via uvx)
+# 可选：DuckDuckGo MCP（社区版，uvx 方式启动）
+[mcp.servers.duckduckgo]
+transport = "stdio"
+enabled = true
+title = "DuckDuckGo MCP"
+timeout_seconds = 45
+command = "duckduckgo-mcp-server"
+args = []
+env = { DDG_SAFE_SEARCH = "MODERATE", DDG_REGION = "wt-wt" }
+expose_roots = false
+allowed_tools = []
+
+# Optional official Exa hosted MCP
+# 可选：官方 Exa hosted MCP
+#[mcp.servers.exa]
+#transport = "streamable_http"
 #enabled = false
-#title = "Filesystem MCP"
+#title = "Exa MCP"
 #timeout_seconds = 30
-#command = "npx"
-#args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
-#env = {}
-#cwd = "."
+#url = "https://mcp.exa.ai/mcp"
+#expose_roots = false
 #allowed_tools = []
 
 # Example Streamable HTTP MCP server

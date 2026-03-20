@@ -13,6 +13,7 @@ Language: **English** | [中文](README_cn.md)
 - ✨ Features
 - 📸 Screenshots
 - 🚀 Quick start (Web UI first)
+- 🔌 MCP usage guide
 - 🖥️ TUI
 - 💻 CLI command cheat sheet
 - ⚙️ Configuration and debugging
@@ -33,7 +34,6 @@ Language: **English** | [中文](README_cn.md)
 - 📝 Workspace modes: supports `Direct` and `Staged`; `Direct` writes to the project immediately, while `Staged` holds diffs for user approval before apply (remote supports `Direct` only).
 - 🧰 Skills: sessions can enable reusable skill bundles from project/global sources; selected skills are materialized into `.opencompany_skills/<session_id>/...` and inherited by workers.
 - 🔌 MCP client: sessions can enable configured MCP servers, expose discovered MCP tools directly to agents, browse/read MCP resources, and selectively expose workspace roots when safe.
-- 📦 Default bundled skills: this repository ships with a small default set of skills adapted from Codex for OpenCompany under `skills/` (currently `pdf`, `openai-docs`, `skill-creator`, and `skill-installer`).
 - 🔒 Security model: supports both `anthropic` [sandbox (SRT)](https://github.com/anthropic-experimental/sandbox-runtime) and `none` (unconstrained) runtime backends.
 - 🖥️ Three interfaces: supports Web UI / TUI / CLI, with Web UI recommended (bilingual visualization in Chinese/English covers session overview, collaboration graph, per-agent details, tool/steer traces, and operations like session create/import, config updates, agent create/steer/terminate, and opening agent terminals).
 - 🤖 LLM access: supports model calls through [OpenRouter](https://openrouter.ai/).
@@ -112,6 +112,113 @@ Default address: `http://127.0.0.1:8765`
 opencompany ui --host 0.0.0.0 --port 9090
 ```
 
+## 🔌 MCP usage guide
+
+This repository now preconfigures four MCP servers in `opencompany.toml`: two enabled official hosted servers (`huggingface`, `notion`) plus two optional presets (`github`, `duckduckgo`).
+
+1. Define MCP servers in `opencompany.toml`:
+
+```toml
+[mcp]
+protocol_version = "2025-11-25"
+
+[mcp.servers.huggingface]
+transport = "streamable_http"
+enabled = true
+title = "Hugging Face MCP"
+timeout_seconds = 30
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+
+[mcp.servers.notion]
+transport = "streamable_http"
+enabled = true
+title = "Notion MCP"
+timeout_seconds = 30
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+oauth_authorization_prompt = "consent"
+oauth_use_resource_param = false
+
+[mcp.servers.github]
+transport = "streamable_http"
+enabled = false
+title = "GitHub MCP"
+timeout_seconds = 30
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
+
+[mcp.servers.duckduckgo]
+transport = "stdio"
+enabled = false
+title = "DuckDuckGo MCP"
+timeout_seconds = 45
+command = "duckduckgo-mcp-server"
+args = []
+env = { DDG_SAFE_SEARCH = "MODERATE", DDG_REGION = "wt-wt" }
+```
+
+2. Prepare environment variables and local MCP dependencies:
+
+```bash
+# GitHub MCP auth header (must include "Bearer " prefix)
+export GITHUB_MCP_AUTHORIZATION="Bearer <your_github_pat>"
+
+# Or persist in .env
+echo 'GITHUB_MCP_AUTHORIZATION=Bearer <your_github_pat>' >> .env
+
+# DuckDuckGo MCP dependency (community server)
+# Option A: inside OpenCompany Conda environment
+conda run -n OpenCompany python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"
+
+# Option B: in your active Python environment
+python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"
+```
+
+3. Validate the config from CLI before opening the UI:
+
+```bash
+opencompany mcp-servers
+opencompany mcp-servers --mcp-server filesystem
+```
+
+4. For OAuth-enabled hosted servers such as Hugging Face and Notion, complete login once before using them:
+
+```bash
+opencompany mcp-login --mcp-server huggingface
+opencompany mcp-login --mcp-server notion
+```
+
+5. In Web UI:
+
+- The `Skills` and `MCP Servers` sections start collapsed by default; expand the section header to manage selections.
+- Configured MCP servers are preloaded from `opencompany.toml` on page load; `Discover` refreshes the catalog.
+- Click tiles directly to enable or disable skills and MCP servers; manual text input is no longer part of the Web UI flow.
+- OAuth-enabled MCP cards expose `Login` / `Continue Login` / `Re-login` plus `Clear Auth`; while a login is pending the button stays clickable so the authorization page can be reopened if it was closed accidentally, and `Clear Auth` drops the stored OAuth record so a hosted server can be fully reconnected from scratch.
+- Click `Use Defaults` to mirror servers with `enabled = true`, or use `Select All` to override the config for the current run.
+- Start or continue a session after selection; the MCP panel will then show connection status, roots exposure, tool/resource counts, protocol version, and warnings for each server.
+
+6. CLI run/resume equivalents:
+
+```bash
+opencompany run --mcp-server huggingface --mcp-server notion "Inspect this repository and propose next engineering steps."
+opencompany run --mcp-server github --mcp-server duckduckgo "Research dependency risks and summarize latest references."
+opencompany resume <session_id> --mcp-server github "new instruction"
+```
+
+Notes:
+
+- Web UI selections are per-run overrides; they do not rewrite `opencompany.toml`.
+- Configured MCP servers are loaded at Web UI bootstrap; `Discover` refreshes the configured catalog, while live connection/tool/resource status appears only after a session actually materializes MCP for an agent.
+- `opencompany mcp-login --mcp-server <id>` performs MCP OAuth discovery, PKCE-based authorization, dynamic client registration when available, and local token persistence for later runs.
+- OpenCompany now serializes OAuth refresh per server inside the runtime process, so concurrent agents do not race the same refresh token after a hosted MCP returns `401`.
+- When an OAuth-enabled hosted MCP keeps returning `401` during MCP connection setup (for example `invalid_token`, expired login, or missing refresh token), OpenCompany now clears that server's local OAuth record so the next login starts from a clean state.
+- GitHub's hosted MCP endpoint is `https://api.githubcopilot.com/mcp/`. The preset uses an `Authorization` header sourced from `GITHUB_MCP_AUTHORIZATION` (set it to a full value such as `Bearer <token>`). Keep this as `headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }` so the Web UI MCP card can show the `Login Config` action.
+- DuckDuckGo MCP preset uses the community `duckduckgo-mcp-server` executable. Install it first in your active environment (for example: `python -m pip install "duckduckgo-mcp-server @ git+https://github.com/nickclyde/duckduckgo-mcp-server.git"`). Under the default constrained sandbox, search/fetch results are still bounded by your network policy.
+- Hugging Face works as a hosted Streamable HTTP MCP server at `https://huggingface.co/mcp`; Hugging Face also documents OAuth login via `https://huggingface.co/mcp?login`. OpenCompany accepts `?login` in config, but strips that query flag before runtime MCP transport requests.
+- Notion provides an official hosted MCP server at `https://mcp.notion.com/mcp`, and its official integration guide uses OAuth 2.0 Authorization Code + PKCE + token refresh, plus a direct `Authorization: Bearer` MCP connection. OpenCompany keeps `oauth_authorization_prompt = "consent"` and enables the OAuth `resource` parameter so token exchange/refresh can target the protected resource metadata exposed by Notion.
+- For hosted servers configured on a `.../mcp` URL, OpenCompany now retries the sibling `.../sse` endpoint automatically when initial Streamable HTTP MCP initialization fails. This matches Notion's recommendation to try Streamable HTTP first and fall back to SSE if needed.
+
 ## 🖥️ TUI
 
 TUI is still supported as a fallback interface:
@@ -175,7 +282,7 @@ Add a skill:
 - Put the skill directory under either `<project_dir>/skills/` or `<app_dir>/skills/`.
 - It is not enough to create only the folder name; a valid skill must include at least `skill.toml` and `SKILL.md`.
 - If the same `skill_id` exists in both places, the project source overrides the global source.
-- This repository already includes a default bundled set of skills under `skills/`, adapted from Codex to the OpenCompany layout.
+- This repository already includes a default bundled set of skills under `skills/` (including `hf-cli`, adapted from Hugging Face Skills).
 
 ```text
 <project_dir>/skills/<skill_id>/
@@ -201,6 +308,15 @@ Verify discovery after adding it:
 
 ```bash
 opencompany skills --project-dir /path/to/target
+```
+
+Example import from Hugging Face Skills:
+
+```bash
+python3 skills/skill-installer/resources/scripts/install-skill-from-github.py \
+  --repo huggingface/skills \
+  --path skills/hf-cli \
+  --dest skills
 ```
 
 Run with explicit skills:
@@ -350,7 +466,7 @@ opencompany ui --debug
 opencompany tui --debug
 ```
 
-With `--debug`, API request/response traces are written to `.opencompany/sessions/<session_id>/debug/`.
+With `--debug`, API request/response traces and per-stage timing traces are written to `.opencompany/sessions/<session_id>/debug/`.
 
 ## 🔒 Runtime safety model
 
@@ -395,6 +511,7 @@ Dependency setup (anthropic backend):
 - Session events: `.opencompany/sessions/<session_id>/events.jsonl`
 - Per-agent messages: `.opencompany/sessions/<session_id>/<agent_id>_messages.jsonl`
 - Optional API debug traces: `.opencompany/sessions/<session_id>/debug/<agent_id>__<module>.jsonl`
+- Optional debug timing traces: `.opencompany/sessions/<session_id>/debug/timings.jsonl`
 - Remote session config (when remote): `.opencompany/sessions/<session_id>/remote_session.json`
 - Cross-session diagnostics: `.opencompany/diagnostics.jsonl`
 

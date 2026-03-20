@@ -73,3 +73,7 @@ class RuntimePaths:
 
     def diagnostics_path(self, filename: str) -> Path:
         return self.data_dir / filename
+
+    @property
+    def mcp_oauth_tokens_path(self) -> Path:
+        return self.data_dir / "mcp_oauth_tokens.json"

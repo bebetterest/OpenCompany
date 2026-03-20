@@ -121,6 +121,22 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(inspect_args.mcp_servers, ["filesystem"])
         self.assertEqual(inspect_args.project_dir, "/tmp/demo")
 
+    def test_mcp_login_command_accepts_flags(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "mcp-login",
+                "--mcp-server",
+                "notion",
+                "--timeout-seconds",
+                "120",
+                "--no-browser",
+            ]
+        )
+
+        self.assertEqual(args.mcp_server, "notion")
+        self.assertEqual(args.timeout_seconds, 120.0)
+        self.assertTrue(args.no_browser)
+
     def test_run_tui_and_ui_accept_remote_flags(self) -> None:
         run_args = build_parser().parse_args(
             [
@@ -1420,6 +1436,55 @@ class CliRunResumePanelTests(unittest.TestCase):
             captured["cleaned_session_ids"],
             [captured["closed_session_id"]],
         )
+
+    def test_mcp_login_command_prints_json(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                encoding="utf-8",
+            )
+
+            async def _fake_complete_mcp_oauth_login(**kwargs):  # type: ignore[no-untyped-def]
+                captured["kwargs"] = kwargs
+                return SimpleNamespace(
+                    authorization_url="https://auth.example.com/authorize?demo=1",
+                    browser_opened=False,
+                    record=SimpleNamespace(
+                        server_id="notion",
+                        authorization_server="https://auth.example.com",
+                        resource="https://mcp.notion.com/mcp",
+                        scope="",
+                        expires_at=1234.0,
+                    ),
+                )
+
+            with patch.object(cli, "complete_mcp_oauth_login", _fake_complete_mcp_oauth_login):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._mcp_login(
+                            app_dir=app_dir,
+                            locale="en",
+                            mcp_server_id="notion",
+                            timeout_seconds=30.0,
+                            open_browser=False,
+                        )
+                    )
+
+        rendered = json.loads(output.getvalue())
+        self.assertTrue(rendered["authorized"])
+        self.assertEqual(rendered["server_id"], "notion")
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        self.assertEqual(kwargs["server"].id, "notion")
+        self.assertFalse(kwargs["open_browser"])
 
     def test_clone_command_calls_explicit_clone_and_prints_ids(self) -> None:
         captured: dict[str, object] = {"events": []}

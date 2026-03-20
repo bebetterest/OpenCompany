@@ -58,16 +58,21 @@ Web UI-specific capabilities:
   - default value comes from `opencompany.toml` (`[llm.openrouter].model`)
   - user can override it per run/continue; submitted value is forwarded to runtime and applied to root/worker LLM calls for that execution
 - control-bar exposes an optional root-agent-name input; when non-empty, `/api/run` forwards it and runtime uses it as the base root agent name (still deduplicated in-session)
-- control-bar also exposes a skills composer with manual input plus `Discover` / `Select All` / `Clear`
+- skills and MCP selector sections are collapsible and default to collapsed on first load
+- control-bar also exposes a skills selector driven by clickable cards plus `Discover` / `Select All` / `Clear`
   - skills are still submitted as `enabled_skill_ids`
   - discover reads project/global skills for the current local or remote launch context
-  - discovered skills render as selectable cards with source/doc metadata, selected chips, and warning cards
+  - discovered skills render as selectable cards with source/doc metadata, selected chips, and warning cards; manual text entry is no longer part of the Web UI flow
   - already-materialized session skills remain visible in the selector even before a fresh discover
   - overview cards surface the current enabled ids, bundle root, and skill warning count
-- control-bar also exposes an MCP server selector with manual input plus `Discover` / `Select All` / `Clear`
+- control-bar also exposes an MCP server selector driven by clickable cards plus `Discover` / `Use Defaults` / `Select All` / `Clear`
   - selection is submitted as `enabled_mcp_server_ids`
-  - discover reads configured MCP servers from `opencompany.toml`
-  - overview cards surface enabled MCP ids plus connected/warning counts from session `mcp_state`
+  - configured MCP servers are preloaded from `opencompany.toml`, and `Discover` refreshes the catalog
+  - `Use Defaults` mirrors servers marked `enabled = true` in config for the current run; manual selection remains a per-run override
+  - OAuth-enabled MCP cards also expose `Login` / `Continue Login` / `Re-login` plus `Clear Auth`; pending logins stay clickable so the authorization page can be reopened without creating a second polling loop, and `Clear Auth` removes the stored OAuth record for a full reconnect
+  - MCP OAuth start is asynchronous: `/api/mcp/oauth/start` may return a pending `flow_id` before an `authorization_url` is ready, and the client keeps polling `/api/mcp/oauth/{flow_id}` to open the auth page as soon as the URL becomes available
+  - selector surfaces both config metadata and runtime metadata per server, including transport, endpoint/command, timeout, allowed tools, roots policy/runtime, protocol version, tool/resource counts, and warnings
+  - overview cards surface enabled MCP ids plus connected/tool/resource/warning counts from session `mcp_state`
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
 - session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
 - initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active
@@ -130,7 +135,7 @@ When `Run` is pressed again while the same session is running, runtime immediate
 It also provides a `Terminal` action from the control row that directly launches a system terminal window using the same sandbox backend/config as agent `shell` calls, with workspace root fixed to the active session workspace. Edits made there are tracked by workspace diff/project sync just like agent edits.
 The control row is organized in three lines: model input + root-agent-name input + locale switch buttons (`EN` / `中文`), a task line with explicit `Task` label and multiline `TextArea` input (content-driven height expansion, min 3/max 9 rows), and run controls (`Run`, `Terminal`, `Reconfigure`, `Interrupt`).
 The model input defaults from config and remains overridable per run/continue.
-The control row also includes a simple MCP server input so TUI users can submit `enabled_mcp_server_ids` on run/continue without leaving the terminal.
+Web UI no longer exposes free-text skill/MCP inputs; selection happens through cards, while CLI/TUI still support explicit `--mcp-server` flags.
 Agent cards/status sections display each agent's selected model from persisted metadata.
 Agent cards/status sections also display context-compression metrics (`compression_count`, context token usage, usage ratio, latest compacted range).
 In `direct` mode, TUI disables the `Diff` tab and `Apply` / `Undo` controls.
@@ -138,6 +143,7 @@ In `direct` mode, TUI disables the `Diff` tab and `Apply` / `Undo` controls.
 CLI also exposes `opencompany terminal <session_id>` and `opencompany terminal <session_id> --self-check`.
 `--self-check` verifies policy parity with agent `shell` and backend-strategy enforcement (workspace write allowed; outside write expected blocked for `anthropic`, expected allowed for `none`).
 Interactive CLI run/resume status panels now include a per-agent `model` field.
+CLI also exposes `opencompany mcp-login --mcp-server <id>` for OAuth-protected hosted MCP servers.
 CLI `run`/`tui`/`ui` setup now supports remote flags for new sessions:
 - `--remote-target user@host[:port]`
 - `--remote-dir /abs/linux/path`

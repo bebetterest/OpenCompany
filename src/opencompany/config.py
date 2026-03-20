@@ -289,6 +289,14 @@ class McpServerConfig:
     cwd: str = ""
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    oauth_enabled: bool = False
+    oauth_scopes: list[str] = field(default_factory=list)
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_client_name: str = "OpenCompany MCP Client"
+    oauth_client_uri: str = ""
+    oauth_authorization_prompt: str = ""
+    oauth_use_resource_param: bool = True
 
     def resolved_title(self) -> str:
         return str(self.title or self.id).strip() or str(self.id or "").strip()
@@ -615,6 +623,13 @@ class OpenCompanyConfig:
                     headers_table = {}
                 if not isinstance(headers_table, dict):
                     raise ValueError(f"[mcp.servers.{server_id}].headers must be a table.")
+                oauth_scopes = raw_server.get("oauth_scopes", [])
+                if oauth_scopes is None:
+                    oauth_scopes = []
+                if not isinstance(oauth_scopes, (list, tuple)):
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}].oauth_scopes must be a list."
+                    )
                 allowed_tools = raw_server.get("allowed_tools", [])
                 if allowed_tools is None:
                     allowed_tools = []
@@ -624,6 +639,21 @@ class OpenCompanyConfig:
                     )
                 command = str(raw_server.get("command", "") or "").strip()
                 url = str(raw_server.get("url", "") or "").strip()
+                oauth_enabled = bool(raw_server.get("oauth_enabled", False))
+                oauth_client_id = str(raw_server.get("oauth_client_id", "") or "").strip()
+                oauth_client_secret = str(
+                    raw_server.get("oauth_client_secret", "") or ""
+                ).strip()
+                oauth_client_name = str(
+                    raw_server.get("oauth_client_name", "OpenCompany MCP Client") or ""
+                ).strip() or "OpenCompany MCP Client"
+                oauth_client_uri = str(
+                    raw_server.get("oauth_client_uri", "") or ""
+                ).strip()
+                oauth_authorization_prompt = str(
+                    raw_server.get("oauth_authorization_prompt", "") or ""
+                ).strip()
+                oauth_use_resource_param = bool(raw_server.get("oauth_use_resource_param", True))
                 if transport == "stdio":
                     if not command:
                         raise ValueError(
@@ -632,6 +662,10 @@ class OpenCompanyConfig:
                     if url:
                         raise ValueError(
                             f"[mcp.servers.{server_id}] transport='stdio' must not set url."
+                        )
+                    if oauth_enabled:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] OAuth is only supported with transport='streamable_http'."
                         )
                 if transport == "streamable_http":
                     if not url:
@@ -642,6 +676,10 @@ class OpenCompanyConfig:
                         raise ValueError(
                             f"[mcp.servers.{server_id}] transport='streamable_http' must not set command."
                         )
+                if oauth_client_secret and not oauth_client_id:
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}] oauth_client_secret requires oauth_client_id."
+                    )
                 normalized_servers[server_id] = McpServerConfig(
                     id=server_id,
                     transport=transport,
@@ -674,6 +712,18 @@ class OpenCompanyConfig:
                         for key, value in headers_table.items()
                         if str(key).strip()
                     },
+                    oauth_enabled=oauth_enabled,
+                    oauth_scopes=[
+                        str(item).strip()
+                        for item in oauth_scopes
+                        if str(item).strip()
+                    ],
+                    oauth_client_id=oauth_client_id,
+                    oauth_client_secret=oauth_client_secret,
+                    oauth_client_name=oauth_client_name,
+                    oauth_client_uri=oauth_client_uri,
+                    oauth_authorization_prompt=oauth_authorization_prompt,
+                    oauth_use_resource_param=oauth_use_resource_param,
                 )
         self.mcp = McpConfig(
             protocol_version=protocol_version,

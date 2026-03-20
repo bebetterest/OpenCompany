@@ -62,6 +62,73 @@ keep_pinned_messages = 3
                     3,
                 )
 
+    def test_bootstrap_preloads_configured_mcp_catalog_with_oauth_metadata(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir()
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.huggingface]
+transport = "streamable_http"
+enabled = true
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+
+[mcp.servers.notion]
+transport = "streamable_http"
+enabled = true
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                encoding="utf-8",
+            )
+            app = create_webui_app(project_dir=project_dir, app_dir=app_dir)
+            with TestClient(app) as client:
+                bootstrap = client.get("/api/bootstrap")
+                self.assertEqual(bootstrap.status_code, 200)
+                catalog = {
+                    str(item["id"]): item
+                    for item in bootstrap.json()["runtime"]["available_mcp_servers"]
+                }
+                self.assertIn("huggingface", catalog)
+                self.assertIn("notion", catalog)
+                self.assertTrue(catalog["huggingface"]["oauth_enabled"])
+                self.assertTrue(catalog["notion"]["oauth_enabled"])
+                self.assertFalse(catalog["huggingface"]["oauth_authorized"])
+                self.assertFalse(catalog["notion"]["oauth_authorized"])
+
+    def test_bootstrap_omits_disabled_mcp_servers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir()
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.filesystem]
+transport = "stdio"
+enabled = true
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.docs]
+transport = "streamable_http"
+enabled = false
+url = "https://example.com/mcp"
+""".strip(),
+                encoding="utf-8",
+            )
+            app = create_webui_app(project_dir=project_dir, app_dir=app_dir)
+            with TestClient(app) as client:
+                bootstrap = client.get("/api/bootstrap")
+                self.assertEqual(bootstrap.status_code, 200)
+                ids = [
+                    str(item.get("id", ""))
+                    for item in bootstrap.json()["runtime"]["available_mcp_servers"]
+                ]
+                self.assertIn("filesystem", ids)
+                self.assertNotIn("docs", ids)
+
     def test_index_uses_multiline_task_textarea(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -77,12 +144,22 @@ keep_pinned_messages = 3
                 self.assertNotIn('<input id="task-input"', response.text)
                 self.assertIn('<input id="model-input"', response.text)
                 self.assertIn('<input id="root-agent-name-input"', response.text)
+                self.assertNotIn('<input id="skills-input"', response.text)
+                self.assertIn('id="skills-toggle-button"', response.text)
+                self.assertIn('aria-controls="skills-panel-body"', response.text)
+                self.assertIn('aria-expanded="false"', response.text)
+                self.assertIn('<div id="skills-panel-body" class="skills-control-shell collapsible-body hidden">', response.text)
                 self.assertIn('<button id="skills-select-all-button"', response.text)
                 self.assertIn('<button id="skills-clear-button"', response.text)
                 self.assertIn('<div id="skills-selected"', response.text)
                 self.assertIn('<div id="skills-warnings"', response.text)
-                self.assertIn('<input id="mcp-input"', response.text)
+                self.assertNotIn('<input id="mcp-input"', response.text)
+                self.assertIn('id="mcp-toggle-button"', response.text)
+                self.assertIn('aria-controls="mcp-panel-body"', response.text)
+                self.assertIn('<div id="mcp-panel-body" class="skills-control-shell collapsible-body hidden">', response.text)
                 self.assertIn('<button id="mcp-discover-button"', response.text)
+                self.assertIn('<button id="mcp-use-defaults-button"', response.text)
+                self.assertIn('<div id="mcp-insight"', response.text)
                 self.assertIn('<div id="mcp-selected"', response.text)
                 self.assertIn('<div id="mcp-warnings"', response.text)
                 self.assertIn('<select id="agents-role-filter">', response.text)
@@ -355,6 +432,111 @@ keep_pinned_messages = 3
 
             self.assertEqual(response.status_code, 500)
             self.assertEqual(response.json()["detail"], "mcp discover failed")
+
+    def test_mcp_oauth_endpoints_forward_runtime_calls(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _fake_start(server_id: str, *, timeout_seconds: float = 300.0) -> dict[str, object]:
+                self.assertEqual(server_id, "notion")
+                self.assertEqual(timeout_seconds, 45.0)
+                return {
+                    "flow_id": "flow-1",
+                    "server_id": "notion",
+                    "status": "pending",
+                    "authorization_url": "https://auth.example.com/authorize",
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            async def _fake_status(flow_id: str) -> dict[str, object]:
+                self.assertEqual(flow_id, "flow-1")
+                return {
+                    "flow_id": "flow-1",
+                    "server_id": "notion",
+                    "status": "completed",
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            async def _fake_clear(server_id: str) -> dict[str, object]:
+                self.assertEqual(server_id, "notion")
+                return {
+                    "server_id": "notion",
+                    "cleared": True,
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            runtime_state.start_mcp_oauth_login = _fake_start  # type: ignore[method-assign]
+            runtime_state.mcp_oauth_login_status = _fake_status  # type: ignore[method-assign]
+            runtime_state.clear_mcp_oauth_login = _fake_clear  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                started = client.post(
+                    "/api/mcp/oauth/start",
+                    json={"server_id": "notion", "timeout_seconds": 45},
+                )
+                self.assertEqual(started.status_code, 200)
+                self.assertEqual(started.json()["flow_id"], "flow-1")
+
+                status = client.get("/api/mcp/oauth/flow-1")
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["status"], "completed")
+
+                cleared = client.post("/api/mcp/oauth/clear", json={"server_id": "notion"})
+                self.assertEqual(cleared.status_code, 200)
+                self.assertTrue(cleared.json()["cleared"])
+
+    def test_mcp_env_auth_configure_endpoint_forwards_runtime_calls(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _fake_configure(server_id: str, values: dict[str, object]) -> dict[str, object]:
+                self.assertEqual(server_id, "github")
+                self.assertEqual(
+                    values,
+                    {"GITHUB_MCP_AUTHORIZATION": "Bearer token-demo"},
+                )
+                return {
+                    "server_id": "github",
+                    "updated_keys": ["GITHUB_MCP_AUTHORIZATION"],
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            runtime_state.configure_mcp_env_auth = _fake_configure  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                configured = client.post(
+                    "/api/mcp/env-auth/configure",
+                    json={
+                        "server_id": "github",
+                        "values": {"GITHUB_MCP_AUTHORIZATION": "Bearer token-demo"},
+                    },
+                )
+                self.assertEqual(configured.status_code, 200)
+                self.assertEqual(
+                    configured.json()["updated_keys"],
+                    ["GITHUB_MCP_AUTHORIZATION"],
+                )
+
+    def test_mcp_env_auth_configure_endpoint_rejects_non_object_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/mcp/env-auth/configure",
+                    json={"server_id": "github", "values": "invalid"},
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"], "values must be an object.")
 
     def test_run_while_running_skips_launch_reconfigure(self) -> None:
         with TemporaryDirectory() as temp_dir:

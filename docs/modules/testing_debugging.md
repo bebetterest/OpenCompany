@@ -54,6 +54,7 @@ GitHub Actions runs tests through `.github/workflows/tests.yml`:
 - Per-session runtime events: `.opencompany/sessions/<session_id>/events.jsonl`
 - Per-agent message logs: `.opencompany/sessions/<session_id>/<agent_id>_messages.jsonl`
 - Optional LLM request/response tracing (via `--debug`): `debug/<agent_id>__<module>.jsonl`
+- Optional stage timing tracing (via `--debug`): `debug/timings.jsonl`
 - Cross-layer diagnostics: `.opencompany/diagnostics.jsonl`
 
 Useful CLI inspection commands:

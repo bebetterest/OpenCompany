@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
 
 from opencompany.config import OpenCompanyConfig
 from opencompany.logging import DiagnosticLogger, diagnostics_path_for_app
+from opencompany.mcp.oauth import McpOAuthError, complete_mcp_oauth_login
 from opencompany.models import RemoteSessionConfig, WorkspaceMode
 from opencompany.orchestrator import Orchestrator, default_app_dir
 from opencompany.paths import RuntimePaths
@@ -190,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(run_parser)
 
@@ -232,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
 
     clone_parser = subparsers.add_parser(
@@ -245,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     clone_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
 
     skills_parser = subparsers.add_parser(
@@ -258,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     skills_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(skills_parser)
 
@@ -282,9 +283,33 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(mcp_parser)
+
+    mcp_login_parser = subparsers.add_parser(
+        "mcp-login",
+        help="Authenticate an OAuth-protected MCP server and persist tokens locally",
+    )
+    mcp_login_parser.add_argument(
+        "--mcp-server",
+        required=True,
+        dest="mcp_server",
+        help="MCP server id to authenticate.",
+    )
+    mcp_login_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    mcp_login_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    mcp_login_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300.0,
+        help="OAuth callback wait timeout in seconds (default: 300).",
+    )
+    mcp_login_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the authorization URL without attempting to open a browser automatically.",
+    )
 
     export_parser = subparsers.add_parser(
         "export-logs",
@@ -413,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(tui_parser)
 
@@ -431,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(ui_parser)
     ui_parser.add_argument("--host", default="127.0.0.1", help="Host for the UI HTTP server")
@@ -2105,6 +2130,93 @@ async def _mcp_servers(
     print(json.dumps(rows, ensure_ascii=False, indent=2))
 
 
+async def _mcp_login(
+    app_dir: Path | None,
+    locale: str | None,
+    *,
+    mcp_server_id: str,
+    timeout_seconds: float,
+    open_browser: bool,
+) -> None:
+    del locale
+    resolved_app_dir = (app_dir or default_app_dir()).resolve()
+    config = OpenCompanyConfig.load(resolved_app_dir)
+    paths = RuntimePaths.create(resolved_app_dir, config)
+    diagnostics = DiagnosticLogger(diagnostics_path_for_app(resolved_app_dir))
+    server_id = str(mcp_server_id or "").strip()
+    if not server_id:
+        raise SystemExit("--mcp-server is required.")
+    server = config.mcp.servers.get(server_id)
+    if server is None:
+        raise SystemExit(f"MCP server '{server_id}' is not defined in opencompany.toml.")
+    diagnostics.log(
+        component="cli",
+        event_type="mcp_login_started",
+        payload={
+            "server_id": server_id,
+            "app_dir": str(resolved_app_dir),
+            "open_browser": bool(open_browser),
+        },
+    )
+    authorization_url_announced = False
+
+    def _announce_authorization_url(url: str) -> None:
+        nonlocal authorization_url_announced
+        if open_browser or authorization_url_announced:
+            return
+        normalized_url = str(url or "").strip()
+        if not normalized_url:
+            return
+        authorization_url_announced = True
+        print("Open this URL to continue MCP OAuth login:", flush=True)
+        print(normalized_url, flush=True)
+        print("", flush=True)
+
+    try:
+        result = await complete_mcp_oauth_login(
+            server=server,
+            store_path=paths.mcp_oauth_tokens_path,
+            timeout_seconds=max(1.0, float(timeout_seconds)),
+            open_browser=open_browser,
+            authorization_url_callback=_announce_authorization_url,
+        )
+    except McpOAuthError as exc:
+        diagnostics.log(
+            component="cli",
+            event_type="mcp_login_failed",
+            level="error",
+            payload={"server_id": server_id},
+            error=exc,
+        )
+        raise SystemExit(str(exc)) from exc
+    diagnostics.log(
+        component="cli",
+        event_type="mcp_login_finished",
+        payload={
+            "server_id": server_id,
+            "authorization_server": result.record.authorization_server,
+            "browser_opened": result.browser_opened,
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "server_id": result.record.server_id,
+                "server_title": server.resolved_title(),
+                "authorized": True,
+                "browser_opened": result.browser_opened,
+                "authorization_url": result.authorization_url,
+                "authorization_server": result.record.authorization_server,
+                "resource": result.record.resource,
+                "scope": result.record.scope,
+                "expires_at": result.record.expires_at,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def _clone_session(
     app_dir: Path | None,
     locale: str | None,
@@ -2788,6 +2900,16 @@ def main() -> None:
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     remote_config=remote_config,
                     remote_password=remote_password,
+                )
+            )
+        elif args.command == "mcp-login":
+            asyncio.run(
+                _mcp_login(
+                    app_dir,
+                    args.locale,
+                    mcp_server_id=getattr(args, "mcp_server", ""),
+                    timeout_seconds=float(getattr(args, "timeout_seconds", 300.0)),
+                    open_browser=not bool(getattr(args, "no_browser", False)),
                 )
             )
         elif args.command == "clone":

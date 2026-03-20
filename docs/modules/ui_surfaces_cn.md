@@ -58,16 +58,21 @@ Web UI 特性：
   - 默认值来自 `opencompany.toml`（`[llm.openrouter].model`）
   - 每次运行/继续前可覆盖；提交值会透传到 runtime，并在该次执行中同时作用于 root/worker 的 LLM 调用
 - 控制栏提供可选 root-agent-name 输入框；非空时 `/api/run` 会透传该值，runtime 以它作为 root agent 命名基底（仍保留会话内去重）
-- 控制栏也提供一套 skills 选择器：手动输入 + `发现` / `全选` / `清空`
+- skills 与 MCP 选择区都支持折叠/展开，并且首次加载时默认折叠
+- 控制栏也提供一套 skills 选择器：点击卡片选择 + `发现` / `全选` / `清空`
   - skills 仍会作为 `enabled_skill_ids` 提交
   - discover 会按当前本地或远程 launch context 读取项目源/全局源 skills
-  - 已发现 skills 会以可切换卡片展示，并附带来源/文档元数据、已选 chips 和告警卡片
+  - 已发现 skills 会以可切换卡片展示，并附带来源/文档元数据、已选 chips 和告警卡片；Web UI 不再保留手动文本输入
   - 已在当前 session 物化生效的 skills，即使还没重新 discover，也会继续显示在选择器里
   - Overview 卡片会展示当前启用 id、bundle root 与告警数量
-- 控制栏也提供一套 MCP server 选择器：手动输入 + `发现` / `全选` / `清空`
+- 控制栏也提供一套 MCP server 选择器：点击卡片选择 + `发现` / `用默认项` / `全选` / `清空`
   - 选择结果会作为 `enabled_mcp_server_ids` 提交
-  - discover 会读取 `opencompany.toml` 中配置的 MCP servers
-  - Overview 卡片会展示当前启用的 MCP ids，以及来自 `session.mcp_state` 的 connected/warning 数量
+  - 页面加载时会预加载 `opencompany.toml` 中配置的 MCP servers，`发现` 负责刷新目录
+  - `用默认项` 会把配置中 `enabled = true` 的 servers 同步为本次运行的选择；手动选择仍然只覆盖当前 run
+  - 对启用 OAuth 的 MCP 卡片，界面还会提供 `登录` / `继续登录` / `重新登录` 和 `清除登录`；登录处理中按钮仍可点击，用于重新打开授权页，而且不会额外启动第二条轮询；`清除登录` 会移除本地保存的 OAuth 记录，便于彻底重连
+  - MCP OAuth 启动是异步链路：`/api/mcp/oauth/start` 可能先返回 pending `flow_id`，授权 `authorization_url` 会稍后可用；前端会持续轮询 `/api/mcp/oauth/{flow_id}`，并在 URL 就绪后再自动打开授权页
+  - 选择器会同时展示每个 server 的配置态与运行态信息，包括 transport、端点/命令、超时、allowed tools、roots 策略/运行态、协议版本、tool/resource 数量与告警
+  - Overview 卡片会展示当前启用的 MCP ids，以及来自 `session.mcp_state` 的 connected/tool/resource/warning 数量
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
 - session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
 - 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示
@@ -130,7 +135,7 @@ TUI 提供 run/interrupt、基于 setup 的会话加载、project sync 操作和
 同时在控制栏提供 `终端` 动作，直接拉起系统终端窗口，复用与 agent `shell` 调用一致的 sandbox backend/config，且工作目录固定到当前活动 session workspace。终端改动与 agent 改动一样会被 workspace diff/project sync 跟踪。
 控制栏采用三行布局：第一行是模型输入 + root-agent-name 输入 + 语言切换按钮（`EN` / `中文`），第二行是带明确 `任务` 标签的多行 `TextArea` 输入（按内容自动增高，最小 3 行、最大 9 行），第三行是运行控制按钮（`运行`、`终端`、`重新配置`、`中断`）。
 模型输入默认读取配置，并可按每次运行/继续自由覆盖。
-控制栏还包含一个简单的 MCP server 输入框，便于 TUI 用户在运行/继续时提交 `enabled_mcp_server_ids`。
+Web UI 已不再提供 skills/MCP 的自由文本输入；选择通过卡片完成，而 CLI/TUI 仍可用显式 `--mcp-server` 参数。
 Agent 卡片/状态区域会显示各 agent 的模型，来源于持久化 metadata。
 Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`、上下文 token 使用、使用率、最近压缩范围）。
 在 `direct` 模式下，TUI 会禁用 `Diff` 标签页以及 `Apply` / `Undo` 控件。
@@ -138,6 +143,7 @@ Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`
 CLI 同时提供 `opencompany terminal <session_id>` 与 `opencompany terminal <session_id> --self-check`。
 `--self-check` 会同时校验与 agent `shell` 的策略一致性，以及按 backend 的运行时语义（workspace 内可写；`anthropic` 期望 workspace 外被阻止，`none` 期望 workspace 外可写）。
 交互式 CLI 的 run/resume 状态面板现包含每个 agent 的 `model` 字段。
+CLI 还提供 `opencompany mcp-login --mcp-server <id>`，用于给受 OAuth 保护的 hosted MCP server 完成登录。
 CLI 还提供 `opencompany mcp-servers`，用于校验配置并打印 MCP servers 的 capabilities/tools/resources。
 CLI 的 `run` / `resume` / `mcp-servers` 都支持重复传入 `--mcp-server <id>`。
 CLI 的 `run`/`tui`/`ui` 在新建会话时支持远程参数：

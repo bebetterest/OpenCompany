@@ -41,11 +41,26 @@
           <label id="root-agent-name-label" for="root-agent-name-input">Root Agent Name</label>
           <input id="root-agent-name-input" type="text" placeholder="Optional root agent name" />
         </div>
-        <div class="control-row model-row">
-          <label id="skills-label" for="skills-input">Skills</label>
-          <div class="skills-control-shell">
+        <div class="control-row control-row-collapsible">
+          <div id="skills-shell" class="control-section-shell is-collapsed">
+            <button
+              id="skills-toggle-button"
+              class="control-section-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="skills-panel-body"
+            >
+              <span class="control-section-heading">
+                <span id="skills-label" class="control-section-title">Skills</span>
+                <span id="skills-summary" class="control-section-summary"></span>
+              </span>
+              <span class="control-section-side">
+                <span id="skills-toggle-state" class="control-section-state">Expand</span>
+                <span class="control-section-caret" aria-hidden="true"></span>
+              </span>
+            </button>
+            <div id="skills-panel-body" class="skills-control-shell collapsible-body hidden">
             <div class="skills-toolbar">
-              <input id="skills-input" type="text" placeholder="skill-a, skill-b" />
               <button id="skills-discover-button" type="button">Discover</button>
               <button id="skills-select-all-button" type="button">Select All</button>
               <button id="skills-clear-button" type="button">Clear</button>
@@ -54,21 +69,40 @@
             <div id="skills-selected" class="skills-selected"></div>
             <div id="skills-list" class="skills-catalog"></div>
             <div id="skills-warnings" class="skills-warnings hidden"></div>
+            </div>
           </div>
         </div>
-        <div class="control-row model-row">
-          <label id="mcp-label" for="mcp-input">MCP Servers</label>
-          <div class="skills-control-shell">
+        <div class="control-row control-row-collapsible">
+          <div id="mcp-shell" class="control-section-shell is-collapsed">
+            <button
+              id="mcp-toggle-button"
+              class="control-section-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="mcp-panel-body"
+            >
+              <span class="control-section-heading">
+                <span id="mcp-label" class="control-section-title">MCP Servers</span>
+                <span id="mcp-summary" class="control-section-summary"></span>
+              </span>
+              <span class="control-section-side">
+                <span id="mcp-toggle-state" class="control-section-state">Expand</span>
+                <span class="control-section-caret" aria-hidden="true"></span>
+              </span>
+            </button>
+            <div id="mcp-panel-body" class="skills-control-shell collapsible-body hidden">
             <div class="skills-toolbar">
-              <input id="mcp-input" type="text" placeholder="server-a, server-b" />
               <button id="mcp-discover-button" type="button">Discover</button>
+              <button id="mcp-use-defaults-button" type="button">Use Defaults</button>
               <button id="mcp-select-all-button" type="button">Select All</button>
               <button id="mcp-clear-button" type="button">Clear</button>
             </div>
             <div id="mcp-status" class="path-label"></div>
+            <div id="mcp-insight" class="mcp-insight"></div>
             <div id="mcp-selected" class="skills-selected"></div>
-            <div id="mcp-list" class="skills-catalog"></div>
+            <div id="mcp-list" class="skills-catalog mcp-catalog"></div>
             <div id="mcp-warnings" class="skills-warnings hidden"></div>
+            </div>
           </div>
         </div>
         <div id="control-summary" class="control-summary"></div>

@@ -329,7 +329,7 @@ class SkillsHelperTests(unittest.TestCase):
 class SkillsFeatureTests(unittest.IsolatedAsyncioTestCase):
     async def test_bundled_default_skills_follow_opencompany_layout(self) -> None:
         app_dir = default_app_dir()
-        bundled_ids = {"openai-docs", "pdf", "skill-creator", "skill-installer"}
+        bundled_ids = {"hf-cli", "openai-docs", "pdf", "skill-creator", "skill-installer"}
 
         discovered = discover_local_skills(app_dir=app_dir)
 
@@ -342,6 +342,23 @@ class SkillsFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((skill_dir / "resources").is_dir())
             for legacy_name in ("agents", "scripts", "references", "assets"):
                 self.assertFalse((skill_dir / legacy_name).exists())
+
+    async def test_discover_skills_includes_resource_count_for_local_skills(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "app"
+            project_dir = root / "project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_app(app_dir)
+            write_skill(project_dir, "project-demo")
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            discovered = await orchestrator.discover_skills(project_dir=project_dir)
+            by_id = {str(item.get("id", "")): item for item in discovered}
+
+            self.assertIn("project-demo", by_id)
+            self.assertGreater(int(by_id["project-demo"].get("resource_count", 0) or 0), 0)
 
     async def test_remote_skill_discovery_skips_invalid_candidates(self) -> None:
         with TemporaryDirectory() as temp_dir:
