@@ -1571,6 +1571,129 @@ oauth_enabled = true
 
         asyncio.run(run())
 
+    def test_build_transport_expands_github_authorization_header_from_env(self) -> None:
+        async def run() -> None:
+            repo_root = Path(__file__).resolve().parents[1]
+            manager = self._manager(repo_root)
+            server = manager.config.mcp.servers["github"]
+            context = _AgentMcpContext(
+                session_id="session-1",
+                agent_id="agent-1",
+                workspace_path=repo_root,
+                workspace_is_remote=False,
+                enabled_server_ids=["github"],
+            )
+
+            with patch.dict(
+                os.environ,
+                {"GITHUB_MCP_AUTHORIZATION": "Bearer gh-test-token"},
+                clear=False,
+            ):
+                transport = await manager._build_transport(  # type: ignore[attr-defined]
+                    context=context,
+                    server=server,
+                    tool_executor=object(),
+                    on_message=lambda _message: None,
+                    on_diagnostic=lambda _event_type, _payload: None,
+                    runtime_transport="streamable_http",
+                    url_override="",
+                )
+
+            self.assertIsInstance(transport, StreamableHttpMcpTransport)
+            self.assertEqual(
+                transport.headers.get("Authorization", ""),
+                "Bearer gh-test-token",
+            )
+            self.assertEqual(transport.url, "https://api.githubcopilot.com/mcp/")
+            await transport.close()
+
+        asyncio.run(run())
+
+    def test_build_transport_uses_duckduckgo_preset_stdio_command_and_env(self) -> None:
+        async def run() -> None:
+            repo_root = Path(__file__).resolve().parents[1]
+            manager = self._manager(repo_root)
+            server = manager.config.mcp.servers["duckduckgo"]
+            context = _AgentMcpContext(
+                session_id="session-1",
+                agent_id="agent-1",
+                workspace_path=repo_root,
+                workspace_is_remote=False,
+                enabled_server_ids=["duckduckgo"],
+            )
+            captured: dict[str, Any] = {}
+
+            class _FakeProcess:
+                async def write_line(self, text: str) -> None:
+                    del text
+
+                async def close(self) -> None:
+                    return None
+
+            class _FakeShellBackend:
+                async def start_interactive(
+                    self,
+                    request: Any,
+                    *,
+                    on_stdout: Any,
+                    on_stderr: Any,
+                ) -> _FakeProcess:
+                    captured["request"] = request
+                    captured["on_stdout"] = on_stdout
+                    captured["on_stderr"] = on_stderr
+                    return _FakeProcess()
+
+            class _FakeToolExecutor:
+                def __init__(self) -> None:
+                    self._backend = _FakeShellBackend()
+
+                def build_interactive_request(
+                    self,
+                    *,
+                    workspace_root: Path,
+                    command: str,
+                    cwd: str,
+                    session_id: str,
+                    environment: dict[str, str],
+                ) -> dict[str, Any]:
+                    captured["workspace_root"] = workspace_root
+                    captured["command"] = command
+                    captured["cwd"] = cwd
+                    captured["session_id"] = session_id
+                    captured["environment"] = environment
+                    return {
+                        "workspace_root": str(workspace_root),
+                        "command": command,
+                        "cwd": cwd,
+                        "session_id": session_id,
+                    }
+
+                def shell_backend(self) -> _FakeShellBackend:
+                    return self._backend
+
+            transport = await manager._build_transport(  # type: ignore[attr-defined]
+                context=context,
+                server=server,
+                tool_executor=_FakeToolExecutor(),
+                on_message=lambda _message: None,
+                on_diagnostic=lambda _event_type, _payload: None,
+                runtime_transport="stdio",
+                url_override="",
+            )
+
+            self.assertIsInstance(transport, StdioMcpTransport)
+            self.assertEqual(captured["workspace_root"], repo_root)
+            self.assertEqual(captured["command"], "duckduckgo-mcp-server")
+            self.assertEqual(captured["cwd"], ".")
+            self.assertEqual(captured["session_id"], "session-1")
+            self.assertEqual(
+                captured["environment"],
+                {"DDG_SAFE_SEARCH": "MODERATE", "DDG_REGION": "wt-wt"},
+            )
+            await transport.close()
+
+        asyncio.run(run())
+
     def test_prepare_agent_skips_stdio_server_for_remote_workspace(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:

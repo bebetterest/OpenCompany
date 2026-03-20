@@ -343,6 +343,31 @@ class SkillsFeatureTests(unittest.IsolatedAsyncioTestCase):
             for legacy_name in ("agents", "scripts", "references", "assets"):
                 self.assertFalse((skill_dir / legacy_name).exists())
 
+    async def test_bundled_default_skills_have_migrated_metadata_contract(self) -> None:
+        app_dir = default_app_dir()
+        source_root = app_dir / "skills"
+        bundled_ids = {"hf-cli", "openai-docs", "pdf", "skill-creator", "skill-installer"}
+
+        discovered = discover_local_skills(app_dir=app_dir)
+
+        self.assertTrue(bundled_ids.issubset(discovered))
+        for skill_id in bundled_ids:
+            descriptor = discovered[skill_id]
+            self.assertEqual(descriptor.id, skill_id)
+            self.assertEqual(descriptor.source_type, "global")
+            self.assertEqual(Path(descriptor.source_path), (source_root / skill_id).resolve())
+            self.assertEqual(descriptor.main_doc_path, "SKILL.md")
+            self.assertEqual(descriptor.localized_doc_path, "SKILL_cn.md")
+            self.assertGreater(len(descriptor.tags), 0)
+
+            file_paths = {entry.relative_path for entry in descriptor.files}
+            self.assertIn("skill.toml", file_paths)
+            self.assertIn("SKILL.md", file_paths)
+            self.assertIn("SKILL_cn.md", file_paths)
+            self.assertTrue(any(path.startswith("resources/") for path in file_paths))
+            for legacy_prefix in ("scripts/", "assets/", "references/", "agents/"):
+                self.assertFalse(any(path.startswith(legacy_prefix) for path in file_paths))
+
     async def test_discover_skills_includes_resource_count_for_local_skills(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

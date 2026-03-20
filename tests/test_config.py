@@ -374,3 +374,44 @@ oauth_client_secret = "secret"
             )
             with self.assertRaisesRegex(ValueError, "oauth_client_secret requires oauth_client_id"):
                 OpenCompanyConfig.load(project_dir)
+
+    def test_repository_default_mcp_presets_match_expected_contract(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        config = OpenCompanyConfig.load(repo_root)
+        servers = config.mcp.servers
+        preset_ids = {"huggingface", "notion", "github", "duckduckgo"}
+
+        self.assertTrue(preset_ids.issubset(servers))
+        self.assertTrue(preset_ids.issubset(set(config.mcp.enabled_server_ids())))
+
+        huggingface = servers["huggingface"]
+        self.assertEqual(huggingface.transport, "streamable_http")
+        self.assertEqual(huggingface.url, "https://huggingface.co/mcp?login")
+        self.assertTrue(huggingface.oauth_enabled)
+        self.assertFalse(bool(huggingface.expose_roots))
+
+        notion = servers["notion"]
+        self.assertEqual(notion.transport, "streamable_http")
+        self.assertEqual(notion.url, "https://mcp.notion.com/mcp")
+        self.assertTrue(notion.oauth_enabled)
+        self.assertEqual(notion.oauth_authorization_prompt, "consent")
+        self.assertFalse(notion.oauth_use_resource_param)
+        self.assertFalse(bool(notion.expose_roots))
+
+        github = servers["github"]
+        self.assertEqual(github.transport, "streamable_http")
+        self.assertEqual(github.url, "https://api.githubcopilot.com/mcp/")
+        self.assertFalse(github.oauth_enabled)
+        self.assertEqual(
+            github.headers.get("Authorization", ""),
+            "env:GITHUB_MCP_AUTHORIZATION",
+        )
+        self.assertFalse(bool(github.expose_roots))
+
+        duckduckgo = servers["duckduckgo"]
+        self.assertEqual(duckduckgo.transport, "stdio")
+        self.assertEqual(duckduckgo.command, "duckduckgo-mcp-server")
+        self.assertEqual(duckduckgo.args, [])
+        self.assertEqual(duckduckgo.env.get("DDG_SAFE_SEARCH", ""), "MODERATE")
+        self.assertEqual(duckduckgo.env.get("DDG_REGION", ""), "wt-wt")
+        self.assertFalse(bool(duckduckgo.expose_roots))
