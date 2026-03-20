@@ -14,11 +14,30 @@ Tool runtime spans:
 Current default tool set for root and worker:
 
 - `shell`, `compress_context`, `wait_time`
+- `list_mcp_servers`, `list_mcp_resources`, `read_mcp_resource`
 - `list_agent_runs`, `get_agent_run`, `spawn_agent`, `cancel_agent`, `steer_agent`
 - `list_tool_runs`, `get_tool_run`, `wait_run`, `cancel_tool_run`
 - `finish`
 
 Role-specific availability is configurable via `[runtime.tools]`, including `steer_agent_scope` (`session` or `descendants`).
+
+## MCP Tool and Resource Surface
+
+- Helper tools:
+  - `list_mcp_servers`: lists enabled/configured MCP servers visible to the current agent runtime.
+  - `list_mcp_resources`: lists cached MCP resources with pagination and optional `server_id` filter.
+  - `read_mcp_resource`: reads one concrete MCP resource URI; v1 does not expand resource templates.
+- Dynamic MCP tools are injected at runtime as synthetic names shaped like `mcp__<server_id>__<tool_name>__<hash>`.
+- Dynamic MCP tools are first-class tool calls: each one gets its own `tool_run` row and agent-visible projected result.
+- MCP resource discovery is optional at runtime: if a server responds to `resources/list` with `-32601 Method not found` (or equivalent), runtime keeps the server connected, preserves discovered tools, and records zero resources instead of treating the server as unavailable.
+- Timeout budgeting for dynamic MCP tools is grouped under `runtime.tool_timeouts.actions.mcp_tool`.
+- OAuth-protected Streamable HTTP MCP servers are authorized out-of-band via `opencompany mcp-login --mcp-server <id>` or the Web UI MCP card login action; runtime reuses the stored bearer token and refreshes it when a refresh token is available.
+- OAuth refresh is serialized per MCP server within the runtime process, and concurrent agents reuse a freshly rotated token instead of racing the same refresh token.
+- If an OAuth-enabled server still returns HTTP `401` during MCP connection setup (including `invalid_token`, expired login, or missing refresh token), runtime clears that server's local OAuth record to force a clean re-login path on the next attempt.
+- Hosted providers that expose a browser-oriented login flag in URL query (for example `?login`) can still be configured directly; runtime strips that query flag before streamable HTTP transport requests.
+- MCP OAuth behavior is configurable per server; hosted providers with stricter guides can override details such as `oauth_authorization_prompt` and `oauth_use_resource_param`.
+- When a hosted server is configured at a `.../mcp` URL and initial Streamable HTTP connection setup fails, runtime automatically retries the sibling `.../sse` endpoint before surfacing the failure.
+- MCP tool/resource outputs are sanitized and size-bounded before they are projected back to agents or persisted into `tool_run.result`.
 
 ## Contract Principles
 
@@ -136,6 +155,9 @@ Every accepted tool action becomes a persisted `tool_run` with:
 - status: `queued` -> `running` -> `completed|failed|cancelled`
 - timestamps: `created_at`, `started_at`, `completed_at`
 - payload: arguments, raw result, error
+- detail timeline: read from projected lifecycle rows (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`) keyed by `tool_run_id`
+  - new sessions write these rows incrementally as events are appended
+  - legacy sessions rebuild the projection once on first detail access
 
 ## Execution Semantics
 

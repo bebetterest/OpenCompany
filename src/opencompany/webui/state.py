@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -14,7 +15,13 @@ from typing import Any
 
 from opencompany.config import OpenCompanyConfig
 from opencompany.i18n import TRANSLATIONS, Translator
-from opencompany.models import RemoteSessionConfig, WorkspaceMode, normalize_workspace_mode
+from opencompany.mcp.oauth import McpOAuthStore, complete_mcp_oauth_login
+from opencompany.models import (
+    RemoteSessionConfig,
+    RunSession,
+    WorkspaceMode,
+    normalize_workspace_mode,
+)
 from opencompany.orchestrator import Orchestrator, default_app_dir
 from opencompany.paths import RuntimePaths
 from opencompany.remote import (
@@ -23,6 +30,7 @@ from opencompany.remote import (
     normalize_remote_session_config,
 )
 from opencompany.sandbox.registry import available_sandbox_backends, resolve_sandbox_backend_cls
+from opencompany.skills import normalize_skill_ids
 
 from .events import EventHub
 
@@ -84,6 +92,17 @@ class SessionLaunchConfig:
         return bool(self.session_id)
 
 
+@dataclass(slots=True)
+class McpOAuthLoginFlow:
+    id: str
+    server_id: str
+    task: asyncio.Task[Any]
+    authorization_url: str = ""
+    status: str = "pending"
+    error: str = ""
+    result: dict[str, Any] | None = None
+
+
 class WebUIRuntimeState:
     def __init__(
         self,
@@ -130,6 +149,14 @@ class WebUIRuntimeState:
         self.selected_model: str = self._default_model_from_config()
         self.keep_pinned_messages: int = self._default_keep_pinned_messages_from_config()
         self.root_agent_name: str = ""
+        self.selected_skill_ids: list[str] = []
+        self.skills_state: dict[str, Any] = {}
+        self.available_skills: list[dict[str, Any]] = []
+        self.selected_mcp_server_ids: list[str] = []
+        self.mcp_state: dict[str, Any] = {}
+        self.available_mcp_servers: list[dict[str, Any]] = []
+        self._mcp_inspection_cache: dict[str, dict[str, Any]] = {}
+        self._mcp_oauth_flows: dict[str, McpOAuthLoginFlow] = {}
         self.project_sync_action_in_progress: bool = False
 
         self.event_hub = EventHub()
@@ -137,6 +164,8 @@ class WebUIRuntimeState:
         if self.configured_resume_session_id:
             with suppress(Exception):
                 self._load_configured_session_context(self.configured_resume_session_id)
+        with suppress(Exception):
+            self._refresh_available_mcp_servers()
 
     def launch_config(self) -> SessionLaunchConfig:
         return SessionLaunchConfig.create(
@@ -151,13 +180,17 @@ class WebUIRuntimeState:
         )
 
     def snapshot(self) -> dict[str, Any]:
+        self._sync_mcp_oauth_flows()
         self.refresh_runtime_config()
         config = self.launch_config()
+        project_dir_display = self._project_dir_display()
         return {
             "locale": self.locale,
             "translations": TRANSLATIONS.get(self.locale, TRANSLATIONS["en"]),
             "launch_config": {
                 "project_dir": str(self.project_dir) if self.project_dir else None,
+                "project_dir_display": project_dir_display,
+                "project_dir_is_remote": self.remote_config is not None,
                 "session_id": self.configured_resume_session_id,
                 "session_mode": config.session_mode.value,
                 "session_mode_locked": config.session_mode_locked,
@@ -175,6 +208,12 @@ class WebUIRuntimeState:
                 "model": self.selected_model or self._default_model_from_config(),
                 "keep_pinned_messages": max(0, int(self.keep_pinned_messages)),
                 "root_agent_name": self.root_agent_name,
+                "selected_skill_ids": list(self.selected_skill_ids),
+                "skills_state": self.skills_state,
+                "available_skills": list(self.available_skills),
+                "selected_mcp_server_ids": list(self.selected_mcp_server_ids),
+                "mcp_state": self.mcp_state,
+                "available_mcp_servers": list(self.available_mcp_servers),
                 "session_status": self.current_session_status,
                 "summary": self.current_summary,
                 "status_message": self.status_message,
@@ -265,6 +304,14 @@ class WebUIRuntimeState:
         self.current_task = ""
         self.current_session_status = "idle"
         self.current_summary = ""
+        self.selected_skill_ids = []
+        self.skills_state = {}
+        self.available_skills = []
+        self.selected_mcp_server_ids = []
+        self.mcp_state = {}
+        self._mcp_inspection_cache = {}
+        with suppress(Exception):
+            self._refresh_available_mcp_servers()
 
     def _load_configured_session_context(self, session_id: str) -> None:
         self._require_session_dir(session_id)
@@ -276,12 +323,53 @@ class WebUIRuntimeState:
         self.project_dir = None if loaded_remote is not None else loaded.project_dir.resolve()
         self.remote_password = ""
         self.configured_resume_session_id = loaded.id
-        self.current_session_id = loaded.id
-        self.current_task = loaded.task
-        self.current_session_status = loaded.status.value
-        self.current_summary = loaded.final_summary or ""
         self.session_mode = normalize_workspace_mode(loaded.workspace_mode)
         self.session_mode_locked = True
+        self.available_skills = []
+        self._mcp_inspection_cache = {}
+        with suppress(Exception):
+            self._refresh_available_mcp_servers()
+        self._apply_session_runtime_state(loaded)
+
+    def _apply_session_runtime_state(self, session: RunSession) -> None:
+        self.current_session_id = session.id
+        self.current_task = session.task
+        self.current_session_status = session.status.value
+        self.current_summary = session.final_summary or ""
+        self.selected_skill_ids = list(session.enabled_skill_ids)
+        self.skills_state = (
+            dict(session.skills_state) if isinstance(session.skills_state, dict) else {}
+        )
+        self.selected_mcp_server_ids = list(session.enabled_mcp_server_ids)
+        self.mcp_state = (
+            dict(session.mcp_state) if isinstance(session.mcp_state, dict) else {}
+        )
+
+    @staticmethod
+    def _normalize_mcp_server_ids(server_ids: list[str] | None) -> list[str] | None:
+        if server_ids is None:
+            return None
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in server_ids:
+            server_id = str(item).strip()
+            if not server_id or server_id in seen:
+                continue
+            seen.add(server_id)
+            normalized.append(server_id)
+        return normalized
+
+    def _project_dir_display(self) -> str | None:
+        if self.remote_config is not None:
+            remote_dir = str(self.remote_config.remote_dir or "").strip()
+            return remote_dir or None
+        return str(self.project_dir) if self.project_dir else None
+
+    def _apply_session_project_location(self, session: RunSession) -> None:
+        if self.remote_config is not None:
+            self.project_dir = None
+            return
+        self.project_dir = session.project_dir.resolve()
 
     def has_running_session(self) -> bool:
         return bool(self.session_task and not self.session_task.done())
@@ -291,6 +379,8 @@ class WebUIRuntimeState:
         task: str,
         model: str | None = None,
         root_agent_name: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._state_lock:
             normalized_task = task.strip()
@@ -298,8 +388,18 @@ class WebUIRuntimeState:
                 raise RuntimeError(self.translator.text("error_task_required"))
             resolved_model = self._resolve_model_for_run(model)
             resolved_root_agent_name = str(root_agent_name or "").strip()
+            normalized_skill_ids = (
+                normalize_skill_ids(enabled_skill_ids)
+                if enabled_skill_ids is not None
+                else None
+            )
+            normalized_mcp_server_ids = self._normalize_mcp_server_ids(enabled_mcp_server_ids)
             self.selected_model = resolved_model
             self.root_agent_name = resolved_root_agent_name
+            if normalized_skill_ids is not None:
+                self.selected_skill_ids = list(normalized_skill_ids)
+            if normalized_mcp_server_ids is not None:
+                self.selected_mcp_server_ids = list(normalized_mcp_server_ids)
             resolved_session_id = self._normalize_optional_session_id(
                 self.configured_resume_session_id
             )
@@ -316,11 +416,14 @@ class WebUIRuntimeState:
                 orchestrator = self.orchestrator
                 if orchestrator is None:
                     raise RuntimeError(self.translator.text("already_running"))
-                orchestrator.submit_run_in_active_session(
+                await orchestrator.submit_run_in_active_session(
                     submit_session_id,
                     normalized_task,
                     model=resolved_model,
                     root_agent_name=resolved_root_agent_name or None,
+                    enabled_skill_ids=normalized_skill_ids,
+                    enabled_mcp_server_ids=normalized_mcp_server_ids,
+                    remote_password=self.remote_password,
                     source="webui",
                 )
                 self.current_task = normalized_task
@@ -345,6 +448,8 @@ class WebUIRuntimeState:
                         resolved_model,
                         resolved_root_agent_name,
                         self.remote_password,
+                        normalized_skill_ids,
+                        normalized_mcp_server_ids,
                     )
                 )
                 return self.snapshot()
@@ -366,9 +471,178 @@ class WebUIRuntimeState:
                     self.session_mode,
                     self.remote_config,
                     self.remote_password,
+                    normalized_skill_ids,
+                    normalized_mcp_server_ids,
                 )
             )
         return self.snapshot()
+
+    async def discover_skills(
+        self,
+        *,
+        project_dir: str | None = None,
+        remote: dict[str, Any] | RemoteSessionConfig | None = None,
+        remote_password: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_remote = (
+            normalize_remote_session_config(remote)
+            if isinstance(remote, (dict, RemoteSessionConfig)) and remote
+            else None
+        )
+        normalized_project = (
+            Path(project_dir).expanduser().resolve()
+            if project_dir
+            else self.project_dir
+        )
+        if normalized_remote is None and normalized_project is None:
+            raise ValueError(self.translator.text("error_config_required"))
+        orchestrator = self._read_orchestrator(normalized_project or Path.cwd())
+        skills = await orchestrator.discover_skills(
+            project_dir=None if normalized_remote is not None else normalized_project,
+            remote_config=normalized_remote,
+            remote_password=remote_password if normalized_remote is not None else None,
+        )
+        self.available_skills = skills
+        return {
+            "skills": skills,
+            "snapshot": self.snapshot(),
+        }
+
+    async def discover_mcp_servers(self) -> dict[str, Any]:
+        servers = self._refresh_available_mcp_servers()
+        inspection_rows = await self._inspect_available_mcp_servers(servers)
+        if inspection_rows:
+            self._cache_mcp_inspection_rows(inspection_rows)
+            servers = self._refresh_available_mcp_servers()
+        return {
+            "mcp_servers": servers,
+            "snapshot": self.snapshot(),
+        }
+
+    async def start_mcp_oauth_login(
+        self,
+        server_id: str,
+        *,
+        timeout_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        normalized_server_id = str(server_id or "").strip()
+        if not normalized_server_id:
+            raise ValueError("server_id is required.")
+        async with self._state_lock:
+            self._sync_mcp_oauth_flows()
+            config = OpenCompanyConfig.load(self._resolved_app_dir())
+            server = config.mcp.servers.get(normalized_server_id)
+            if server is None:
+                raise ValueError(f"MCP server '{normalized_server_id}' is not defined in opencompany.toml.")
+            if not server.oauth_enabled:
+                raise ValueError(f"MCP server '{normalized_server_id}' does not require OAuth login.")
+            active_flow = self._active_mcp_oauth_flow(normalized_server_id)
+            if active_flow is not None:
+                self._refresh_available_mcp_servers()
+                return self._mcp_oauth_flow_payload(active_flow)
+            flow_ref: dict[str, McpOAuthLoginFlow] = {}
+
+            def _capture_authorization_url(url: str) -> bool:
+                normalized_url = str(url or "").strip()
+                flow = flow_ref.get("flow")
+                if flow is not None and normalized_url:
+                    flow.authorization_url = normalized_url
+                return True
+
+            task = asyncio.create_task(
+                complete_mcp_oauth_login(
+                    server=server,
+                    store_path=self._mcp_oauth_store_path(),
+                    timeout_seconds=max(1.0, float(timeout_seconds)),
+                    open_browser=True,
+                    browser_opener=_capture_authorization_url,
+                )
+            )
+            flow = McpOAuthLoginFlow(
+                id=f"mcp-oauth-{uuid.uuid4().hex[:12]}",
+                server_id=normalized_server_id,
+                task=task,
+            )
+            flow_ref["flow"] = flow
+            self._mcp_oauth_flows[flow.id] = flow
+            self._refresh_available_mcp_servers()
+            return self._mcp_oauth_flow_payload(flow)
+
+    async def clear_mcp_oauth_login(self, server_id: str) -> dict[str, Any]:
+        normalized_server_id = str(server_id or "").strip()
+        if not normalized_server_id:
+            raise ValueError("server_id is required.")
+        async with self._state_lock:
+            self._sync_mcp_oauth_flows()
+            active_flow = self._active_mcp_oauth_flow(normalized_server_id)
+            if active_flow is not None and not active_flow.task.done():
+                active_flow.task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await active_flow.task
+                self._mcp_oauth_flows.pop(active_flow.id, None)
+            removed = McpOAuthStore(self._mcp_oauth_store_path()).delete_record(
+                normalized_server_id
+            )
+            self._refresh_available_mcp_servers()
+            return {
+                "server_id": normalized_server_id,
+                "cleared": bool(removed or active_flow is not None),
+                "snapshot": self.snapshot(),
+            }
+
+    async def mcp_oauth_login_status(self, flow_id: str) -> dict[str, Any]:
+        normalized_flow_id = str(flow_id or "").strip()
+        if not normalized_flow_id:
+            raise ValueError("flow_id is required.")
+        async with self._state_lock:
+            self._sync_mcp_oauth_flows()
+            flow = self._mcp_oauth_flows.get(normalized_flow_id)
+            if flow is None:
+                raise ValueError(f"MCP OAuth flow '{normalized_flow_id}' was not found.")
+            self._refresh_available_mcp_servers()
+            return self._mcp_oauth_flow_payload(flow)
+
+    async def configure_mcp_env_auth(
+        self,
+        server_id: str,
+        values: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized_server_id = str(server_id or "").strip()
+        if not normalized_server_id:
+            raise ValueError("server_id is required.")
+        if not isinstance(values, dict):
+            raise ValueError("values must be an object.")
+        async with self._state_lock:
+            config = OpenCompanyConfig.load(self._resolved_app_dir())
+            server = config.mcp.servers.get(normalized_server_id)
+            if server is None:
+                raise ValueError(f"MCP server '{normalized_server_id}' is not defined in opencompany.toml.")
+            env_auth_keys = self._mcp_header_env_keys(
+                normalized_server_id,
+                config=config,
+            )
+            if not env_auth_keys:
+                raise ValueError(
+                    f"MCP server '{normalized_server_id}' has no env-backed auth headers."
+                )
+            normalized_values: dict[str, str] = {}
+            for env_key in env_auth_keys:
+                raw_value = values.get(env_key)
+                normalized_value = str(raw_value or "").strip()
+                if not normalized_value:
+                    raise ValueError(f"Value for '{env_key}' is required.")
+                if any(token in normalized_value for token in ("\r", "\n", "\x00")):
+                    raise ValueError(f"Value for '{env_key}' contains unsupported characters.")
+                normalized_values[env_key] = normalized_value
+            self._upsert_project_env_values(normalized_values)
+            for key, value in normalized_values.items():
+                os.environ[key] = value
+            self._refresh_available_mcp_servers()
+            return {
+                "server_id": normalized_server_id,
+                "updated_keys": list(normalized_values.keys()),
+                "snapshot": self.snapshot(),
+            }
 
     def interrupt(self) -> dict[str, Any]:
         orchestrator = self.orchestrator
@@ -380,6 +654,14 @@ class WebUIRuntimeState:
         return self.snapshot()
 
     async def shutdown(self) -> None:
+        if self._mcp_oauth_flows:
+            for flow in self._mcp_oauth_flows.values():
+                if not flow.task.done():
+                    flow.task.cancel()
+            await asyncio.gather(
+                *(flow.task for flow in self._mcp_oauth_flows.values()),
+                return_exceptions=True,
+            )
         task = self.session_task
         if task is None or task.done():
             return
@@ -515,6 +797,23 @@ class WebUIRuntimeState:
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
         return orchestrator.load_session_events(normalized)
 
+    def list_session_events_page(
+        self,
+        session_id: str,
+        *,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+    ) -> dict[str, Any]:
+        normalized = self._resolve_session_id(session_id)
+        orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
+        return orchestrator.list_session_events_page(
+            normalized,
+            limit=limit,
+            before=before,
+            activity_only=activity_only,
+        )
+
     def load_session_agents(self, session_id: str) -> list[dict[str, Any]]:
         normalized = self._resolve_session_id(session_id)
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
@@ -530,6 +829,7 @@ class WebUIRuntimeState:
         cursor: str | None = None,
         limit: int = 500,
         tail: int | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         normalized = self._resolve_session_id(session_id)
         orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
@@ -539,6 +839,7 @@ class WebUIRuntimeState:
             cursor=cursor,
             limit=limit,
             tail=tail,
+            before=before,
         )
 
     def list_tool_runs_page(
@@ -560,21 +861,26 @@ class WebUIRuntimeState:
 
     def get_tool_run(self, session_id: str, tool_run_id: str) -> dict[str, Any]:
         normalized_session_id = self._resolve_session_id(session_id)
+        orchestrator = self._terminal_orchestrator()
+        if hasattr(orchestrator, "get_tool_run_detail"):
+            return orchestrator.get_tool_run_detail(normalized_session_id, tool_run_id)
         normalized_tool_run_id = str(tool_run_id or "").strip()
         if not normalized_tool_run_id:
             raise ValueError("tool_run_id is required")
-        orchestrator = self._terminal_orchestrator()
         record = orchestrator.storage.load_tool_run(normalized_tool_run_id)
         if not isinstance(record, dict):
             raise ValueError(f"Tool run {normalized_tool_run_id} was not found.")
         if str(record.get("session_id", "")).strip() != normalized_session_id:
             raise ValueError(f"Tool run {normalized_tool_run_id} is outside the current session.")
-
         detail = dict(record)
-        if str(detail.get("tool_name", "")).strip() == "shell":
+        if str(detail.get("tool_name", "")).strip() == "shell" and hasattr(
+            orchestrator,
+            "_shell_outputs_for_tool_run",
+        ):
             stdout, stderr = orchestrator._shell_outputs_for_tool_run(detail)
             detail["stdout"] = stdout
             detail["stderr"] = stderr
+        detail.setdefault("timeline", [])
         return detail
 
     def tool_run_metrics(self, session_id: str) -> dict[str, Any]:
@@ -1015,6 +1321,31 @@ class WebUIRuntimeState:
         elif event_type == "session_context_imported":
             self.current_session_status = str(details.get("session_status", self.current_session_status))
             self.status_message = self.translator.text("configuration_saved")
+        elif event_type == "session_skills_materialized":
+            if isinstance(details, dict):
+                self.selected_skill_ids = [
+                    str(item).strip()
+                    for item in details.get("enabled_skill_ids", [])
+                    if str(item).strip()
+                ]
+                self.skills_state = {
+                    **(self.skills_state if isinstance(self.skills_state, dict) else {}),
+                    "bundle_root": str(details.get("skill_bundle_root", "") or ""),
+                    "manifest_path": str(details.get("manifest_path", "") or ""),
+                    "warnings": list(details.get("warnings", []))
+                    if isinstance(details.get("warnings"), list)
+                    else [],
+                }
+        elif event_type == "session_mcp_refreshed":
+            if isinstance(details, dict):
+                self.selected_mcp_server_ids = self._normalize_mcp_server_ids(
+                    details.get("enabled_mcp_server_ids")
+                    if isinstance(details.get("enabled_mcp_server_ids"), list)
+                    else None
+                ) or []
+                mcp_state = details.get("mcp_state")
+                if isinstance(mcp_state, dict):
+                    self.mcp_state = dict(mcp_state)
         elif event_type == "session_interrupted":
             self.current_session_status = "interrupted"
             self.status_message = self.translator.text("session_interrupted")
@@ -1042,6 +1373,8 @@ class WebUIRuntimeState:
         session_mode: WorkspaceMode | str | None = None,
         remote: RemoteSessionConfig | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1056,14 +1389,16 @@ class WebUIRuntimeState:
             if remote is not None:
                 run_kwargs["remote_config"] = remote
                 run_kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                run_kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.run_task(task, **run_kwargs)
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_completed")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"
@@ -1083,6 +1418,8 @@ class WebUIRuntimeState:
         model: str,
         root_agent_name: str | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1094,18 +1431,20 @@ class WebUIRuntimeState:
             }
             if str(remote_password or "").strip():
                 kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.run_task_in_session(
                 session_id,
                 task,
                 **kwargs,
             )
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_completed")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"
@@ -1126,6 +1465,8 @@ class WebUIRuntimeState:
         reactivate_agent_id: str | None = None,
         run_root_agent: bool = True,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> None:
         orchestrator = self.orchestrator
         if orchestrator is None:
@@ -1138,18 +1479,20 @@ class WebUIRuntimeState:
             }
             if str(remote_password or "").strip():
                 kwargs["remote_password"] = remote_password
+            if enabled_skill_ids is not None:
+                kwargs["enabled_skill_ids"] = enabled_skill_ids
+            if enabled_mcp_server_ids is not None:
+                kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
             session = await orchestrator.resume(
                 session_id,
                 instruction,
                 **kwargs,
             )
-            self.project_dir = session.project_dir.resolve()
-            self.current_session_id = session.id
+            self._apply_session_project_location(session)
             self.configured_resume_session_id = session.id
             self.session_mode = normalize_workspace_mode(session.workspace_mode)
             self.session_mode_locked = True
-            self.current_session_status = session.status.value
-            self.current_summary = session.final_summary or self.current_summary
+            self._apply_session_runtime_state(session)
             self.status_message = self.current_summary or self.translator.text("session_resumed_done")
         except asyncio.CancelledError:
             self.current_session_status = "interrupted"
@@ -1169,6 +1512,274 @@ class WebUIRuntimeState:
             orchestrator = Orchestrator(project_dir, locale=self.locale, app_dir=self.app_dir)
         self._apply_sandbox_backend(orchestrator)
         return orchestrator
+
+    def _sync_mcp_oauth_flows(self) -> None:
+        for flow in self._mcp_oauth_flows.values():
+            if not flow.task.done() or flow.status in {"completed", "failed", "cancelled"}:
+                continue
+            try:
+                result = flow.task.result()
+            except asyncio.CancelledError:
+                flow.status = "cancelled"
+                flow.error = "cancelled"
+                flow.result = None
+            except Exception as exc:
+                flow.status = "failed"
+                flow.error = str(exc)
+                flow.result = None
+            else:
+                flow.status = "completed"
+                flow.error = ""
+                flow.result = {
+                    "authorization_server": getattr(result.record, "authorization_server", ""),
+                    "resource": getattr(result.record, "resource", ""),
+                    "scope": getattr(result.record, "scope", ""),
+                    "expires_at": getattr(result.record, "expires_at", None),
+                }
+
+    def _active_mcp_oauth_flow(self, server_id: str) -> McpOAuthLoginFlow | None:
+        normalized_server_id = str(server_id or "").strip()
+        for flow in self._mcp_oauth_flows.values():
+            if flow.server_id == normalized_server_id and flow.status == "pending":
+                return flow
+        return None
+
+    def _mcp_oauth_store_path(self) -> Path:
+        app_dir = self._resolved_app_dir()
+        config = OpenCompanyConfig.load(app_dir)
+        return RuntimePaths.create(app_dir, config).mcp_oauth_tokens_path
+
+    def _oauth_server_state_payload(self, server_id: str) -> dict[str, Any]:
+        payload = {
+            "oauth_authorized": False,
+            "oauth_scope": "",
+            "oauth_expires_at": None,
+            "oauth_login_pending": False,
+            "oauth_flow_id": "",
+            "oauth_login_error": "",
+        }
+        try:
+            record = McpOAuthStore(self._mcp_oauth_store_path()).load_record(server_id)
+        except Exception:
+            record = None
+        if record is not None and record.access_token:
+            payload["oauth_authorized"] = True
+            payload["oauth_scope"] = record.scope
+            payload["oauth_expires_at"] = record.expires_at
+        flow = self._active_mcp_oauth_flow(server_id)
+        if flow is not None:
+            payload["oauth_login_pending"] = True
+            payload["oauth_flow_id"] = flow.id
+        return payload
+
+    def _refresh_available_mcp_servers(self) -> list[dict[str, Any]]:
+        self._sync_mcp_oauth_flows()
+        config = OpenCompanyConfig.load(self._resolved_app_dir())
+        orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
+        servers = orchestrator.mcp_manager.available_servers()
+        enriched: list[dict[str, Any]] = []
+        for raw_server in servers:
+            row = dict(raw_server)
+            if row.get("enabled") is False:
+                continue
+            server_id = str(row.get("id", "") or "").strip()
+            if server_id and bool(row.get("oauth_enabled", False)):
+                row.update(self._oauth_server_state_payload(server_id))
+            env_auth_keys = self._mcp_header_env_keys(server_id, config=config)
+            row["env_auth_required"] = bool(env_auth_keys)
+            row["env_auth_keys"] = list(env_auth_keys)
+            row["env_auth_configured"] = bool(env_auth_keys) and all(
+                str(os.environ.get(key, "")).strip()
+                for key in env_auth_keys
+            )
+            if server_id:
+                inspection = self._mcp_inspection_cache.get(server_id)
+                if isinstance(inspection, dict):
+                    row.update(inspection)
+            enriched.append(row)
+        self.available_mcp_servers = enriched
+        return enriched
+
+    async def _inspect_available_mcp_servers(
+        self,
+        servers: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        server_ids = [
+            str(item.get("id", "")).strip()
+            for item in servers
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+        if not server_ids:
+            return []
+        if self.remote_config is None and self.project_dir is None:
+            return []
+        orchestrator = self._read_orchestrator(self.project_dir or Path.cwd())
+        inspect = getattr(orchestrator.mcp_manager, "inspect_servers", None)
+        if not callable(inspect):
+            return []
+        inspection_session_id = f"webui-mcp-inspect-{uuid.uuid4().hex[:12]}"
+        workspace_path = (
+            Path(self.remote_config.remote_dir).expanduser()
+            if self.remote_config is not None
+            else (self.project_dir or Path.cwd()).resolve()
+        )
+        try:
+            if self.remote_config is not None:
+                orchestrator._apply_session_remote_runtime(
+                    session_id=inspection_session_id,
+                    remote_config=self.remote_config,
+                    remote_password=self.remote_password,
+                    require_password=True,
+                )
+            rows = await inspect(
+                enabled_server_ids=server_ids,
+                workspace_path=workspace_path,
+                workspace_is_remote=self.remote_config is not None,
+                tool_executor=orchestrator.tool_executor,
+                session_id=inspection_session_id,
+            )
+            return [dict(item) for item in rows if isinstance(item, dict)]
+        except Exception:
+            return []
+        finally:
+            with suppress(Exception):
+                await orchestrator.mcp_manager.close_session(inspection_session_id)
+            with suppress(Exception):
+                orchestrator.tool_executor.cleanup_session_remote_runtime(inspection_session_id)
+
+    def _cache_mcp_inspection_rows(self, rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            server_id = str(row.get("id", "") or row.get("server_id", "")).strip()
+            if not server_id:
+                continue
+            tools = row.get("tools") if isinstance(row.get("tools"), list) else []
+            resources = row.get("resources") if isinstance(row.get("resources"), list) else []
+            tool_items = [
+                {
+                    "tool_name": str(item.get("tool_name", "")).strip(),
+                    "title": str(item.get("title", "")).strip(),
+                    "description": str(item.get("description", "")).strip(),
+                    "synthetic_name": str(item.get("synthetic_name", "")).strip(),
+                }
+                for item in tools
+                if isinstance(item, dict)
+            ]
+            resource_items = [
+                {
+                    "uri": str(item.get("uri", "")).strip(),
+                    "name": str(item.get("name", "")).strip(),
+                    "title": str(item.get("title", "")).strip(),
+                    "description": str(item.get("description", "")).strip(),
+                    "mime_type": str(item.get("mime_type", "")).strip(),
+                }
+                for item in resources
+                if isinstance(item, dict)
+            ]
+            tool_names = [
+                str(item.get("tool_name", "")).strip()
+                for item in tools
+                if isinstance(item, dict) and str(item.get("tool_name", "")).strip()
+            ]
+            resource_names = [
+                str(item.get("title", "") or item.get("name", "") or item.get("uri", "")).strip()
+                for item in resources
+                if isinstance(item, dict)
+                and str(item.get("title", "") or item.get("name", "") or item.get("uri", "")).strip()
+            ]
+            resource_uris = [
+                str(item.get("uri", "")).strip()
+                for item in resources
+                if isinstance(item, dict) and str(item.get("uri", "")).strip()
+            ]
+            self._mcp_inspection_cache[server_id] = {
+                "materialized": True,
+                "connected": bool(row.get("connected", False)),
+                "roots_enabled": bool(row.get("roots_enabled", False)),
+                "protocol_version": str(row.get("protocol_version", "")).strip(),
+                "warning": str(row.get("warning", "")).strip(),
+                "tool_count": max(0, int(row.get("tool_count", len(tool_items)) or 0)),
+                "resource_count": max(0, int(row.get("resource_count", len(resource_items)) or 0)),
+                "tool_names": tool_names,
+                "tool_items": tool_items,
+                "resource_names": resource_names,
+                "resource_uris": resource_uris,
+                "resource_items": resource_items,
+                "tools_dirty": bool(row.get("tools_dirty", False)),
+                "resources_dirty": bool(row.get("resources_dirty", False)),
+            }
+
+    def _mcp_header_env_keys(
+        self,
+        server_id: str,
+        *,
+        config: OpenCompanyConfig | None = None,
+    ) -> list[str]:
+        normalized_server_id = str(server_id or "").strip()
+        if not normalized_server_id:
+            return []
+        resolved_config = config or OpenCompanyConfig.load(self._resolved_app_dir())
+        server = resolved_config.mcp.servers.get(normalized_server_id)
+        if server is None:
+            return []
+        keys: list[str] = []
+        seen: set[str] = set()
+        for raw_value in server.headers.values():
+            normalized_value = str(raw_value or "")
+            if not normalized_value.startswith("env:"):
+                continue
+            env_key = normalized_value[4:].strip()
+            if not env_key or env_key in seen:
+                continue
+            keys.append(env_key)
+            seen.add(env_key)
+        return keys
+
+    def _upsert_project_env_values(self, values: dict[str, str]) -> None:
+        env_path = self._resolved_app_dir() / ".env"
+        existing_lines = (
+            env_path.read_text(encoding="utf-8").splitlines()
+            if env_path.exists()
+            else []
+        )
+        pending: dict[str, str] = {
+            str(key).strip(): str(value)
+            for key, value in values.items()
+            if str(key).strip()
+        }
+        rendered: list[str] = []
+        for line in existing_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                rendered.append(line)
+                continue
+            key_part, _, _ = line.partition("=")
+            env_key = key_part.strip()
+            if env_key in pending:
+                rendered.append(f"{env_key}={pending.pop(env_key)}")
+            else:
+                rendered.append(line)
+        if pending:
+            if rendered and rendered[-1].strip():
+                rendered.append("")
+            for env_key, env_value in pending.items():
+                rendered.append(f"{env_key}={env_value}")
+        env_path.write_text(
+            "\n".join(rendered) + ("\n" if rendered else ""),
+            encoding="utf-8",
+        )
+
+    def _mcp_oauth_flow_payload(self, flow: McpOAuthLoginFlow) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "flow_id": flow.id,
+            "server_id": flow.server_id,
+            "status": flow.status,
+            "authorization_url": flow.authorization_url,
+            "error": flow.error,
+            "snapshot": self.snapshot(),
+        }
+        if isinstance(flow.result, dict):
+            payload.update(flow.result)
+        return payload
 
     def _resolved_app_dir(self) -> Path:
         if self.app_dir is not None:
@@ -1279,7 +1890,12 @@ class WebUIRuntimeState:
         normalized_agent_id = str(agent_id or "").strip()
         if not normalized_agent_id:
             return ""
-        for row in orchestrator.storage.load_agents(session_id):
+        load_agents = getattr(orchestrator, "load_session_agents", None)
+        if callable(load_agents):
+            rows = load_agents(session_id)
+        else:
+            rows = orchestrator.storage.load_agents(session_id)
+        for row in rows:
             if str(row.get("id", "")).strip() != normalized_agent_id:
                 continue
             return str(row.get("role", "")).strip().lower()

@@ -7,10 +7,12 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from opencompany.mcp import McpError
 from opencompany.models import (
     AgentNode,
     AgentRole,
     AgentStatus,
+    EventRecord,
     RunSession,
     SessionStatus,
     ToolRun,
@@ -85,6 +87,317 @@ def bootstrap_runtime(
 
 
 class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ask_agent_emits_runtime_mcp_state_when_prepare_agent_updates_status(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-mcp-runtime-update",
+            )
+
+            async def _fake_prepare_agent(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                return {
+                    "enabled": True,
+                    "enabled_server_ids": ["filesystem"],
+                    "entries": [
+                        {
+                            "id": "filesystem",
+                            "title": "filesystem",
+                            "transport": "stdio",
+                            "enabled": True,
+                            "connected": True,
+                            "tool_count": 2,
+                            "resource_count": 1,
+                        }
+                    ],
+                    "warnings": [],
+                    "dynamic_tools": [],
+                    "updated_at": "2026-03-19T10:00:00Z",
+                }
+
+            async def _fake_runtime_ask(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                return []
+
+            session.enabled_mcp_server_ids = ["filesystem"]
+            orchestrator.mcp_manager.prepare_agent = _fake_prepare_agent  # type: ignore[method-assign]
+            orchestrator.agent_runtime.ask = _fake_runtime_ask  # type: ignore[method-assign]
+
+            await orchestrator._ask_agent(
+                root,
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+
+            self.assertTrue(session.mcp_state["entries"][0]["connected"])
+            events = orchestrator.storage.load_events(session.id)
+            refresh_events = [
+                event
+                for event in events
+                if event["event_type"] == "session_mcp_refreshed"
+            ]
+            self.assertEqual(len(refresh_events), 1)
+            payload = json.loads(refresh_events[0]["payload_json"])
+            self.assertEqual(payload["mcp_state"]["entries"][0]["tool_count"], 2)
+
+    async def test_ask_agent_persists_mcp_warning_when_prepare_agent_fails(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-mcp-runtime-failure",
+            )
+
+            async def _raise_prepare_agent(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                raise McpError("MCP bootstrap failed")
+
+            async def _fake_runtime_ask(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                return []
+
+            session.enabled_mcp_server_ids = ["filesystem"]
+            orchestrator.mcp_manager.prepare_agent = _raise_prepare_agent  # type: ignore[method-assign]
+            orchestrator.agent_runtime.ask = _fake_runtime_ask  # type: ignore[method-assign]
+
+            await orchestrator._ask_agent(
+                root,
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+
+            self.assertEqual(
+                session.mcp_state["warnings"][0]["message"],
+                "MCP bootstrap failed",
+            )
+            events = orchestrator.storage.load_events(session.id)
+            refresh_events = [
+                event
+                for event in events
+                if event["event_type"] == "session_mcp_refreshed"
+            ]
+            self.assertEqual(len(refresh_events), 1)
+            payload = json.loads(refresh_events[0]["payload_json"])
+            self.assertEqual(
+                payload["mcp_state"]["warnings"][0]["message"],
+                "MCP bootstrap failed",
+            )
+
+    def test_project_tool_result_preserves_mcp_truncation_flags(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+
+            resource_result = orchestrator._project_tool_result(
+                action={"type": "read_mcp_resource"},
+                raw_result={
+                    "server_id": "filesystem",
+                    "uri": "file:///demo.txt",
+                    "contents": [{"text": "demo"}],
+                    "contents_truncated": True,
+                },
+            )
+            dynamic_result = orchestrator._project_tool_result(
+                action={"type": "mcp__filesystem__search__deadbeef"},
+                raw_result={
+                    "server_id": "filesystem",
+                    "tool_name": "search",
+                    "content": [{"text": "demo"}],
+                    "content_truncated": True,
+                },
+            )
+
+            self.assertTrue(resource_result["contents_truncated"])
+            self.assertTrue(dynamic_result["content_truncated"])
+
+    def test_get_tool_run_detail_uses_projected_timeline_without_session_scan(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-tool-timeline-projected",
+            )
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id="toolrun-1",
+                    session_id=session.id,
+                    agent_id=root.id,
+                    tool_name="list_agent_runs",
+                    arguments={"type": "list_agent_runs"},
+                    status=ToolRunStatus.COMPLETED,
+                    blocking=True,
+                    created_at="2026-03-18T10:00:00Z",
+                    started_at="2026-03-18T10:00:01Z",
+                    completed_at="2026-03-18T10:00:03Z",
+                    result={"ok": True},
+                )
+            )
+            for timestamp, event_type, payload in [
+                (
+                    "2026-03-18T10:00:00Z",
+                    "tool_call_started",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "action": {"type": "list_agent_runs", "_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:01Z",
+                    "tool_run_submitted",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "list_agent_runs",
+                        "action": {"_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:02Z",
+                    "tool_call",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "action": {"type": "list_agent_runs", "_tool_call_id": "call-1"},
+                        "result": {"ok": True},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:03Z",
+                    "tool_run_updated",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "list_agent_runs",
+                        "status": ToolRunStatus.COMPLETED.value,
+                    },
+                ),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session.id,
+                        agent_id=root.id,
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="tool",
+                        payload=payload,
+                        workspace_id=workspace_manager.root_workspace().id,
+                        checkpoint_seq=0,
+                    )
+                )
+
+            orchestrator.storage.mark_tool_run_timeline_backfilled(
+                session.id,
+                utc_now(),
+            )
+            def _unexpected_load_events(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                raise AssertionError("projected timeline should not fall back to session event scan")
+
+            orchestrator.storage.load_events = _unexpected_load_events  # type: ignore[method-assign]
+            detail = orchestrator.get_tool_run_detail(session.id, "toolrun-1")
+
+            self.assertEqual(
+                [entry["event_type"] for entry in detail["timeline"]],
+                ["tool_call_started", "tool_run_submitted", "tool_call", "tool_run_updated"],
+            )
+
+    def test_get_tool_run_detail_backfills_legacy_session_once(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, _agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-tool-timeline-legacy",
+            )
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id="toolrun-1",
+                    session_id=session.id,
+                    agent_id=root.id,
+                    tool_name="list_agent_runs",
+                    arguments={"type": "list_agent_runs"},
+                    status=ToolRunStatus.COMPLETED,
+                    blocking=True,
+                    created_at="2026-03-18T10:00:00Z",
+                    started_at="2026-03-18T10:00:01Z",
+                    completed_at="2026-03-18T10:00:03Z",
+                    result={"ok": True},
+                )
+            )
+            for timestamp, event_type, payload in [
+                (
+                    "2026-03-18T10:00:00Z",
+                    "tool_call_started",
+                    {"action": {"type": "list_agent_runs", "_tool_call_id": "call-1"}},
+                ),
+                (
+                    "2026-03-18T10:00:01Z",
+                    "tool_run_submitted",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "list_agent_runs",
+                        "action": {"_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:02Z",
+                    "tool_call",
+                    {
+                        "action": {"type": "list_agent_runs", "_tool_call_id": "call-1"},
+                        "result": {"ok": True},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:03Z",
+                    "tool_run_updated",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "list_agent_runs",
+                        "status": ToolRunStatus.COMPLETED.value,
+                    },
+                ),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session.id,
+                        agent_id=root.id,
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="tool",
+                        payload=payload,
+                        workspace_id=workspace_manager.root_workspace().id,
+                        checkpoint_seq=0,
+                    )
+                )
+
+            first = orchestrator.get_tool_run_detail(session.id, "toolrun-1")
+            self.assertEqual(
+                [entry["event_type"] for entry in first["timeline"]],
+                ["tool_call_started", "tool_run_submitted", "tool_call", "tool_run_updated"],
+            )
+            self.assertTrue(
+                all(
+                    str(entry.get("payload", {}).get("tool_run_id", "")) == "toolrun-1"
+                    for entry in first["timeline"]
+                )
+            )
+            self.assertTrue(orchestrator.storage.has_tool_run_timeline_backfill(session.id))
+
+            def _unexpected_load_events(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                raise AssertionError("legacy session should only backfill once")
+
+            orchestrator.storage.load_events = _unexpected_load_events  # type: ignore[method-assign]
+            second = orchestrator.get_tool_run_detail(session.id, "toolrun-1")
+            self.assertEqual(
+                [entry["event_type"] for entry in second["timeline"]],
+                ["tool_call_started", "tool_run_submitted", "tool_call", "tool_run_updated"],
+            )
+
     async def test_list_agent_runs_pagination_and_messages_count(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)

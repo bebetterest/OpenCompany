@@ -56,6 +56,21 @@ Locale behavior:
 - `zh` uses `_cn` variants
 - fallback defaults to English assets when localized files are missing
 
+## Skill Prompt Augmentation
+
+When a session has enabled skills:
+
+- runtime stores a `skills_catalog` inside each agent's metadata
+- `ContextAssembler.system_prompt()` appends an `Enabled Skills` block after the role prompt
+- that block includes:
+  - skill bundle root
+  - manifest path
+  - per-skill doc path / localized doc path
+  - any drift or missing-source warnings
+
+The appended section is informational only: skills do not register new tools or change tool schemas.
+The role prompts also explain how to use that section: root should incorporate it into planning/delegation and pass exact paths downstream, while worker should read the referenced docs first and use `shell` for any file/script/binary inspection.
+
 ## Role and Locale Coupling
 
 - System prompt is role-specific (`root` / `worker`).
@@ -71,6 +86,7 @@ Locale behavior:
 - Root prompt explicitly prefers `steer_agent` for course corrections or extra constraints on an existing agent, instead of spawning a new overlapping child.
 - Root prompt also states that inter-agent messaging/replies should go through `steer_agent`, that new user messages are authoritative and must be followed strictly, and that messages from other agents must be analyzed before application.
 - Root prompt enforces spawn-task-bound action scope and a no-touch rule for referenced files/content unless modification permission is explicitly stated.
+- Root prompt also states that when an `Enabled Skills` block is present, it should be treated as a reusable-resource hint and relevant skills should be preferred when useful; children should receive exact listed paths, and the materialized skill bundle stays read-only unless the user explicitly asks otherwise.
 - Root prompt requires active progress checks for running children, allows explicit `wait_time` / `wait_run` usage, and mandates dependency-chain termination when a required child is terminated.
 - Root prompt requires post-child validation and cleanup before downstream use, with targeted re-delegation for follow-up and local handling only for trivial edits.
 - Root prompt instructs user handoff with analysis summary when completion is near-impossible (for example no viable path or effort estimate beyond 24 hours).
@@ -81,6 +97,7 @@ Locale behavior:
 - Worker prompt also prefers `steer_agent` when an already-running agent only needs correction or additional constraints.
 - Worker prompt also states that inter-agent messaging/replies should go through `steer_agent`, that new user/parent-agent messages are authoritative and must be followed strictly, and that messages from other non-parent agents require the worker's own analysis and judgment.
 - Worker prompt also enforces the same no-touch rule: referenced files/content remain read-only unless explicit modification permission is granted.
+- Worker prompt also states that when an `Enabled Skills` block is present, it should be treated as a reusable-resource hint and relevant skills should be preferred when useful: read the referenced docs first, use listed paths exactly, inspect/execute skill scripts or binaries only via `shell`, and keep the materialized skill bundle read-only unless explicitly allowed.
 - Worker prompt mirrors the same anti-overlap, dependency-ID propagation, no-parent-duplicate-execution, dependency-chain termination, and mid-flight wait/check guardrails when it creates child agents.
 - Worker prompt requires dependency-aware execution against referenced agent outputs, post-child validation/cleanup, and explicit blocked-state summaries when completion is not feasible in the current environment.
 - Worker prompt also repeats the ended-agent `finish` summary/feedback expectation and the `get_agent_run(agent_id)` last-message lookup pattern.

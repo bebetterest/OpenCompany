@@ -838,7 +838,7 @@ class OrchestratorSteerRunTests(unittest.IsolatedAsyncioTestCase):
                 SteerRunStatus.CANCELLED.value,
             )
 
-    async def test_load_session_context_clones_steer_runs_and_rewrites_event_ids(self) -> None:
+    async def test_clone_session_clones_steer_runs_and_rewrites_event_ids(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             app_dir = root / "opencompany-app"
@@ -870,7 +870,7 @@ class OrchestratorSteerRunTests(unittest.IsolatedAsyncioTestCase):
                 task="Clone steer runs",
                 locale="en",
                 root_agent_id=root_agent.id,
-                status=SessionStatus.RUNNING,
+                status=SessionStatus.INTERRUPTED,
                 created_at=now,
                 updated_at=now,
             )
@@ -918,7 +918,7 @@ class OrchestratorSteerRunTests(unittest.IsolatedAsyncioTestCase):
             )
             orchestrator.storage.save_checkpoint(session_id, now, checkpoint_state)
 
-            loaded = orchestrator.load_session_context(session_id)
+            loaded = orchestrator.clone_session(session_id)
             cloned_runs_page = orchestrator.list_steer_runs_page(loaded.id, limit=20)
             cloned_runs = cloned_runs_page.get("steer_runs")
             self.assertIsInstance(cloned_runs, list)

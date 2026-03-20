@@ -11,7 +11,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
+from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
@@ -20,6 +22,7 @@ from typing import Any
 from opencompany.config import OpenCompanyConfig
 from opencompany.llm.openrouter import OpenRouterClient
 from opencompany.logging import AgentMessageLogger, DiagnosticLogger, StructuredLogger, append_jsonl
+from opencompany.mcp import McpError, McpManager
 from opencompany.models import (
     AgentNode,
     AgentRole,
@@ -60,7 +63,7 @@ from opencompany.orchestration import (
     session_state,
     worker_initial_message,
 )
-from opencompany.orchestration.context import prompt_window_projection
+from opencompany.orchestration.context import prompt_window_projection_from_metadata
 from opencompany.orchestration.messages import (
     step_limit_summary_message,
 )
@@ -69,6 +72,24 @@ from opencompany.prompts import PromptLibrary
 from opencompany.sandbox.anthropic import AnthropicSandboxBackend
 from opencompany.sandbox.base import SandboxBackend
 from opencompany.sandbox.registry import resolve_sandbox_backend_cls
+from opencompany.skills import (
+    SKILL_BUNDLE_DIRNAME,
+    SKILL_MAIN_DOC_CN_FILENAME,
+    SKILL_MAIN_DOC_FILENAME,
+    SKILL_MANIFEST_FILENAME,
+    SKILL_METADATA_FILENAME,
+    SkillDescriptor,
+    SkillFileRecord,
+    build_manifest_payload,
+    copy_local_skill_tree,
+    describe_skill_drift,
+    discover_local_skills,
+    normalize_skill_id,
+    normalize_skill_ids,
+    skill_bundle_root_relative,
+    skill_manifest_relative,
+    skills_catalog_for_agent,
+)
 from opencompany.status_machine import (
     AGENT_ACTIVE_STATUSES,
     AGENT_NON_SCHEDULABLE_STATUSES,
@@ -77,7 +98,7 @@ from opencompany.status_machine import (
     normalize_session_completion_state,
     validate_agent_status_transition,
 )
-from opencompany.storage import Storage
+from opencompany.storage import Storage, TOOL_RUN_TIMELINE_EVENT_TYPES
 from opencompany.tools import ToolExecutor, child_limit_details, child_summaries, is_descendant
 from opencompany.tools.runtime import (
     KNOWN_STEER_RUN_STATUSES,
@@ -108,6 +129,21 @@ from opencompany.utils import (
     utc_now,
 )
 from opencompany.workspace import WorkspaceChangeSet, WorkspaceManager
+
+SESSION_HISTORY_STREAM_EVENT_TYPES = frozenset({"llm_token", "llm_reasoning", "shell_stream"})
+ACTIVITY_DIAGNOSTIC_EVENT_TYPES = frozenset(
+    {
+        "mcp_connect_started",
+        "mcp_transport_fallback_started",
+        "mcp_transport_fallback_succeeded",
+        "mcp_transport_fallback_failed",
+        "mcp_initialized",
+        "mcp_tools_refreshed",
+        "mcp_resources_refreshed",
+        "mcp_resources_not_supported",
+        "mcp_server_prepare_failed",
+    }
+)
 
 
 def _looks_like_app_dir(path: Path) -> bool:
@@ -201,6 +237,11 @@ class Orchestrator:
             log_agent_event=self._log_agent_event,
             log_diagnostic=self._log_diagnostic,
         )
+        self.mcp_manager = McpManager(
+            app_dir=self.app_dir,
+            config=self.config,
+            log_diagnostic=self._log_diagnostic,
+        )
         self.agent_runtime = AgentRuntime(
             config=self.config,
             locale=self.locale,
@@ -214,6 +255,7 @@ class Orchestrator:
         self.latest_session_id: str | None = None
         self._loggers: dict[str, StructuredLogger] = {}
         self._message_loggers: dict[str, AgentMessageLogger] = {}
+        self._debug_timing_paths: dict[str, Path] = {}
         self._run_loop_task: asyncio.Task[Any] | None = None
         self._workspace_merge_lock = asyncio.Lock()
         self._worker_semaphore: asyncio.Semaphore | None = None
@@ -341,6 +383,8 @@ class Orchestrator:
         workspace_mode: WorkspaceMode | str | None = None,
         remote_config: RemoteSessionConfig | dict[str, Any] | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         resolved_workspace_mode = normalize_workspace_mode(
@@ -381,6 +425,8 @@ class Orchestrator:
             status=SessionStatus.RUNNING,
             created_at=now,
             updated_at=now,
+            enabled_skill_ids=normalize_skill_ids(enabled_skill_ids),
+            skill_bundle_root=skill_bundle_root_relative(session_id),
             config_snapshot=json_ready(asdict(self.config)),
         )
         self._persist_session_remote_config(session.id, normalized_remote_config)
@@ -395,6 +441,7 @@ class Orchestrator:
         )
         session.root_agent_id = root_agent.id
         self.storage.upsert_session(session)
+        self.storage.mark_tool_run_timeline_backfilled(session.id, now)
         logger = self._get_logger(session_id)
         self._log_diagnostic(
             "session_run_requested",
@@ -406,6 +453,8 @@ class Orchestrator:
                 "project_dir": str(self.project_dir),
                 "root_agent_id": root_agent.id,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -422,6 +471,9 @@ class Orchestrator:
                 "root_agent_name": root_agent.name,
                 "root_agent_role": root_agent.role.value,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": 0,
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -430,19 +482,82 @@ class Orchestrator:
         self._tool_run_shell_streams = {}
         self._run_loop_task = asyncio.current_task()
         try:
-            self._apply_session_remote_runtime(
-                session_id=session.id,
-                remote_config=normalized_remote_config,
-                remote_password=remote_password,
-                require_password=True,
-            )
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=[],
-                root_loop=0,
-            )
+            apply_remote_started_monotonic = time.perf_counter()
+            apply_remote_succeeded = False
+            try:
+                self._apply_session_remote_runtime(
+                    session_id=session.id,
+                    remote_config=normalized_remote_config,
+                    remote_password=remote_password,
+                    require_password=True,
+                )
+                apply_remote_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.setup_remote_runtime",
+                    started_monotonic=apply_remote_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": apply_remote_succeeded},
+                )
+
+            refresh_skills_started_monotonic = time.perf_counter()
+            refresh_skills_succeeded = False
+            try:
+                await self._refresh_session_skills(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    requested_skill_ids=enabled_skill_ids,
+                    remote_password=remote_password,
+                )
+                refresh_skills_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.refresh_skills",
+                    started_monotonic=refresh_skills_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": refresh_skills_succeeded},
+                )
+
+            refresh_mcp_started_monotonic = time.perf_counter()
+            refresh_mcp_succeeded = False
+            try:
+                await self._refresh_session_mcp(
+                    session=session,
+                    agents=agents,
+                    requested_server_ids=enabled_mcp_server_ids,
+                )
+                refresh_mcp_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.refresh_mcp",
+                    started_monotonic=refresh_mcp_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": refresh_mcp_succeeded},
+                )
+
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=[],
+                    root_loop=0,
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": run_session_succeeded},
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -478,6 +593,8 @@ class Orchestrator:
         model: str | None = None,
         root_agent_name: str | None = None,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         normalized_session_id = self._normalize_session_id(session_id)
@@ -497,12 +614,60 @@ class Orchestrator:
             checkpoint_seq,
         ) = self._import_session_context(normalized_session_id, source="run")
         remote_config = self._session_remote_config(normalized_session_id)
-        self._apply_session_remote_runtime(
-            session_id=normalized_session_id,
-            remote_config=remote_config,
-            remote_password=remote_password,
-            require_password=True,
-        )
+        apply_remote_started_monotonic = time.perf_counter()
+        apply_remote_succeeded = False
+        try:
+            self._apply_session_remote_runtime(
+                session_id=normalized_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+            apply_remote_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.setup_remote_runtime",
+                started_monotonic=apply_remote_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": apply_remote_succeeded},
+            )
+        refresh_skills_started_monotonic = time.perf_counter()
+        refresh_skills_succeeded = False
+        try:
+            await self._refresh_session_skills(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                requested_skill_ids=enabled_skill_ids,
+                remote_password=remote_password,
+            )
+            refresh_skills_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_skills",
+                started_monotonic=refresh_skills_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_skills_succeeded},
+            )
+        refresh_mcp_started_monotonic = time.perf_counter()
+        refresh_mcp_succeeded = False
+        try:
+            await self._refresh_session_mcp(
+                session=session,
+                agents=agents,
+                requested_server_ids=enabled_mcp_server_ids,
+            )
+            refresh_mcp_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_mcp",
+                started_monotonic=refresh_mcp_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_mcp_succeeded},
+            )
 
         root_agent = self._append_root_agent_for_task(
             session=session,
@@ -537,6 +702,8 @@ class Orchestrator:
                 "root_agent_id": root_agent.id,
                 "checkpoint_seq": checkpoint_seq,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -554,6 +721,11 @@ class Orchestrator:
                 "root_agent_role": root_agent.role.value,
                 "checkpoint_seq": checkpoint_seq,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": len(session.skills_state.get("warnings", []))
+                if isinstance(session.skills_state, dict)
+                else 0,
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -562,13 +734,25 @@ class Orchestrator:
         self._tool_run_shell_streams = {}
         self._run_loop_task = asyncio.current_task()
         try:
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=[],
-                root_loop=max(0, int(root_loop)),
-            )
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=[],
+                    root_loop=max(0, int(root_loop)),
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={"success": run_session_succeeded},
+                )
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -584,13 +768,16 @@ class Orchestrator:
             )
         return session
 
-    def submit_run_in_active_session(
+    async def submit_run_in_active_session(
         self,
         session_id: str,
         task: str,
         *,
         model: str | None = None,
         root_agent_name: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
+        remote_password: str | None = None,
         source: str = "webui",
     ) -> dict[str, Any]:
         selected_model = self._set_runtime_model_override(model)
@@ -609,6 +796,19 @@ class Orchestrator:
             raise RuntimeError(
                 f"Session {normalized_session_id} is not running (status={session.status.value})."
             )
+
+        await self._refresh_session_skills(
+            session=session,
+            agents=agents,
+            workspace_manager=workspace_manager,
+            requested_skill_ids=enabled_skill_ids,
+            remote_password=remote_password,
+        )
+        await self._refresh_session_mcp(
+            session=session,
+            agents=agents,
+            requested_server_ids=enabled_mcp_server_ids,
+        )
 
         root_agent = self._append_root_agent_for_task(
             session=session,
@@ -635,6 +835,8 @@ class Orchestrator:
                 "project_dir": str(self.project_dir),
                 "root_agent_id": root_agent.id,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
             },
         )
         logger.log(
@@ -653,6 +855,8 @@ class Orchestrator:
                 "source": str(source or "manual"),
                 "running_session_append": True,
                 "workspace_mode": session.workspace_mode.value,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
             },
             workspace_id=root_agent.workspace_id,
         )
@@ -663,6 +867,8 @@ class Orchestrator:
             "model": selected_model,
             "source": str(source or "manual"),
             "workspace_mode": session.workspace_mode.value,
+            "enabled_skill_ids": list(session.enabled_skill_ids),
+            "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
         }
 
     def _append_root_agent_for_task(
@@ -696,6 +902,7 @@ class Orchestrator:
             metadata={
                 "created_at": now,
                 "model": self.config.llm.openrouter.model_for_role(AgentRole.ROOT.value),
+                "skills_catalog": json_ready(self._session_skills_catalog(session)),
             },
         )
         root_agent.conversation = [
@@ -914,14 +1121,954 @@ class Orchestrator:
             password=password,
         )
 
+    @staticmethod
+    def _skill_bundle_exclude_prefixes(session: RunSession) -> tuple[str, ...]:
+        bundle_root = str(session.skill_bundle_root or "").strip()
+        if not bundle_root:
+            return ()
+        return (bundle_root,)
+
+    def _session_skills_catalog(self, session: RunSession) -> dict[str, Any]:
+        return skills_catalog_for_agent(
+            session_id=session.id,
+            locale=self.locale,
+            skills_state=session.skills_state,
+        )
+
+    def _apply_skill_catalog_to_agents(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+    ) -> None:
+        catalog = self._session_skills_catalog(session)
+        for agent in agents.values():
+            if not isinstance(agent.metadata, dict):
+                agent.metadata = {}
+            agent.metadata["skills_catalog"] = json_ready(catalog)
+            self.storage.upsert_agent(agent)
+
+    def _skill_warning(
+        self,
+        *,
+        warning_type: str,
+        skill_id: str,
+        message: str,
+        message_cn: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "type": warning_type,
+            "skill_id": skill_id,
+            "message": message,
+            "message_cn": message_cn,
+        }
+        payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _rewrite_skills_state_for_cloned_session(
+        skills_state: Any,
+        *,
+        session_id: str,
+    ) -> dict[str, Any]:
+        bundle_root = skill_bundle_root_relative(session_id)
+        manifest_path = skill_manifest_relative(session_id)
+        if not isinstance(skills_state, dict):
+            return {
+                "bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "entries": [],
+                "warnings": [],
+            }
+        rewritten = dict(skills_state)
+        rewritten["bundle_root"] = bundle_root
+        rewritten["manifest_path"] = manifest_path
+        entries: list[dict[str, Any]] = []
+        for raw_entry in skills_state.get("entries", []):
+            if not isinstance(raw_entry, dict):
+                continue
+            entry = dict(raw_entry)
+            skill_id = str(entry.get("id", "")).strip()
+            if skill_id:
+                bundle_path = str(Path(bundle_root) / skill_id)
+                entry["bundle_path"] = bundle_path
+                main_doc_path = str(entry.get("main_doc_path", SKILL_MAIN_DOC_FILENAME) or SKILL_MAIN_DOC_FILENAME)
+                localized_doc_path = str(
+                    entry.get("localized_doc_path", main_doc_path) or main_doc_path
+                )
+                entry["main_doc_project_path"] = str(Path(bundle_path) / main_doc_path)
+                entry["localized_doc_project_path"] = str(Path(bundle_path) / localized_doc_path)
+            entries.append(entry)
+        rewritten["entries"] = entries
+        rewritten["warnings"] = (
+            list(skills_state.get("warnings", []))
+            if isinstance(skills_state.get("warnings"), list)
+            else []
+        )
+        return rewritten
+
+    def _skill_entry_record(
+        self,
+        *,
+        descriptor: SkillDescriptor,
+        session: RunSession,
+        files: list[SkillFileRecord],
+    ) -> dict[str, Any]:
+        bundle_root = str(session.skill_bundle_root or skill_bundle_root_relative(session.id))
+        bundle_path = str(Path(bundle_root) / descriptor.id)
+        main_doc_project_path = str(Path(bundle_path) / descriptor.main_doc_path)
+        localized_doc_project_path = str(Path(bundle_path) / descriptor.localized_doc_path)
+        resource_count = sum(
+            1
+            for item in files
+            if item.relative_path
+            not in {
+                SKILL_METADATA_FILENAME,
+                SKILL_MAIN_DOC_FILENAME,
+                SKILL_MAIN_DOC_CN_FILENAME,
+            }
+        )
+        return {
+            "id": descriptor.id,
+            "name": descriptor.name,
+            "name_cn": descriptor.name_cn,
+            "description": descriptor.description,
+            "description_cn": descriptor.description_cn,
+            "tags": list(descriptor.tags),
+            "source_type": descriptor.source_type,
+            "source_root": descriptor.source_root,
+            "source_path": descriptor.source_path,
+            "bundle_path": bundle_path,
+            "main_doc_path": descriptor.main_doc_path,
+            "localized_doc_path": descriptor.localized_doc_path,
+            "main_doc_project_path": main_doc_project_path,
+            "localized_doc_project_path": localized_doc_project_path,
+            "resource_count": resource_count,
+            "files": [entry.to_record() for entry in files],
+        }
+
+    def _current_skill_descriptors(
+        self,
+        *,
+        project_dir: Path | None,
+    ) -> dict[str, SkillDescriptor]:
+        return discover_local_skills(
+            app_dir=self.app_dir,
+            project_dir=project_dir,
+        )
+
+    async def discover_skills(
+        self,
+        *,
+        project_dir: Path | None = None,
+        remote_config: RemoteSessionConfig | dict[str, Any] | None = None,
+        remote_password: str | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_remote_config = (
+            normalize_remote_session_config(remote_config)
+            if remote_config is not None
+            else None
+        )
+        descriptors = self._current_skill_descriptors(
+            project_dir=None if normalized_remote_config is not None else project_dir,
+        )
+        if normalized_remote_config is not None:
+            descriptors.update(
+                await self._discover_remote_project_skills(
+                    remote_config=normalized_remote_config,
+                    remote_password=remote_password,
+                )
+            )
+        return [
+            {
+                "id": descriptor.id,
+                "name": descriptor.name,
+                "name_cn": descriptor.name_cn,
+                "description": descriptor.description,
+                "description_cn": descriptor.description_cn,
+                "tags": list(descriptor.tags),
+                "source_type": descriptor.source_type,
+                "source_root": descriptor.source_root,
+                "source_path": descriptor.source_path,
+                "main_doc_path": descriptor.main_doc_path,
+                "localized_doc_path": descriptor.localized_doc_path,
+                "resource_count": len(descriptor.files),
+            }
+            for descriptor in sorted(descriptors.values(), key=lambda item: item.id)
+        ]
+
+    async def _discover_remote_project_skills(
+        self,
+        *,
+        remote_config: RemoteSessionConfig,
+        remote_password: str | None = None,
+    ) -> dict[str, SkillDescriptor]:
+        ephemeral_session_id = f"remote-skills-{uuid.uuid4().hex[:12]}"
+        self._apply_session_remote_runtime(
+            session_id=ephemeral_session_id,
+            remote_config=remote_config,
+            remote_password=remote_password,
+            require_password=True,
+        )
+        try:
+            skills_root = str(Path(remote_config.remote_dir).expanduser() / "skills")
+            result = await self._run_remote_shell_command(
+                session_id=ephemeral_session_id,
+                command=(
+                    "set -euo pipefail; "
+                    f"skills_root={shlex.quote(skills_root)}; "
+                    'if [ ! -d "$skills_root" ]; then exit 0; fi; '
+                    'find "$skills_root" -mindepth 1 -maxdepth 1 -type d -print'
+                ),
+            )
+            if result.exit_code != 0:
+                raise ValueError(result.stderr.strip() or "Failed to discover remote project skills.")
+            discovered: dict[str, SkillDescriptor] = {}
+            for raw_line in str(result.stdout or "").splitlines():
+                candidate_path = str(raw_line or "").strip()
+                if not candidate_path:
+                    continue
+                directory_id = Path(candidate_path).name
+                try:
+                    skill_id = normalize_skill_id(directory_id)
+                except ValueError:
+                    continue
+                metadata_payload = await self._remote_read_text_file(
+                    session_id=ephemeral_session_id,
+                    remote_path=str(Path(candidate_path) / SKILL_METADATA_FILENAME),
+                )
+                if metadata_payload is None:
+                    continue
+                if await self._remote_path_missing(
+                    session_id=ephemeral_session_id,
+                    remote_path=str(Path(candidate_path) / SKILL_MAIN_DOC_FILENAME),
+                ):
+                    continue
+                try:
+                    metadata = tomllib.loads(metadata_payload)
+                    skill_metadata = (
+                        metadata.get("skill")
+                        if isinstance(metadata.get("skill"), dict)
+                        else metadata
+                    )
+                    if not isinstance(skill_metadata, dict):
+                        continue
+                    metadata_id = str(skill_metadata.get("id", skill_id) or skill_id).strip()
+                    if normalize_skill_id(metadata_id) != skill_id:
+                        continue
+                    localized_doc_path = (
+                        SKILL_MAIN_DOC_CN_FILENAME
+                        if not await self._remote_path_missing(
+                            session_id=ephemeral_session_id,
+                            remote_path=str(Path(candidate_path) / SKILL_MAIN_DOC_CN_FILENAME),
+                        )
+                        else SKILL_MAIN_DOC_FILENAME
+                    )
+                    discovered[skill_id] = SkillDescriptor(
+                        id=skill_id,
+                        name=str(skill_metadata.get("name", skill_id) or skill_id).strip() or skill_id,
+                        name_cn=str(
+                            skill_metadata.get("name_cn", skill_metadata.get("name", skill_id))
+                            or skill_id
+                        ).strip()
+                        or skill_id,
+                        description=str(skill_metadata.get("description", "") or "").strip(),
+                        description_cn=str(
+                            skill_metadata.get(
+                                "description_cn",
+                                skill_metadata.get("description", ""),
+                            )
+                            or ""
+                        ).strip(),
+                        tags=tuple(
+                            str(item).strip()
+                            for item in skill_metadata.get("tags", [])
+                            if str(item).strip()
+                        ),
+                        source_type="project",
+                        source_root=skills_root,
+                        source_path=candidate_path,
+                        main_doc_path=SKILL_MAIN_DOC_FILENAME,
+                        localized_doc_path=localized_doc_path,
+                        files=(),
+                    )
+                except (tomllib.TOMLDecodeError, ValueError):
+                    continue
+            return discovered
+        finally:
+            self.tool_executor.cleanup_session_remote_runtime(ephemeral_session_id)
+            with suppress(Exception):
+                self._persist_session_remote_config(ephemeral_session_id, None)
+            with suppress(Exception):
+                shutil.rmtree(self.paths.session_dir(ephemeral_session_id, create=False))
+
+    async def _run_remote_shell_command(
+        self,
+        *,
+        session_id: str,
+        command: str,
+    ) -> ShellCommandRequest | Any:
+        normalized_session_id = self._normalize_session_id(session_id)
+        remote_context = self.tool_executor.session_remote_context(normalized_session_id)
+        if remote_context is None:
+            raise RuntimeError(f"Remote runtime context is missing for session {normalized_session_id}.")
+        remote_root = Path(remote_context.config.remote_dir).expanduser()
+        request = self.tool_executor.build_shell_request(
+            workspace_root=remote_root,
+            command=command,
+            cwd=".",
+            writable_paths=[remote_root],
+            session_id=normalized_session_id,
+            remote=remote_context,
+        )
+        return await self.tool_executor.shell_backend().run_command(request)
+
+    async def _remote_read_text_file(
+        self,
+        *,
+        session_id: str,
+        remote_path: str,
+    ) -> str | None:
+        command = (
+            "set -euo pipefail; "
+            f"target={shlex.quote(remote_path)}; "
+            'if [ ! -f "$target" ]; then exit 0; fi; '
+            '(base64 < "$target" || openssl base64 -A < "$target") | tr -d "\\n"'
+        )
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=command,
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to read remote file {remote_path}.")
+        encoded = str(result.stdout or "").strip()
+        if not encoded:
+            return None
+        return base64.b64decode(encoded.encode("ascii")).decode("utf-8")
+
+    async def _remote_path_missing(
+        self,
+        *,
+        session_id: str,
+        remote_path: str,
+    ) -> bool:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(remote_path)}; "
+                'if [ -e "$target" ]; then printf "0"; else printf "1"; fi'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to stat remote path {remote_path}.")
+        return str(result.stdout or "").strip() != "0"
+
+    async def _refresh_session_skills(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+        workspace_manager: WorkspaceManager,
+        requested_skill_ids: list[str] | None,
+        remote_password: str | None = None,
+    ) -> None:
+        normalized_requested = (
+            normalize_skill_ids(requested_skill_ids)
+            if requested_skill_ids is not None
+            else normalize_skill_ids(session.enabled_skill_ids)
+        )
+        bundle_root = skill_bundle_root_relative(session.id)
+        manifest_path = skill_manifest_relative(session.id)
+        session.skill_bundle_root = bundle_root
+        previous_entries = {}
+        if isinstance(session.skills_state, dict):
+            for raw_entry in session.skills_state.get("entries", []):
+                if not isinstance(raw_entry, dict):
+                    continue
+                skill_id = str(raw_entry.get("id", "")).strip()
+                if skill_id:
+                    previous_entries[skill_id] = raw_entry
+        if not normalized_requested and not previous_entries:
+            session.enabled_skill_ids = []
+            session.skills_state = {
+                "bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "entries": [],
+                "warnings": [],
+                "updated_at": utc_now(),
+            }
+            self.storage.upsert_session(session)
+            self._apply_skill_catalog_to_agents(session=session, agents=agents)
+            return
+
+        remote_config = self._session_remote_config(session.id, load_if_missing=True)
+        descriptors = self._current_skill_descriptors(
+            project_dir=None if remote_config is not None else session.project_dir,
+        )
+        if remote_config is not None:
+            descriptors.update(
+                await self._discover_remote_project_skills(
+                    remote_config=remote_config,
+                    remote_password=remote_password,
+                )
+            )
+
+        warnings: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
+
+        if remote_config is None:
+            targets = self._local_skill_materialization_targets(
+                session=session,
+                workspace_manager=workspace_manager,
+            )
+            self._clear_local_skill_bundle_targets(
+                targets=targets,
+                bundle_root=bundle_root,
+                clear_all_bundles=not self._is_direct_workspace_mode(session),
+            )
+        else:
+            await self._prepare_remote_skill_bundle_root(
+                session_id=session.id,
+                bundle_root=bundle_root,
+            )
+
+        for skill_id in normalized_requested:
+            descriptor = descriptors.get(skill_id)
+            if descriptor is None:
+                warnings.append(
+                    self._skill_warning(
+                        warning_type="missing_source",
+                        skill_id=skill_id,
+                        message=(
+                            f"Skill '{skill_id}' was skipped because it is missing from both project and global sources."
+                        ),
+                        message_cn=(
+                            f"skill '{skill_id}' 已被跳过，因为项目源和全局源中都找不到它。"
+                        ),
+                    )
+                )
+                continue
+            if remote_config is None:
+                for target in targets:
+                    self._materialize_local_skill_to_target(
+                        descriptor=descriptor,
+                        target_root=target,
+                        bundle_root=bundle_root,
+                    )
+                files = list(descriptor.files)
+            else:
+                files = await self._materialize_remote_skill(
+                    session_id=session.id,
+                    descriptor=descriptor,
+                    bundle_root=bundle_root,
+                )
+            entry = self._skill_entry_record(
+                descriptor=descriptor,
+                session=session,
+                files=files,
+            )
+            if describe_skill_drift(previous_entries.get(skill_id), entry):
+                warnings.append(
+                    self._skill_warning(
+                        warning_type="content_drift",
+                        skill_id=skill_id,
+                        message=(
+                            f"Skill '{skill_id}' changed since the last materialization and was rebuilt from the latest source."
+                        ),
+                        message_cn=(
+                            f"skill '{skill_id}' 与上次物化时相比已发生变化，系统已按最新来源重新构建。"
+                        ),
+                    )
+                )
+            entries.append(entry)
+
+        manifest_payload = build_manifest_payload(
+            session_id=session.id,
+            bundle_root=bundle_root,
+            entries=entries,
+            warnings=warnings,
+        )
+        if remote_config is None:
+            self._write_local_skill_manifests(
+                targets=targets,
+                bundle_root=bundle_root,
+                payload=manifest_payload,
+            )
+        else:
+            await self._write_remote_skill_manifest(
+                session_id=session.id,
+                bundle_root=bundle_root,
+                payload=manifest_payload,
+            )
+
+        session.enabled_skill_ids = [str(entry.get("id", "")).strip() for entry in entries if str(entry.get("id", "")).strip()]
+        session.skill_bundle_root = bundle_root
+        session.skills_state = {
+            "bundle_root": bundle_root,
+            "manifest_path": manifest_path,
+            "entries": entries,
+            "warnings": warnings,
+            "updated_at": utc_now(),
+        }
+        self.storage.upsert_session(session)
+        self._apply_skill_catalog_to_agents(session=session, agents=agents)
+        self._log_diagnostic(
+            "session_skills_materialized",
+            session_id=session.id,
+            agent_id=session.root_agent_id or None,
+            payload={
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "bundle_root": bundle_root,
+                "warning_count": len(warnings),
+            },
+        )
+        self._get_logger(session.id).log(
+            session_id=session.id,
+            agent_id=session.root_agent_id or "",
+            parent_agent_id=None,
+            event_type="session_skills_materialized",
+            phase="runtime",
+            payload={
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": bundle_root,
+                "manifest_path": manifest_path,
+                "warning_count": len(warnings),
+                "warnings": warnings,
+            },
+            workspace_id=next(
+                (
+                    agent.workspace_id
+                    for agent in agents.values()
+                    if agent.id == session.root_agent_id
+                ),
+                None,
+            ),
+        )
+
+    async def _refresh_session_mcp(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+        requested_server_ids: list[str] | None,
+    ) -> None:
+        enabled_server_ids = self.mcp_manager.normalize_enabled_server_ids(
+            requested_server_ids
+            if requested_server_ids is not None
+            else session.enabled_mcp_server_ids
+        )
+        session.enabled_mcp_server_ids = list(enabled_server_ids)
+        session.mcp_state = self.mcp_manager.session_state(
+            enabled_server_ids=enabled_server_ids,
+        )
+        self.storage.upsert_session(session)
+        self._apply_mcp_state_to_agents(session=session, agents=agents)
+        self._emit_session_mcp_refreshed(
+            session=session,
+            agent_id=session.root_agent_id or None,
+            workspace_id=next(
+                (
+                    agent.workspace_id
+                    for agent in agents.values()
+                    if agent.id == session.root_agent_id
+                ),
+                None,
+            ),
+        )
+
+    def _apply_mcp_state_to_agents(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+    ) -> None:
+        base_state = dict(session.mcp_state) if isinstance(session.mcp_state, dict) else {}
+        base_state.setdefault("enabled", bool(session.enabled_mcp_server_ids))
+        base_state.setdefault("dynamic_tools", [])
+        base_state.setdefault("updated_at", utc_now())
+        for agent in agents.values():
+            if not isinstance(agent.metadata, dict):
+                agent.metadata = {}
+            current_state = agent.metadata.get("mcp")
+            if isinstance(current_state, dict):
+                preserved_dynamic_tools = list(
+                    current_state.get("dynamic_tools", [])
+                    if isinstance(current_state.get("dynamic_tools"), list)
+                    else []
+                )
+            else:
+                preserved_dynamic_tools = []
+            agent.metadata["mcp"] = {
+                **base_state,
+                "dynamic_tools": preserved_dynamic_tools,
+            }
+            self.storage.upsert_agent(agent)
+
+    @staticmethod
+    def _normalized_session_mcp_state(state: dict[str, Any] | None) -> dict[str, Any]:
+        normalized = state if isinstance(state, dict) else {}
+        enabled_server_ids = (
+            [
+                str(item).strip()
+                for item in normalized.get("enabled_server_ids", [])
+                if str(item).strip()
+            ]
+            if isinstance(normalized.get("enabled_server_ids"), list)
+            else []
+        )
+        entries = (
+            [dict(item) for item in normalized.get("entries", []) if isinstance(item, dict)]
+            if isinstance(normalized.get("entries"), list)
+            else []
+        )
+        warnings = (
+            [dict(item) for item in normalized.get("warnings", []) if isinstance(item, dict)]
+            if isinstance(normalized.get("warnings"), list)
+            else []
+        )
+        return {
+            "enabled": bool(normalized.get("enabled", bool(enabled_server_ids))),
+            "enabled_server_ids": enabled_server_ids,
+            "entries": entries,
+            "warnings": warnings,
+        }
+
+    def _session_mcp_state_changed(
+        self,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+    ) -> bool:
+        return self._normalized_session_mcp_state(before) != self._normalized_session_mcp_state(after)
+
+    def _emit_session_mcp_refreshed(
+        self,
+        *,
+        session: RunSession,
+        agent_id: str | None,
+        workspace_id: str | None,
+    ) -> None:
+        self._log_diagnostic(
+            "session_mcp_refreshed",
+            session_id=session.id,
+            agent_id=agent_id,
+            payload={
+                "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
+                "warning_count": len(session.mcp_state.get("warnings", []))
+                if isinstance(session.mcp_state, dict)
+                else 0,
+            },
+        )
+        self._get_logger(session.id).log(
+            session_id=session.id,
+            agent_id=agent_id or "",
+            parent_agent_id=None,
+            event_type="session_mcp_refreshed",
+            phase="runtime",
+            payload={
+                "enabled_mcp_server_ids": list(session.enabled_mcp_server_ids),
+                "mcp_state": dict(session.mcp_state)
+                if isinstance(session.mcp_state, dict)
+                else {},
+            },
+            workspace_id=workspace_id,
+        )
+
+    def _local_skill_materialization_targets(
+        self,
+        *,
+        session: RunSession,
+        workspace_manager: WorkspaceManager,
+    ) -> list[Path]:
+        if self._is_direct_workspace_mode(session):
+            root_workspace = workspace_manager.root_workspace()
+            if root_workspace is not None:
+                return [root_workspace.path.resolve()]
+            return [session.project_dir.resolve()]
+        targets: list[Path] = []
+        seen: set[str] = set()
+        for workspace in workspace_manager.all_workspaces().values():
+            normalized_path = str(workspace.path.resolve())
+            if normalized_path in seen:
+                continue
+            seen.add(normalized_path)
+            targets.append(workspace.path.resolve())
+        return targets
+
+    def _clear_local_skill_bundle_targets(
+        self,
+        *,
+        targets: list[Path],
+        bundle_root: str,
+        clear_all_bundles: bool = False,
+    ) -> None:
+        for target_root in targets:
+            skills_root = target_root / SKILL_BUNDLE_DIRNAME
+            if clear_all_bundles and skills_root.exists():
+                shutil.rmtree(skills_root)
+            bundle_path = target_root / bundle_root
+            if bundle_path.exists():
+                shutil.rmtree(bundle_path)
+            ensure_directory(bundle_path)
+
+    def _materialize_local_skill_to_target(
+        self,
+        *,
+        descriptor: SkillDescriptor,
+        target_root: Path,
+        bundle_root: str,
+    ) -> None:
+        target_dir = target_root / bundle_root / descriptor.id
+        copy_local_skill_tree(Path(descriptor.source_path), target_dir)
+
+    def _write_local_skill_manifests(
+        self,
+        *,
+        targets: list[Path],
+        bundle_root: str,
+        payload: dict[str, Any],
+    ) -> None:
+        content = stable_json_dumps(payload) + "\n"
+        for target_root in targets:
+            bundle_path = ensure_directory(target_root / bundle_root)
+            (bundle_path / SKILL_MANIFEST_FILENAME).write_text(
+                content,
+                encoding="utf-8",
+            )
+
+    async def _prepare_remote_skill_bundle_root(
+        self,
+        *,
+        session_id: str,
+        bundle_root: str,
+    ) -> None:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(str(Path(self.project_dir) / bundle_root))}; "
+                'rm -rf "$target"; '
+                'mkdir -p "$target"'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or "Failed to prepare remote skill bundle root.")
+
+    async def _materialize_remote_skill(
+        self,
+        *,
+        session_id: str,
+        descriptor: SkillDescriptor,
+        bundle_root: str,
+    ) -> list[SkillFileRecord]:
+        target_dir = str(Path(self.project_dir) / bundle_root / descriptor.id)
+        if descriptor.source_type == "project":
+            result = await self._run_remote_shell_command(
+                session_id=session_id,
+                command=(
+                    "set -euo pipefail; "
+                    f"source={shlex.quote(descriptor.source_path)}; "
+                    f"target={shlex.quote(target_dir)}; "
+                    'mkdir -p "$target"; '
+                    'cp -a "$source/." "$target/"'
+                ),
+            )
+            if result.exit_code != 0:
+                raise ValueError(result.stderr.strip() or f"Failed to copy remote skill {descriptor.id}.")
+        else:
+            await self._upload_local_skill_to_remote(
+                session_id=session_id,
+                descriptor=descriptor,
+                target_dir=target_dir,
+            )
+        return await self._collect_remote_skill_files(
+            session_id=session_id,
+            target_dir=target_dir,
+        )
+
+    async def _upload_local_skill_to_remote(
+        self,
+        *,
+        session_id: str,
+        descriptor: SkillDescriptor,
+        target_dir: str,
+    ) -> None:
+        source_dir = Path(descriptor.source_path)
+        prepare = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f'target={shlex.quote(target_dir)}; '
+                'mkdir -p "$target"'
+            ),
+        )
+        if prepare.exit_code != 0:
+            raise ValueError(prepare.stderr.strip() or f"Failed to create remote target for skill {descriptor.id}.")
+        for file_record in descriptor.files:
+            source_path = source_dir / file_record.relative_path
+            encoded = base64.b64encode(source_path.read_bytes()).decode("ascii")
+            target_path = str(Path(target_dir) / file_record.relative_path)
+            command = (
+                "set -euo pipefail\n"
+                f"target={shlex.quote(target_path)}\n"
+                'mkdir -p "$(dirname "$target")"\n'
+                "cat <<'__OPENCOMPANY_SKILL_B64__' | "
+                "(base64 --decode 2>/dev/null || base64 -d 2>/dev/null) > \"$target\"\n"
+                f"{encoded}\n"
+                "__OPENCOMPANY_SKILL_B64__\n"
+                f"chmod {shlex.quote(file_record.mode)} \"$target\"\n"
+            )
+            result = await self._run_remote_shell_command(
+                session_id=session_id,
+                command=command,
+            )
+            if result.exit_code != 0:
+                raise ValueError(
+                    result.stderr.strip()
+                    or f"Failed to upload remote skill file {file_record.relative_path}."
+                )
+
+    async def _collect_remote_skill_files(
+        self,
+        *,
+        session_id: str,
+        target_dir: str,
+    ) -> list[SkillFileRecord]:
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail; "
+                f"target={shlex.quote(target_dir)}; "
+                'if [ ! -d "$target" ]; then exit 0; fi; '
+                'cd "$target"; '
+                "find . -type f -print0 | while IFS= read -r -d '' path; do "
+                'rel=${path#./}; '
+                "if command -v sha256sum >/dev/null 2>&1; then "
+                'sha=$(sha256sum "$rel" | awk \'{print $1}\'); '
+                "else "
+                'sha=$(shasum -a 256 "$rel" | awk \'{print $1}\'); '
+                "fi; "
+                'size=$(wc -c < "$rel" | tr -d \' \'); '
+                'mode=$(stat -c \'%a\' "$rel" 2>/dev/null || stat -f \'%Lp\' "$rel"); '
+                'is_exec=0; if [ -x "$rel" ]; then is_exec=1; fi; '
+                'is_binary=0; if [ "$size" -gt 0 ] && ! LC_ALL=C grep -Iq . "$rel"; then is_binary=1; fi; '
+                'rel_b64=$(printf %s "$rel" | base64 | tr -d \'\\n\'); '
+                'printf \'%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\' "$rel_b64" "$sha" "$size" "$mode" "$is_binary" "$is_exec"; '
+                "done"
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or f"Failed to collect remote files for {target_dir}.")
+        records: list[SkillFileRecord] = []
+        for raw_line in str(result.stdout or "").splitlines():
+            columns = raw_line.split("\t")
+            if len(columns) != 6:
+                continue
+            relative_path = base64.b64decode(columns[0].encode("ascii")).decode("utf-8")
+            records.append(
+                SkillFileRecord(
+                    relative_path=relative_path,
+                    sha256=str(columns[1]).strip(),
+                    size=int(columns[2] or 0),
+                    mode=str(columns[3]).strip() or "644",
+                    is_binary=str(columns[4]).strip() == "1",
+                    is_executable=str(columns[5]).strip() == "1",
+                )
+            )
+        records.sort(key=lambda item: item.relative_path)
+        return records
+
+    async def _write_remote_skill_manifest(
+        self,
+        *,
+        session_id: str,
+        bundle_root: str,
+        payload: dict[str, Any],
+    ) -> None:
+        manifest_path = str(Path(self.project_dir) / bundle_root / SKILL_MANIFEST_FILENAME)
+        encoded = base64.b64encode((stable_json_dumps(payload) + "\n").encode("utf-8")).decode("ascii")
+        result = await self._run_remote_shell_command(
+            session_id=session_id,
+            command=(
+                "set -euo pipefail\n"
+                f"target={shlex.quote(manifest_path)}\n"
+                'mkdir -p "$(dirname "$target")"\n'
+                "cat <<'__OPENCOMPANY_SKILL_MANIFEST__' | "
+                "(base64 --decode 2>/dev/null || base64 -d 2>/dev/null) > \"$target\"\n"
+                f"{encoded}\n"
+                "__OPENCOMPANY_SKILL_MANIFEST__\n"
+                'chmod 644 "$target"\n'
+            ),
+        )
+        if result.exit_code != 0:
+            raise ValueError(result.stderr.strip() or "Failed to write remote skill manifest.")
+
     def load_session_context(self, session_id: str) -> RunSession:
         normalized_session_id = self._normalize_session_id(session_id)
+        stored_session = self.storage.load_session(normalized_session_id)
+        checkpoint = self.storage.latest_checkpoint(normalized_session_id)
+        fallback: RunSession | None = None
+        if checkpoint is not None:
+            state = checkpoint.get("state")
+            if isinstance(state, dict):
+                session_payload = state.get("session")
+                if isinstance(session_payload, dict):
+                    fallback = self._session_from_state(session_payload)
+        if stored_session is not None:
+            if fallback is None:
+                raw_status = str(
+                    stored_session.get("status", SessionStatus.INTERRUPTED.value)
+                ).strip().lower()
+                try:
+                    stored_status = SessionStatus(raw_status)
+                except ValueError:
+                    stored_status = SessionStatus.INTERRUPTED
+                fallback = RunSession(
+                    id=str(stored_session.get("id", normalized_session_id) or normalized_session_id),
+                    project_dir=Path(str(stored_session.get("project_dir", "."))),
+                    task=str(stored_session.get("task", "") or ""),
+                    locale=str(stored_session.get("locale", self.locale) or self.locale),
+                    root_agent_id=str(stored_session.get("root_agent_id", "") or ""),
+                    workspace_mode=normalize_workspace_mode(
+                        stored_session.get("workspace_mode", WorkspaceMode.STAGED.value)
+                    ),
+                    status=stored_status,
+                    status_reason=(
+                        str(stored_session.get("status_reason"))
+                        if stored_session.get("status_reason") is not None
+                        else None
+                    ),
+                    created_at=str(stored_session.get("created_at", utc_now()) or utc_now()),
+                    updated_at=str(stored_session.get("updated_at", utc_now()) or utc_now()),
+                    loop_index=int(stored_session.get("loop_index", 0) or 0),
+                    final_summary=(
+                        str(stored_session.get("final_summary"))
+                        if stored_session.get("final_summary") is not None
+                        else None
+                    ),
+                    completion_state=normalize_session_completion_state(
+                        session_status=stored_status,
+                        completion_state=stored_session.get("completion_state"),
+                    ),
+                    follow_up_needed=bool(int(stored_session.get("follow_up_needed", 0) or 0)),
+                    enabled_skill_ids=[],
+                    skill_bundle_root="",
+                    skills_state={},
+                    config_snapshot={},
+                )
+            return self._session_from_storage_row(stored_session, fallback=fallback)
+        if fallback is not None:
+            return fallback
+        raise ValueError(f"No checkpoint found for session {normalized_session_id}")
+
+    def clone_session(self, session_id: str) -> RunSession:
+        normalized_session_id = self._normalize_session_id(session_id)
+        source_session = self.load_session_context(normalized_session_id)
+        if source_session.status == SessionStatus.RUNNING:
+            raise ValueError(f"Cannot clone running session {normalized_session_id}.")
         cloned_session_id = self._clone_session_context(normalized_session_id)
-        session, _, _, _, _, _ = self._import_session_context(
-            cloned_session_id,
-            source="reconfigure",
-        )
-        return session
+        return self.load_session_context(cloned_session_id)
 
     async def resume(
         self,
@@ -931,6 +2078,8 @@ class Orchestrator:
         reactivate_agent_id: str | None = None,
         run_root_agent: bool = True,
         remote_password: str | None = None,
+        enabled_skill_ids: list[str] | None = None,
+        enabled_mcp_server_ids: list[str] | None = None,
     ) -> RunSession:
         selected_model = self._set_runtime_model_override(model)
         normalized_session_id = self._normalize_session_id(session_id)
@@ -952,12 +2101,60 @@ class Orchestrator:
             checkpoint_seq,
         ) = self._import_session_context(normalized_session_id, source="resume")
         remote_config = self._session_remote_config(normalized_session_id)
-        self._apply_session_remote_runtime(
-            session_id=normalized_session_id,
-            remote_config=remote_config,
-            remote_password=remote_password,
-            require_password=True,
-        )
+        apply_remote_started_monotonic = time.perf_counter()
+        apply_remote_succeeded = False
+        try:
+            self._apply_session_remote_runtime(
+                session_id=normalized_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+            apply_remote_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.setup_remote_runtime",
+                started_monotonic=apply_remote_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": apply_remote_succeeded},
+            )
+        refresh_skills_started_monotonic = time.perf_counter()
+        refresh_skills_succeeded = False
+        try:
+            await self._refresh_session_skills(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                requested_skill_ids=enabled_skill_ids,
+                remote_password=remote_password,
+            )
+            refresh_skills_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_skills",
+                started_monotonic=refresh_skills_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_skills_succeeded},
+            )
+        refresh_mcp_started_monotonic = time.perf_counter()
+        refresh_mcp_succeeded = False
+        try:
+            await self._refresh_session_mcp(
+                session=session,
+                agents=agents,
+                requested_server_ids=enabled_mcp_server_ids,
+            )
+            refresh_mcp_succeeded = True
+        finally:
+            self._log_debug_timing(
+                stage="session.refresh_mcp",
+                started_monotonic=refresh_mcp_started_monotonic,
+                session_id=session.id,
+                agent_id=session.root_agent_id,
+                payload={"success": refresh_mcp_succeeded},
+            )
         if normalized_run_root_agent and normalized_reactivate_agent_id:
             candidate = agents.get(normalized_reactivate_agent_id)
             if candidate is not None and candidate.role == AgentRole.ROOT:
@@ -1032,6 +2229,8 @@ class Orchestrator:
                 "model": selected_model,
                 "reactivate_agent_id": normalized_reactivate_agent_id,
                 "run_root_agent": normalized_run_root_agent,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
             },
         )
         logger.log(
@@ -1050,22 +2249,39 @@ class Orchestrator:
                 "model": selected_model,
                 "reactivate_agent_id": normalized_reactivate_agent_id,
                 "run_root_agent": normalized_run_root_agent,
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
+                "skills_warning_count": len(session.skills_state.get("warnings", []))
+                if isinstance(session.skills_state, dict)
+                else 0,
             },
             workspace_id=root_agent.workspace_id,
         )
         self._run_loop_task = asyncio.current_task()
         try:
-            await self._run_session(
-                session=session,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=pending_agent_ids,
-                root_loop=root_loop,
-                run_root_agent=normalized_run_root_agent,
-                focus_agent_id=(
-                    None if normalized_run_root_agent else normalized_reactivate_agent_id
-                ),
-            )
+            run_session_started_monotonic = time.perf_counter()
+            run_session_succeeded = False
+            try:
+                await self._run_session(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=pending_agent_ids,
+                    root_loop=root_loop,
+                    run_root_agent=normalized_run_root_agent,
+                    focus_agent_id=(
+                        None if normalized_run_root_agent else normalized_reactivate_agent_id
+                    ),
+                )
+                run_session_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="session.run_loop",
+                    started_monotonic=run_session_started_monotonic,
+                    session_id=session.id,
+                    agent_id=session.root_agent_id,
+                    payload={"success": run_session_succeeded},
+                )
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -1108,7 +2324,10 @@ class Orchestrator:
         if cloned_session_dir.exists():
             shutil.rmtree(cloned_session_dir)
         shutil.copytree(source_session_dir, cloned_session_dir)
-        self._rewrite_cloned_message_logs(cloned_session_dir, cloned_session_id)
+        self._clone_session_remote_config(
+            source_session_id=normalized_source_session_id,
+            cloned_session_id=cloned_session_id,
+        )
 
         now = utc_now()
         source_config_snapshot = (
@@ -1133,6 +2352,16 @@ class Orchestrator:
             final_summary=source_session.final_summary,
             completion_state=source_session.completion_state,
             follow_up_needed=source_session.follow_up_needed,
+            enabled_skill_ids=list(source_session.enabled_skill_ids),
+            enabled_mcp_server_ids=list(source_session.enabled_mcp_server_ids),
+            skill_bundle_root=skill_bundle_root_relative(cloned_session_id),
+            skills_state=self._rewrite_skills_state_for_cloned_session(
+                source_session.skills_state,
+                session_id=cloned_session_id,
+            ),
+            mcp_state=dict(source_session.mcp_state)
+            if isinstance(source_session.mcp_state, dict)
+            else {},
             config_snapshot=source_config_snapshot,
         )
         self.storage.upsert_session(cloned_session)
@@ -1151,6 +2380,12 @@ class Orchestrator:
             tool_run_id_map=tool_run_id_map,
             steer_run_id_map=steer_run_id_map,
         )
+        self._rewrite_cloned_event_log(
+            cloned_session_dir,
+            cloned_session_id,
+            tool_run_id_map=tool_run_id_map,
+            steer_run_id_map=steer_run_id_map,
+        )
         source_checkpoints = self.storage.load_checkpoints(normalized_source_session_id)
         if not source_checkpoints:
             raise ValueError(f"No checkpoint found for session {normalized_source_session_id}")
@@ -1158,6 +2393,7 @@ class Orchestrator:
             rewritten_state = self._rewrite_checkpoint_for_cloned_session(
                 state=checkpoint.get("state", {}),
                 source_session_id=normalized_source_session_id,
+                source_checkpoint_seq=int(source_checkpoint["seq"]),
                 cloned_session_id=cloned_session_id,
                 source_session_dir=source_session_dir,
                 cloned_session_dir=cloned_session_dir,
@@ -1167,39 +2403,41 @@ class Orchestrator:
             checkpoint_created_at = str(checkpoint.get("created_at", "")).strip() or now
             self.storage.save_checkpoint(cloned_session_id, checkpoint_created_at, rewritten_state)
 
-        for row in self.storage.load_events(normalized_source_session_id):
-            payload = row.get("payload_json", {})
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
+        with self.storage.batched_writes():
+            for row in self.storage.load_events(normalized_source_session_id):
+                payload = row.get("payload_json", {})
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                if not isinstance(payload, dict):
                     payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            payload = self._rewrite_run_ids_in_payload(
-                payload,
-                tool_run_id_map=tool_run_id_map,
-                steer_run_id_map=steer_run_id_map,
-            )
-            self.storage.append_event(
-                EventRecord(
-                    timestamp=str(row.get("timestamp", "")).strip() or now,
-                    session_id=cloned_session_id,
-                    agent_id=(
-                        str(row.get("agent_id", "")).strip() or None
-                    ),
-                    parent_agent_id=(
-                        str(row.get("parent_agent_id", "")).strip() or None
-                    ),
-                    event_type=str(row.get("event_type", "")),
-                    phase=str(row.get("phase", "runtime")),
-                    payload=payload,
-                    workspace_id=(
-                        str(row.get("workspace_id", "")).strip() or None
-                    ),
-                    checkpoint_seq=int(row.get("checkpoint_seq", 0) or 0),
+                payload = self._rewrite_run_ids_in_payload(
+                    payload,
+                    tool_run_id_map=tool_run_id_map,
+                    steer_run_id_map=steer_run_id_map,
                 )
-            )
+                self.storage.append_event(
+                    EventRecord(
+                        timestamp=str(row.get("timestamp", "")).strip() or now,
+                        session_id=cloned_session_id,
+                        agent_id=(
+                            str(row.get("agent_id", "")).strip() or None
+                        ),
+                        parent_agent_id=(
+                            str(row.get("parent_agent_id", "")).strip() or None
+                        ),
+                        event_type=str(row.get("event_type", "")),
+                        phase=str(row.get("phase", "runtime")),
+                        payload=payload,
+                        workspace_id=(
+                            str(row.get("workspace_id", "")).strip() or None
+                        ),
+                        checkpoint_seq=int(row.get("checkpoint_seq", 0) or 0),
+                    )
+                )
+        self._backfill_tool_run_timeline_projection(cloned_session_id)
 
         self._log_diagnostic(
             "session_context_cloned",
@@ -1211,6 +2449,66 @@ class Orchestrator:
             },
         )
         return cloned_session_id
+
+    def _clone_session_remote_config(
+        self,
+        *,
+        source_session_id: str,
+        cloned_session_id: str,
+    ) -> None:
+        source_remote_config = self._session_remote_config(source_session_id)
+        if source_remote_config is None:
+            return
+        cloned_remote_config = normalize_remote_session_config(asdict(source_remote_config))
+        source_password_ref = str(source_remote_config.password_ref or "").strip()
+        if cloned_remote_config.auth_mode != "password":
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        if not source_password_ref:
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        try:
+            source_password = str(load_remote_session_password(source_password_ref) or "").strip()
+        except Exception as exc:
+            self._log_diagnostic(
+                "remote_password_clone_load_failed",
+                level="warning",
+                session_id=cloned_session_id,
+                payload={
+                    "source_session_id": source_session_id,
+                    "password_ref": source_password_ref,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        if not source_password:
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        cloned_password_ref = build_remote_password_ref(cloned_session_id, cloned_remote_config)
+        try:
+            save_remote_session_password(cloned_password_ref, source_password)
+        except Exception as exc:
+            self._log_diagnostic(
+                "remote_password_clone_persist_failed",
+                level="warning",
+                session_id=cloned_session_id,
+                payload={
+                    "source_session_id": source_session_id,
+                    "password_ref": cloned_password_ref,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
+            cloned_remote_config.password_ref = ""
+            self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
+            return
+        cloned_remote_config.password_ref = cloned_password_ref
+        self._persist_session_remote_config(cloned_session_id, cloned_remote_config)
 
     def _clone_tool_runs_for_cloned_session(
         self,
@@ -1379,50 +2677,81 @@ class Orchestrator:
         tool_run_id_map: dict[str, str] | None = None,
         steer_run_id_map: dict[str, str] | None = None,
     ) -> None:
+        for path in sorted(session_dir.glob("*_messages.jsonl")):
+            self._rewrite_cloned_jsonl_records(
+                path,
+                session_id=session_id,
+                tool_run_id_map=tool_run_id_map,
+                steer_run_id_map=steer_run_id_map,
+            )
+
+    def _rewrite_cloned_event_log(
+        self,
+        session_dir: Path,
+        session_id: str,
+        *,
+        tool_run_id_map: dict[str, str] | None = None,
+        steer_run_id_map: dict[str, str] | None = None,
+    ) -> None:
+        self._rewrite_cloned_jsonl_records(
+            session_dir / self.config.logging.jsonl_filename,
+            session_id=session_id,
+            tool_run_id_map=tool_run_id_map,
+            steer_run_id_map=steer_run_id_map,
+        )
+
+    def _rewrite_cloned_jsonl_records(
+        self,
+        path: Path,
+        *,
+        session_id: str,
+        tool_run_id_map: dict[str, str] | None = None,
+        steer_run_id_map: dict[str, str] | None = None,
+    ) -> None:
+        if not path.exists() or not path.is_file():
+            return
         normalized_tool_map = tool_run_id_map or {}
         normalized_steer_map = steer_run_id_map or {}
-        for path in sorted(session_dir.glob("*_messages.jsonl")):
-            rewritten_lines: list[str] = []
-            changed = False
-            with path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    raw_line = line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        record = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        rewritten_lines.append(raw_line)
-                        continue
-                    if not isinstance(record, dict):
-                        rewritten_lines.append(raw_line)
-                        continue
-                    if str(record.get("session_id", "")).strip() != session_id:
-                        record["session_id"] = session_id
-                        changed = True
-                    if normalized_tool_map or normalized_steer_map:
-                        rewritten_record = self._rewrite_run_ids_in_payload(
-                            record,
-                            tool_run_id_map=normalized_tool_map,
-                            steer_run_id_map=normalized_steer_map,
-                        )
-                        if rewritten_record != record:
-                            changed = True
-                            record = rewritten_record
-                    rewritten_lines.append(
-                        json.dumps(json_ready(record), ensure_ascii=False)
+        rewritten_lines: list[str] = []
+        changed = False
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                raw_line = line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    rewritten_lines.append(raw_line)
+                    continue
+                if not isinstance(record, dict):
+                    rewritten_lines.append(raw_line)
+                    continue
+                if str(record.get("session_id", "")).strip() != session_id:
+                    record["session_id"] = session_id
+                    changed = True
+                if normalized_tool_map or normalized_steer_map:
+                    rewritten_record = self._rewrite_run_ids_in_payload(
+                        record,
+                        tool_run_id_map=normalized_tool_map,
+                        steer_run_id_map=normalized_steer_map,
                     )
-            if changed:
-                payload = "\n".join(rewritten_lines)
-                if payload:
-                    payload += "\n"
-                path.write_text(payload, encoding="utf-8")
+                    if rewritten_record != record:
+                        changed = True
+                        record = rewritten_record
+                rewritten_lines.append(json.dumps(json_ready(record), ensure_ascii=False))
+        if changed:
+            payload = "\n".join(rewritten_lines)
+            if payload:
+                payload += "\n"
+            path.write_text(payload, encoding="utf-8")
 
     def _rewrite_checkpoint_for_cloned_session(
         self,
         *,
         state: dict[str, Any],
         source_session_id: str,
+        source_checkpoint_seq: int,
         cloned_session_id: str,
         source_session_dir: Path,
         cloned_session_dir: Path,
@@ -1438,6 +2767,8 @@ class Orchestrator:
         session_payload = rewritten_state.get("session")
         rewritten_workspace_mode = WorkspaceMode.STAGED
         rewritten_project_dir = cloned_session_dir
+        rewritten_session_locale = self.locale
+        rewritten_skills_state: dict[str, Any] = {}
         if isinstance(session_payload, dict):
             session_payload["id"] = cloned_session_id
             config_snapshot = session_payload.get("config_snapshot")
@@ -1445,6 +2776,20 @@ class Orchestrator:
                 config_snapshot = {}
                 session_payload["config_snapshot"] = config_snapshot
             config_snapshot["continued_from_session_id"] = source_session_id
+            config_snapshot["continued_from_checkpoint_seq"] = source_checkpoint_seq
+            session_payload["skill_bundle_root"] = skill_bundle_root_relative(cloned_session_id)
+            session_payload["skills_state"] = self._rewrite_skills_state_for_cloned_session(
+                session_payload.get("skills_state"),
+                session_id=cloned_session_id,
+            )
+            rewritten_session_locale = str(
+                session_payload.get("locale", self.locale) or self.locale
+            )
+            rewritten_skills_state = (
+                dict(session_payload["skills_state"])
+                if isinstance(session_payload.get("skills_state"), dict)
+                else {}
+            )
             rewritten_workspace_mode = normalize_workspace_mode(
                 session_payload.get("workspace_mode")
             )
@@ -1454,10 +2799,22 @@ class Orchestrator:
 
         agents_payload = rewritten_state.get("agents")
         if isinstance(agents_payload, dict):
+            rewritten_skills_catalog = json_ready(
+                skills_catalog_for_agent(
+                    session_id=cloned_session_id,
+                    locale=rewritten_session_locale,
+                    skills_state=rewritten_skills_state,
+                )
+            )
             for payload in agents_payload.values():
                 if not isinstance(payload, dict):
                     continue
                 payload["session_id"] = cloned_session_id
+                metadata = payload.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                    payload["metadata"] = metadata
+                metadata["skills_catalog"] = rewritten_skills_catalog
 
         workspaces_payload = rewritten_state.get("workspaces")
         if isinstance(workspaces_payload, dict):
@@ -1709,6 +3066,7 @@ class Orchestrator:
                 f"Root agent {session.root_agent_id} is missing in checkpoint for session {session_id}."
             )
         self._restore_agent_conversations_from_messages(session_id, agents)
+        self._apply_skill_catalog_to_agents(session=session, agents=agents)
         normalized_workspaces = self._normalize_workspace_state_for_session(
             session_id=session_id,
             workspace_mode=session.workspace_mode,
@@ -1773,6 +3131,8 @@ class Orchestrator:
                 "checkpoint_seq": checkpoint_seq,
                 "previous_checkpoint_seq": checkpoint["seq"],
                 "project_dir": str(self.project_dir),
+                "enabled_skill_ids": list(session.enabled_skill_ids),
+                "skill_bundle_root": session.skill_bundle_root,
                 "pending_agent_ids": pending_agent_ids,
                 "paused_agent_ids": paused_agent_ids,
                 "cancelled_tool_run_ids": cancelled_tool_run_ids,
@@ -1833,37 +3193,141 @@ class Orchestrator:
                 )
             used.add(candidate.casefold())
 
+    def _event_record_from_storage_row(
+        self,
+        row: dict[str, Any],
+        *,
+        default_session_id: str,
+    ) -> dict[str, Any]:
+        payload = row.get("payload_json", {})
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "timestamp": str(row.get("timestamp", "")),
+            "session_id": str(row.get("session_id", default_session_id)),
+            "agent_id": row.get("agent_id"),
+            "parent_agent_id": row.get("parent_agent_id"),
+            "event_type": str(row.get("event_type", "")),
+            "phase": str(row.get("phase", "runtime")),
+            "payload": payload,
+            "workspace_id": row.get("workspace_id"),
+            "checkpoint_seq": int(row.get("checkpoint_seq", 0) or 0),
+            "id": int(row.get("id", 0) or 0),
+        }
+
     def load_session_events(self, session_id: str) -> list[dict[str, Any]]:
         normalized_session_id = self._normalize_session_id(session_id)
-        records: list[dict[str, Any]] = []
-        for row in self.storage.load_events(normalized_session_id):
-            payload = row.get("payload_json", {})
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            records.append(
-                {
-                    "timestamp": str(row.get("timestamp", "")),
-                    "session_id": str(row.get("session_id", normalized_session_id)),
-                    "agent_id": row.get("agent_id"),
-                    "parent_agent_id": row.get("parent_agent_id"),
-                    "event_type": str(row.get("event_type", "")),
-                    "phase": str(row.get("phase", "runtime")),
-                    "payload": payload,
-                    "workspace_id": row.get("workspace_id"),
-                    "checkpoint_seq": int(row.get("checkpoint_seq", 0) or 0),
-                }
+        return [
+            self._event_record_from_storage_row(
+                row,
+                default_session_id=normalized_session_id,
             )
-        return records
+            for row in self.storage.load_events(normalized_session_id)
+        ]
+
+    def list_session_events_page(
+        self,
+        session_id: str,
+        *,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+    ) -> dict[str, Any]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        try:
+            bounded_limit = max(1, min(5000, int(limit if limit is not None else 200)))
+        except (TypeError, ValueError):
+            bounded_limit = 200
+        before_id: int | None = None
+        if before is not None:
+            before_text = str(before).strip()
+            if before_text:
+                try:
+                    before_id = int(before_text)
+                except ValueError as exc:
+                    raise ValueError("Invalid events before cursor.") from exc
+        rows = self.storage.list_events_page(
+            session_id=normalized_session_id,
+            before_id=before_id,
+            limit=bounded_limit + 1,
+            exclude_event_types=(
+                list(SESSION_HISTORY_STREAM_EVENT_TYPES) if activity_only else None
+            ),
+        )
+        has_more_before = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        page_rows.reverse()
+        events = [
+            self._event_record_from_storage_row(
+                row,
+                default_session_id=normalized_session_id,
+            )
+            for row in page_rows
+        ]
+        before_cursor = str(events[0]["id"]) if has_more_before and events else None
+        return {
+            "events": events,
+            "before_cursor": before_cursor,
+            "has_more_before": has_more_before,
+        }
+
+    def _storage_row_from_agent(self, agent: AgentNode) -> dict[str, Any]:
+        return {
+            "id": agent.id,
+            "session_id": agent.session_id,
+            "name": agent.name,
+            "role": agent.role.value,
+            "instruction": agent.instruction,
+            "workspace_id": agent.workspace_id,
+            "parent_agent_id": agent.parent_agent_id,
+            "status": agent.status.value,
+            "status_reason": agent.status_reason,
+            "children_json": json.dumps(list(agent.children), ensure_ascii=False),
+            "summary": agent.summary,
+            "next_recommendation": agent.next_recommendation,
+            "diff_artifact": agent.diff_artifact,
+            "completion_status": agent.completion_status,
+            "step_count": agent.step_count,
+            "metadata_json": json.dumps(json_ready(agent.metadata), ensure_ascii=False),
+        }
+
+    def _session_agent_rows(self, session_id: str) -> list[dict[str, Any]]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        stored_rows = self.storage.load_agents(normalized_session_id)
+        if stored_rows:
+            return stored_rows
+        checkpoint = self.storage.latest_checkpoint(normalized_session_id)
+        if checkpoint is None:
+            return []
+        state = checkpoint.get("state", {})
+        if not isinstance(state, dict):
+            return []
+        agent_payloads = state.get("agents", {})
+        if not isinstance(agent_payloads, dict):
+            return []
+        fallback_rows: list[dict[str, Any]] = []
+        for payload in sorted(
+            agent_payloads.values(),
+            key=lambda item: str(item.get("id", "")) if isinstance(item, dict) else "",
+        ):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                agent = self._agent_from_state(payload)
+            except (KeyError, TypeError, ValueError):
+                continue
+            fallback_rows.append(self._storage_row_from_agent(agent))
+        return fallback_rows
 
     def load_session_agents(self, session_id: str) -> list[dict[str, Any]]:
         normalized_session_id = self._normalize_session_id(session_id)
         agents: list[dict[str, Any]] = []
-        for row in self.storage.load_agents(normalized_session_id):
+        for row in self._session_agent_rows(normalized_session_id):
             children: list[str] = []
             raw_children = row.get("children_json")
             if isinstance(raw_children, str):
@@ -2051,14 +3515,25 @@ class Orchestrator:
         cursor: str | None = None,
         limit: int = 500,
         tail: int | None = None,
+        before: str | None = None,
     ) -> dict[str, Any]:
         normalized_session_id = self._normalize_session_id(session_id)
-        self._sync_session_messages_from_checkpoint(normalized_session_id)
-        page = self._get_message_logger(normalized_session_id).list_records(
+        logger = self._get_message_logger(normalized_session_id)
+        normalized_agent_id = str(agent_id or "").strip() or None
+        if normalized_agent_id is not None:
+            if not logger.has_records_file(normalized_agent_id):
+                self._sync_session_messages_from_checkpoint(
+                    normalized_session_id,
+                    agent_ids={normalized_agent_id},
+                )
+        elif not logger.agent_ids():
+            self._sync_session_messages_from_checkpoint(normalized_session_id)
+        page = logger.list_records(
             agent_id=agent_id,
             cursor=cursor,
             limit=limit,
             tail=tail,
+            before=before,
         )
         raw_messages = page.get("messages", [])
         if not isinstance(raw_messages, list) or not raw_messages:
@@ -2068,6 +3543,137 @@ class Orchestrator:
             raw_messages,
         )
         return page
+
+    def get_tool_run_detail(
+        self,
+        session_id: str,
+        tool_run_id: str,
+        *,
+        timeline_limit: int = 300,
+    ) -> dict[str, Any]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        normalized_tool_run_id = str(tool_run_id or "").strip()
+        if not normalized_tool_run_id:
+            raise ValueError("tool_run_id is required")
+        record = self.storage.load_tool_run(normalized_tool_run_id)
+        if not isinstance(record, dict):
+            raise ValueError(f"Tool run {normalized_tool_run_id} was not found.")
+        if str(record.get("session_id", "")).strip() != normalized_session_id:
+            raise ValueError(f"Tool run {normalized_tool_run_id} is outside the current session.")
+        detail = dict(record)
+        if str(detail.get("tool_name", "")).strip() == "shell":
+            stdout, stderr = self._shell_outputs_for_tool_run(detail)
+            detail["stdout"] = stdout
+            detail["stderr"] = stderr
+        if not self.storage.has_tool_run_timeline_backfill(normalized_session_id):
+            self._backfill_tool_run_timeline_projection(normalized_session_id)
+        timeline = self.storage.load_tool_run_timeline(
+            session_id=normalized_session_id,
+            tool_run_id=normalized_tool_run_id,
+            limit=timeline_limit,
+        )
+        detail["timeline"] = self._dedupe_tool_run_timeline_entries(timeline)
+        return detail
+
+    def _backfill_tool_run_timeline_projection(
+        self,
+        session_id: str,
+    ) -> None:
+        rows = self.storage.load_events(
+            session_id,
+            event_types=list(TOOL_RUN_TIMELINE_EVENT_TYPES),
+        )
+        call_id_to_run_id = self._collect_tool_run_timeline_call_map(session_id, rows)
+        with self.storage.batched_writes():
+            for row in rows:
+                source_event_id = int(row.get("id", 0) or 0)
+                if source_event_id <= 0:
+                    continue
+                record = self._event_record_from_storage_row(
+                    row,
+                    default_session_id=session_id,
+                )
+                resolved_tool_run_id = self._resolve_tool_run_timeline_run_id(
+                    record,
+                    call_id_to_run_id=call_id_to_run_id,
+                )
+                if not resolved_tool_run_id:
+                    continue
+                raw_payload = record.get("payload", {})
+                payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+                payload.setdefault("tool_run_id", resolved_tool_run_id)
+                self.storage.append_tool_run_timeline_event(
+                    source_event_id=source_event_id,
+                    session_id=session_id,
+                    tool_run_id=resolved_tool_run_id,
+                    timestamp=str(record.get("timestamp", "")),
+                    event_type=str(record.get("event_type", "")),
+                    phase=str(record.get("phase", "")),
+                    agent_id=str(record.get("agent_id", "") or "") or None,
+                    payload=payload if isinstance(payload, dict) else {},
+                )
+        self.storage.mark_tool_run_timeline_backfilled(session_id, utc_now())
+
+    def _collect_tool_run_timeline_call_map(
+        self,
+        session_id: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        call_id_to_run_id: dict[str, str] = {}
+        for row in rows:
+            record = self._event_record_from_storage_row(
+                row,
+                default_session_id=session_id,
+            )
+            payload = record.get("payload", {})
+            payload = payload if isinstance(payload, dict) else {}
+            action = payload.get("action")
+            action = action if isinstance(action, dict) else {}
+            call_id = str(action.get("_tool_call_id", "")).strip()
+            tool_run_id = str(payload.get("tool_run_id", "")).strip() or str(
+                action.get("tool_run_id", "")
+            ).strip()
+            if call_id and tool_run_id:
+                call_id_to_run_id[call_id] = tool_run_id
+        return call_id_to_run_id
+
+    def _resolve_tool_run_timeline_run_id(
+        self,
+        record: dict[str, Any],
+        *,
+        call_id_to_run_id: dict[str, str],
+    ) -> str:
+        payload = record.get("payload", {})
+        payload = payload if isinstance(payload, dict) else {}
+        action = payload.get("action")
+        action = action if isinstance(action, dict) else {}
+        call_id = str(action.get("_tool_call_id", "")).strip()
+        event_type = str(record.get("event_type", "")).strip()
+        resolved_tool_run_id = str(payload.get("tool_run_id", "")).strip()
+        if event_type == "tool_run_submitted" and resolved_tool_run_id and call_id:
+            call_id_to_run_id[call_id] = resolved_tool_run_id
+        if not resolved_tool_run_id and call_id:
+            resolved_tool_run_id = call_id_to_run_id.get(call_id, "")
+        if not resolved_tool_run_id and event_type in {"tool_call_started", "tool_call"}:
+            resolved_tool_run_id = str(action.get("tool_run_id", "")).strip()
+        return resolved_tool_run_id
+
+    def _dedupe_tool_run_timeline_entries(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        for entry in entries:
+            last = deduped[-1] if deduped else None
+            if (
+                last
+                and last.get("timestamp") == entry["timestamp"]
+                and last.get("event_type") == entry["event_type"]
+                and last.get("phase") == entry["phase"]
+            ):
+                continue
+            deduped.append(entry)
+        return deduped
 
     def _annotate_prompt_visibility_for_records(
         self,
@@ -2112,79 +3718,27 @@ class Orchestrator:
         if not agent_ids:
             return {}
         keep_count = max(0, int(self.config.runtime.context.keep_pinned_messages))
+        stored_agent_rows = self.storage.load_agents(session_id)
+        source_rows = stored_agent_rows if stored_agent_rows else self._session_agent_rows(session_id)
         rows_by_agent = {
             str(row.get("id", "")).strip(): row
-            for row in self.storage.load_agents(session_id)
+            for row in source_rows
             if isinstance(row, dict) and str(row.get("id", "")).strip()
         }
         logger = self._get_message_logger(session_id)
         projections: dict[str, Any] = {}
         for agent_id in agent_ids:
-            full_records = logger.read(agent_id)
-            if not full_records:
+            message_count = logger.count(agent_id)
+            if message_count <= 0:
                 continue
             agent_row = rows_by_agent.get(agent_id, {})
             metadata = self._message_projection_metadata(agent_row)
-            internal_indices = {
-                _safe_int(record.get("message_index"), default=-1)
-                for record in full_records
-                if isinstance(record, dict) and bool(record.get("internal", False))
-            }
-            internal_indices = {index for index in internal_indices if index >= 0}
-            if internal_indices:
-                merged_internal = {
-                    _safe_int(value, default=-1)
-                    for value in metadata.get("internal_message_indices", [])
-                    if _safe_int(value, default=-1) >= 0
-                }
-                merged_internal.update(internal_indices)
-                metadata = dict(metadata)
-                metadata["internal_message_indices"] = sorted(merged_internal)
-            conversation = self._conversation_from_message_records(full_records)
-            if not conversation:
-                continue
-            role_text = str(agent_row.get("role", AgentRole.WORKER.value)).strip().lower()
-            try:
-                role = AgentRole(role_text)
-            except ValueError:
-                role = AgentRole.WORKER
-            agent = AgentNode(
-                id=agent_id,
-                session_id=session_id,
-                name=str(agent_row.get("name", agent_id) or agent_id),
-                role=role,
-                instruction=str(agent_row.get("instruction", "")),
-                workspace_id=str(agent_row.get("workspace_id", "workspace")),
+            projections[agent_id] = prompt_window_projection_from_metadata(
+                message_count=message_count,
                 metadata=metadata,
-                conversation=conversation,
-            )
-            projections[agent_id] = prompt_window_projection(
-                agent,
                 keep_pinned_messages=keep_count,
             )
         return projections
-
-    @staticmethod
-    def _conversation_from_message_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        conversation: list[dict[str, Any]] = []
-        for record in sorted(
-            records,
-            key=lambda item: _safe_int(item.get("message_index"), default=-1),
-        ):
-            message_index = _safe_int(record.get("message_index"), default=-1)
-            if message_index < 0:
-                continue
-            while len(conversation) <= message_index:
-                conversation.append({"role": "assistant", "content": ""})
-            message = record.get("message")
-            if isinstance(message, dict):
-                conversation[message_index] = message
-            else:
-                conversation[message_index] = {
-                    "role": str(record.get("role", "")).strip() or "assistant",
-                    "content": str(message or ""),
-                }
-        return conversation
 
     @staticmethod
     def _message_projection_metadata(agent_row: dict[str, Any]) -> dict[str, Any]:
@@ -2371,7 +3925,7 @@ class Orchestrator:
 
     def _agent_name_index_for_session(self, session_id: str) -> dict[str, str]:
         index: dict[str, str] = {}
-        for row in self.storage.load_agents(session_id):
+        for row in self._session_agent_rows(session_id):
             agent_id = str(row.get("id", "")).strip()
             if not agent_id:
                 continue
@@ -3410,6 +4964,9 @@ class Orchestrator:
                     locale=str(row.get("locale", self.locale) or self.locale),
                     root_agent_id=str(row.get("root_agent_id", "")),
                     workspace_mode=normalize_workspace_mode(row.get("workspace_mode")),
+                    enabled_skill_ids=[],
+                    skill_bundle_root="",
+                    skills_state={},
                 )
             return self._session_from_storage_row(row, fallback=fallback)
         return fallback
@@ -3460,7 +5017,10 @@ class Orchestrator:
 
         session, root_agent, workspace_manager = self._project_sync_context(normalized_session_id)
         workspace = workspace_manager.workspace(root_agent.workspace_id)
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         staged_changes = WorkspaceChangeSet(
             added=sorted({str(path) for path in state.get("added", [])}),
             modified=sorted({str(path) for path in state.get("modified", [])}),
@@ -3537,7 +5097,10 @@ class Orchestrator:
             )
 
         session, root_agent, workspace_manager = self._project_sync_context(normalized_session_id)
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         staged_changes = WorkspaceChangeSet(
             added=sorted({str(path) for path in state.get("added", [])}),
             modified=sorted({str(path) for path in state.get("modified", [])}),
@@ -3612,6 +5175,7 @@ class Orchestrator:
                 applied = workspace_manager.apply_workspace_changes(
                     root_agent.workspace_id,
                     session.project_dir,
+                    exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
                 )
         except Exception as exc:
             state["last_error"] = str(exc)
@@ -3765,11 +5329,71 @@ class Orchestrator:
             self.paths.existing_session_dir(normalized_session_id) / PROJECT_SYNC_STATE_FILENAME
         )
 
+    def _debug_timing_path(self, session_id: str) -> Path | None:
+        if not self.debug:
+            return None
+        normalized_session_id = self._normalize_session_id(session_id)
+        cached_path = self._debug_timing_paths.get(normalized_session_id)
+        if cached_path is not None:
+            return cached_path
+        debug_dir = ensure_directory(self.paths.session_dir(normalized_session_id, create=True) / "debug")
+        timing_path = debug_dir / "timings.jsonl"
+        self._debug_timing_paths[normalized_session_id] = timing_path
+        return timing_path
+
+    def _log_debug_timing(
+        self,
+        *,
+        stage: str,
+        started_monotonic: float,
+        session_id: str | None = None,
+        agent: AgentNode | None = None,
+        agent_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.debug:
+            return
+        resolved_session_id = str(
+            session_id or (agent.session_id if agent is not None else "") or self.latest_session_id or ""
+        ).strip()
+        if not resolved_session_id:
+            return
+        normalized_session_id = self._normalize_session_id(resolved_session_id)
+        resolved_agent_id = str(agent_id or (agent.id if agent is not None else "")).strip() or None
+        duration_ms = max(0, int((time.perf_counter() - started_monotonic) * 1000))
+        record_payload = dict(payload or {})
+        record_payload["stage"] = str(stage or "").strip()
+        record_payload["duration_ms"] = duration_ms
+        if agent is not None:
+            record_payload.setdefault("agent_role", agent.role.value)
+            record_payload.setdefault("step_count", int(agent.step_count))
+        self._log_diagnostic(
+            "debug_timing",
+            session_id=normalized_session_id,
+            agent_id=resolved_agent_id,
+            payload=record_payload,
+        )
+        timing_path = self._debug_timing_path(normalized_session_id)
+        if timing_path is None:
+            return
+        append_jsonl(
+            timing_path,
+            {
+                "timestamp": utc_now(),
+                "session_id": normalized_session_id,
+                "agent_id": resolved_agent_id,
+                "stage": record_payload["stage"],
+                "duration_ms": duration_ms,
+                "payload": json_ready(record_payload),
+            },
+        )
+
     def _configure_llm_debug_log(self, session_id: str) -> None:
         if not self.debug or self.llm_client is None:
             return
         normalized_session_id = self._normalize_session_id(session_id)
         debug_dir = ensure_directory(self.paths.session_dir(normalized_session_id, create=True) / "debug")
+        timing_path = self._debug_timing_path(normalized_session_id)
         log_path = debug_dir / "requests_responses.jsonl"
         if hasattr(self.llm_client, "request_response_log_dir"):
             setattr(self.llm_client, "request_response_log_dir", debug_dir)
@@ -3779,7 +5403,11 @@ class Orchestrator:
         self._log_diagnostic(
             "llm_debug_log_configured",
             session_id=normalized_session_id,
-            payload={"path": str(log_path), "dir": str(debug_dir)},
+            payload={
+                "path": str(log_path),
+                "dir": str(debug_dir),
+                "timing_path": str(timing_path) if timing_path is not None else None,
+            },
         )
 
     def _load_project_sync_state(self, session_id: str) -> dict[str, Any] | None:
@@ -3835,7 +5463,10 @@ class Orchestrator:
         root_agent: AgentNode,
         workspace_manager: WorkspaceManager,
     ) -> dict[str, Any]:
-        changes = workspace_manager.compute_workspace_changes(root_agent.workspace_id)
+        changes = workspace_manager.compute_workspace_changes(
+            root_agent.workspace_id,
+            exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+        )
         has_changes = bool(changes.added or changes.modified or changes.deleted)
         state = {
             "version": PROJECT_SYNC_STATE_VERSION,
@@ -4039,7 +5670,20 @@ class Orchestrator:
                     break
                 if session.status != SessionStatus.RUNNING:
                     break
+                wait_started_monotonic = time.perf_counter()
                 await self._wait_for_runtime_change()
+                self._log_debug_timing(
+                    stage="session.wait_for_runtime_change",
+                    started_monotonic=wait_started_monotonic,
+                    session_id=session.id,
+                    agent_id=session.root_agent_id,
+                    payload={
+                        "root_loop": int(session.loop_index),
+                        "active_root_tasks": len(self._active_root_tasks),
+                        "active_worker_tasks": len(self._active_worker_tasks),
+                        "active_tool_run_tasks": len(self._active_tool_run_tasks),
+                    },
+                )
                 if session.status == SessionStatus.RUNNING:
                     session.updated_at = utc_now()
                     self.storage.upsert_session(session)
@@ -4079,6 +5723,7 @@ class Orchestrator:
             await self._cancel_root_tasks()
             await self._cancel_worker_tasks()
             await self._cancel_tool_run_tasks()
+            await self.mcp_manager.close_session(session.id)
             self._live_session_contexts.pop(session.id, None)
             self._runtime_wakeup_event = None
             self._log_diagnostic(
@@ -4200,6 +5845,7 @@ class Orchestrator:
             self._background_root_failures.append((agent_id, exc))
         finally:
             self._active_root_tasks.pop(agent_id, None)
+            await self.mcp_manager.close_agent(session_id=session.id, agent_id=agent_id)
             self._log_diagnostic(
                 "agent_task_finished",
                 session_id=session.id,
@@ -4379,104 +6025,222 @@ class Orchestrator:
         pending_agent_ids: list[str],
         root_loop: int,
     ) -> list[str]:
-        pending_agent_ids = self._consume_finished_child_summaries(
-            root_agent,
-            pending_agent_ids,
-            agents,
-        )
-
-        async def ask_root_agent(current_agent: AgentNode) -> list[dict[str, Any]]:
-            # Refresh pending children right before each LLM request so root can
-            # react without waiting for another tool step.
-            pending_agent_ids[:] = self._consume_finished_child_summaries(
-                current_agent,
+        runtime_key = session.id
+        seeded_runtime_context = False
+        if runtime_key not in self._live_session_contexts:
+            self._live_session_contexts[runtime_key] = (session, agents, workspace_manager)
+            seeded_runtime_context = True
+        try:
+            pending_agent_ids = self._consume_finished_child_summaries(
+                root_agent,
                 pending_agent_ids,
                 agents,
             )
-            self._maybe_append_root_soft_limit_reminder(
-                session=session,
-                root_agent=current_agent,
-                root_loop=root_loop,
-            )
-            return await self._ask_agent(current_agent)
 
-        if self.interrupt_requested:
+            async def ask_root_agent(current_agent: AgentNode) -> list[dict[str, Any]]:
+                # Refresh pending children right before each LLM request so root can
+                # react without waiting for another tool step.
+                pending_agent_ids[:] = self._consume_finished_child_summaries(
+                    current_agent,
+                    pending_agent_ids,
+                    agents,
+                )
+                self._maybe_append_root_soft_limit_reminder(
+                    session=session,
+                    root_agent=current_agent,
+                    root_loop=root_loop,
+                )
+                return await self._ask_agent(current_agent)
+
+            if self.interrupt_requested:
+                return pending_agent_ids
+            actions: list[dict[str, Any]] = []
+            ask_succeeded = False
+            ask_started_monotonic = time.perf_counter()
+            try:
+                actions = await ask_root_agent(root_agent)
+                ask_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="root_cycle.ask_agent",
+                    started_monotonic=ask_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "success": ask_succeeded,
+                        "actions_count": len(actions) if ask_succeeded else None,
+                    },
+                )
+            if self.interrupt_requested:
+                return pending_agent_ids
+            action_result = ActionBatchResult(finish_payload=None)
+            execute_succeeded = False
+            execute_started_monotonic = time.perf_counter()
+            try:
+                action_result = await self._execute_agent_actions(
+                    session=session,
+                    agent=root_agent,
+                    actions=actions,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=pending_agent_ids,
+                )
+                execute_succeeded = True
+            finally:
+                self._log_debug_timing(
+                    stage="root_cycle.execute_actions",
+                    started_monotonic=execute_started_monotonic,
+                    session_id=session.id,
+                    agent=root_agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "success": execute_succeeded,
+                        "actions_count": len(actions),
+                        "has_finish_payload": bool(action_result.finish_payload),
+                    },
+                )
+            if self.interrupt_requested:
+                return pending_agent_ids
+            if action_result.finish_payload:
+                finalize_succeeded = False
+                finalize_started_monotonic = time.perf_counter()
+                try:
+                    await self._finalize_root(
+                        session=session,
+                        root_agent=root_agent,
+                        payload=action_result.finish_payload,
+                        agents=agents,
+                        workspace_manager=workspace_manager,
+                        pending_agent_ids=pending_agent_ids,
+                        root_loop=root_loop,
+                    )
+                    finalize_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="root_cycle.finalize_root",
+                        started_monotonic=finalize_started_monotonic,
+                        session_id=session.id,
+                        agent=root_agent,
+                        payload={
+                            "root_loop": root_loop,
+                            "success": finalize_succeeded,
+                        },
+                    )
+                return pending_agent_ids
             return pending_agent_ids
-        actions = await ask_root_agent(root_agent)
-        if self.interrupt_requested:
-            return pending_agent_ids
-        action_result = await self._execute_agent_actions(
-            session=session,
-            agent=root_agent,
-            actions=actions,
-            agents=agents,
-            workspace_manager=workspace_manager,
-            root_loop=root_loop,
-            tracked_pending_ids=pending_agent_ids,
-        )
-        if self.interrupt_requested:
-            return pending_agent_ids
-        if action_result.finish_payload:
-            await self._finalize_root(
-                session=session,
-                root_agent=root_agent,
-                payload=action_result.finish_payload,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                pending_agent_ids=pending_agent_ids,
-                root_loop=root_loop,
-            )
-            return pending_agent_ids
-        return pending_agent_ids
+        finally:
+            if seeded_runtime_context:
+                self._live_session_contexts.pop(runtime_key, None)
 
     async def _run_worker(self, agent: AgentNode, agents: dict[str, AgentNode], session: RunSession, workspace_manager: WorkspaceManager, root_loop: int) -> None:
-        if not self._is_active_agent(agent):
-            return
-        tracked_children = [
-            child_id
-            for child_id in agent.children
-            if (child := agents.get(child_id))
-            and self._is_active_agent(child)
-        ]
+        runtime_key = session.id
+        seeded_runtime_context = False
+        if runtime_key not in self._live_session_contexts:
+            self._live_session_contexts[runtime_key] = (session, agents, workspace_manager)
+            seeded_runtime_context = True
+        try:
+            if not self._is_active_agent(agent):
+                return
+            tracked_children = [
+                child_id
+                for child_id in agent.children
+                if (child := agents.get(child_id))
+                and self._is_active_agent(child)
+            ]
 
-        async def ask_worker_agent(current_agent: AgentNode) -> list[dict[str, Any]]:
-            tracked_children[:] = self._consume_finished_child_summaries(
-                current_agent,
-                tracked_children,
-                agents,
-            )
-            return await self._ask_agent(current_agent)
-        while not self.interrupt_requested and self._is_active_agent(agent):
-            current_root_loop = max(int(session.loop_index), int(root_loop))
-            self._maybe_append_worker_soft_limit_reminder(
-                session=session,
-                agent=agent,
-            )
-            actions = await ask_worker_agent(agent)
-            if self.interrupt_requested or not self._is_active_agent(agent):
-                return
-            loop_result = await self._execute_agent_actions(
-                session=session,
-                agent=agent,
-                actions=actions,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=current_root_loop,
-                tracked_pending_ids=tracked_children,
-            )
-            if self.interrupt_requested or not self._is_active_agent(agent):
-                return
-            if loop_result.finish_payload:
-                await self._complete_worker(
+            async def ask_worker_agent(current_agent: AgentNode) -> list[dict[str, Any]]:
+                tracked_children[:] = self._consume_finished_child_summaries(
+                    current_agent,
+                    tracked_children,
+                    agents,
+                )
+                return await self._ask_agent(current_agent)
+            while not self.interrupt_requested and self._is_active_agent(agent):
+                current_root_loop = max(int(session.loop_index), int(root_loop))
+                self._maybe_append_worker_soft_limit_reminder(
                     session=session,
                     agent=agent,
-                    payload=loop_result.finish_payload,
-                    workspace_manager=workspace_manager,
-                    agents=agents,
-                    root_loop=current_root_loop,
                 )
-                return
-            await asyncio.sleep(0)
+                actions: list[dict[str, Any]] = []
+                ask_succeeded = False
+                ask_started_monotonic = time.perf_counter()
+                try:
+                    actions = await ask_worker_agent(agent)
+                    ask_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="worker_cycle.ask_agent",
+                        started_monotonic=ask_started_monotonic,
+                        session_id=session.id,
+                        agent=agent,
+                        payload={
+                            "root_loop": current_root_loop,
+                            "success": ask_succeeded,
+                            "actions_count": len(actions) if ask_succeeded else None,
+                        },
+                    )
+                if self.interrupt_requested or not self._is_active_agent(agent):
+                    return
+                loop_result = ActionBatchResult(finish_payload=None)
+                execute_succeeded = False
+                execute_started_monotonic = time.perf_counter()
+                try:
+                    loop_result = await self._execute_agent_actions(
+                        session=session,
+                        agent=agent,
+                        actions=actions,
+                        agents=agents,
+                        workspace_manager=workspace_manager,
+                        root_loop=current_root_loop,
+                        tracked_pending_ids=tracked_children,
+                    )
+                    execute_succeeded = True
+                finally:
+                    self._log_debug_timing(
+                        stage="worker_cycle.execute_actions",
+                        started_monotonic=execute_started_monotonic,
+                        session_id=session.id,
+                        agent=agent,
+                        payload={
+                            "root_loop": current_root_loop,
+                            "success": execute_succeeded,
+                            "actions_count": len(actions),
+                            "has_finish_payload": bool(loop_result.finish_payload),
+                        },
+                    )
+                if self.interrupt_requested or not self._is_active_agent(agent):
+                    return
+                if loop_result.finish_payload:
+                    complete_succeeded = False
+                    complete_started_monotonic = time.perf_counter()
+                    try:
+                        await self._complete_worker(
+                            session=session,
+                            agent=agent,
+                            payload=loop_result.finish_payload,
+                            workspace_manager=workspace_manager,
+                            agents=agents,
+                            root_loop=current_root_loop,
+                        )
+                        complete_succeeded = True
+                    finally:
+                        self._log_debug_timing(
+                            stage="worker_cycle.complete_worker",
+                            started_monotonic=complete_started_monotonic,
+                            session_id=session.id,
+                            agent=agent,
+                            payload={
+                                "root_loop": current_root_loop,
+                                "success": complete_succeeded,
+                            },
+                        )
+                    return
+                await asyncio.sleep(0)
+        finally:
+            if seeded_runtime_context:
+                self._live_session_contexts.pop(runtime_key, None)
 
     def _maybe_append_root_soft_limit_reminder(
         self,
@@ -4606,16 +6370,45 @@ class Orchestrator:
             if agent.role == AgentRole.WORKER and not self._is_active_agent(agent):
                 break
             action_type = str(action.get("type", "")).strip()
-            submit_result = await self._submit_tool_run(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-                force_wait=has_deferred_compress and action_type not in {"compress_context", "finish"},
-            )
+            submit_result: dict[str, Any] = {}
+            submit_succeeded = False
+            submit_started_monotonic = time.perf_counter()
+            try:
+                submit_result = await self._submit_tool_run(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                    force_wait=has_deferred_compress and action_type not in {"compress_context", "finish"},
+                )
+                submit_succeeded = True
+            finally:
+                maybe_submit_result = (
+                    submit_result if isinstance(submit_result, dict) else {}
+                )
+                maybe_agent_result = maybe_submit_result.get("agent_result")
+                projected_agent_result = maybe_agent_result if isinstance(maybe_agent_result, dict) else {}
+                self._log_debug_timing(
+                    stage="execute_action.submit",
+                    started_monotonic=submit_started_monotonic,
+                    session_id=session.id,
+                    agent=agent,
+                    payload={
+                        "root_loop": root_loop,
+                        "action_type": action_type or None,
+                        "success": submit_succeeded
+                        and not str(projected_agent_result.get("error", "")).strip(),
+                        "submit_succeeded": submit_succeeded,
+                        "tool_run_id": str(projected_agent_result.get("tool_run_id", "")).strip()
+                        or None,
+                        "has_finish_payload": isinstance(
+                            maybe_submit_result.get("finish_payload"), dict
+                        ),
+                    },
+                )
             agent_result = submit_result.get("agent_result")
             if not isinstance(agent_result, dict):
                 agent_result = {}
@@ -4642,13 +6435,149 @@ class Orchestrator:
             ordered.append(action)
         return [*ordered, *deferred_compress, *deferred_finish]
 
-    async def _ask_agent(self, agent: AgentNode) -> list[dict[str, Any]]:
+    async def _ask_agent(
+        self,
+        agent: AgentNode,
+        *,
+        session: RunSession | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+    ) -> list[dict[str, Any]]:
         self._consume_waiting_steers_for_agent(agent)
-        return await self.agent_runtime.ask(
-            agent,
-            self.llm_client,
-            model_override=self._runtime_model_override,
+        runtime_context = self._live_session_contexts.get(agent.session_id)
+        if runtime_context is not None:
+            live_session, _live_agents, live_workspace_manager = runtime_context
+            if session is None:
+                session = live_session
+            if workspace_manager is None:
+                workspace_manager = live_workspace_manager
+        if session is None:
+            session = self.load_session_context(agent.session_id)
+        if workspace_manager is None:
+            workspace_manager = WorkspaceManager(self.paths.session_dir(agent.session_id, create=True))
+            if agent.role == AgentRole.ROOT and agent.workspace_id == "root":
+                workspace_manager.create_root_workspace(
+                    session.project_dir,
+                    mode=session.workspace_mode,
+                )
+            else:
+                raise RuntimeError(
+                    "workspace_manager is required to ask a non-root agent outside the live runtime context."
+                )
+        workspace = workspace_manager.workspace(agent.workspace_id)
+        remote_context = self.tool_executor.session_remote_context(agent.session_id)
+        previous_mcp_state = (
+            dict(session.mcp_state)
+            if isinstance(session.mcp_state, dict)
+            else {}
         )
+        mcp_prepare_started_monotonic = time.perf_counter()
+        mcp_prepare_succeeded = False
+        mcp_prepare_error: str | None = None
+        try:
+            mcp_payload = await self.mcp_manager.prepare_agent(
+                session=session,
+                agent=agent,
+                workspace_path=workspace.path,
+                workspace_is_remote=remote_context is not None,
+                tool_executor=self.tool_executor,
+            )
+        except McpError as exc:
+            mcp_prepare_error = str(exc)
+            if not isinstance(agent.metadata, dict):
+                agent.metadata = {}
+            agent.metadata["mcp"] = {
+                "enabled": bool(session.enabled_mcp_server_ids),
+                "enabled_server_ids": list(session.enabled_mcp_server_ids),
+                "entries": [],
+                "warnings": [{"message": str(exc)}],
+                "dynamic_tools": [],
+                "updated_at": utc_now(),
+            }
+            session.mcp_state = {
+                "enabled": bool(session.enabled_mcp_server_ids),
+                "enabled_server_ids": list(session.enabled_mcp_server_ids),
+                "entries": [],
+                "warnings": [{"message": str(exc)}],
+                "updated_at": utc_now(),
+            }
+            self.storage.upsert_session(session)
+            if self._session_mcp_state_changed(previous_mcp_state, session.mcp_state):
+                self._emit_session_mcp_refreshed(
+                    session=session,
+                    agent_id=agent.id,
+                    workspace_id=agent.workspace_id,
+                )
+            self._log_diagnostic(
+                "mcp_prepare_agent_failed",
+                level="warning",
+                session_id=session.id,
+                agent_id=agent.id,
+                payload={"error": str(exc)},
+            )
+        else:
+            mcp_prepare_succeeded = True
+            if not isinstance(agent.metadata, dict):
+                agent.metadata = {}
+            agent.metadata["mcp"] = mcp_payload
+            session.mcp_state = {
+                "enabled": bool(
+                    mcp_payload.get("enabled_server_ids")
+                    if isinstance(mcp_payload.get("enabled_server_ids"), list)
+                    else session.enabled_mcp_server_ids
+                ),
+                "enabled_server_ids": list(mcp_payload.get("enabled_server_ids", []))
+                if isinstance(mcp_payload.get("enabled_server_ids"), list)
+                else list(session.enabled_mcp_server_ids),
+                "entries": list(mcp_payload.get("entries", []))
+                if isinstance(mcp_payload.get("entries"), list)
+                else [],
+                "warnings": list(mcp_payload.get("warnings", []))
+                if isinstance(mcp_payload.get("warnings"), list)
+                else [],
+                "updated_at": mcp_payload.get("updated_at", utc_now()),
+            }
+            self.storage.upsert_session(session)
+            if self._session_mcp_state_changed(previous_mcp_state, session.mcp_state):
+                self._emit_session_mcp_refreshed(
+                    session=session,
+                    agent_id=agent.id,
+                    workspace_id=agent.workspace_id,
+                )
+        finally:
+            self._log_debug_timing(
+                stage="ask_agent.prepare_mcp",
+                started_monotonic=mcp_prepare_started_monotonic,
+                session_id=session.id,
+                agent=agent,
+                payload={
+                    "success": mcp_prepare_succeeded,
+                    "error": mcp_prepare_error,
+                    "enabled_mcp_server_count": len(session.enabled_mcp_server_ids),
+                },
+            )
+        self.storage.upsert_agent(agent)
+        actions: list[dict[str, Any]] = []
+        llm_ask_succeeded = False
+        llm_ask_started_monotonic = time.perf_counter()
+        try:
+            actions = await self.agent_runtime.ask(
+                agent,
+                self.llm_client,
+                model_override=self._runtime_model_override,
+            )
+            llm_ask_succeeded = True
+            return actions
+        finally:
+            self._log_debug_timing(
+                stage="ask_agent.llm_roundtrip",
+                started_monotonic=llm_ask_started_monotonic,
+                session_id=session.id,
+                agent=agent,
+                payload={
+                    "success": llm_ask_succeeded,
+                    "actions_count": len(actions) if llm_ask_succeeded else None,
+                },
+            )
 
     def _consume_waiting_steers_for_agent(self, agent: AgentNode) -> None:
         waiting_runs = self._list_steer_runs_all(
@@ -4967,84 +6896,119 @@ class Orchestrator:
         root_loop: int,
         tracked_pending_ids: list[str] | None,
     ) -> dict[str, Any]:
-        raw_result: dict[str, Any]
+        raw_result: dict[str, Any] = {}
         action_type = str(action.get("type", "")).strip()
-        if action_type == "shell":
-            raw_result = await self._execute_shell_action(
-                agent,
-                action,
-                workspace_manager,
-                tool_run_id=run.id,
-            )
-        elif action_type == "spawn_agent":
-            raw_result = await self._execute_spawn_tool_run(
-                run=run,
+        execute_started_monotonic = time.perf_counter()
+        execute_succeeded = False
+        execute_error: str | None = None
+        try:
+            if self._is_dynamic_mcp_tool(agent=agent, action_type=action_type):
+                raw_result = await self._execute_mcp_dynamic_tool(
+                    agent=agent,
+                    action=action,
+                )
+            elif action_type == "shell":
+                raw_result = await self._execute_shell_action(
+                    agent,
+                    action,
+                    workspace_manager,
+                    tool_run_id=run.id,
+                )
+            elif action_type == "list_mcp_servers":
+                raw_result = await self._list_mcp_servers_result(agent=agent, action=action)
+            elif action_type == "list_mcp_resources":
+                raw_result = await self._list_mcp_resources_result(agent=agent, action=action)
+            elif action_type == "read_mcp_resource":
+                raw_result = await self._read_mcp_resource_result(agent=agent, action=action)
+            elif action_type == "spawn_agent":
+                raw_result = await self._execute_spawn_tool_run(
+                    run=run,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    session=session,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "steer_agent":
+                raw_result = self._steer_agent_tool_result(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                )
+            elif action_type == "list_tool_runs":
+                raw_result = self._tool_run_list_result(agent=agent, action=action, agents=agents)
+            elif action_type == "get_tool_run":
+                raw_result = self._tool_run_get_result(agent=agent, action=action, agents=agents)
+            elif action_type == "wait_run":
+                raw_result = await self._run_wait_result(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                )
+            elif action_type == "cancel_tool_run":
+                raw_result = await self._tool_run_cancel_result(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=root_loop,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "cancel_agent":
+                raw_result = await self._execute_read_only_action_with_timeout(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    tool_run_id=run.id,
+                )
+                await self._apply_cancel_agent_side_effects(
+                    session=session,
+                    requesting_agent=agent,
+                    action=action,
+                    raw_result=raw_result,
+                    agents=agents,
+                    tracked_pending_ids=tracked_pending_ids,
+                )
+            elif action_type == "wait_time":
+                raw_result = await self._wait_time_result(action=action)
+            elif action_type == "compress_context":
+                raw_result = await self.agent_runtime.compress_context(
+                    agent,
+                    llm_client=self.llm_client,
+                    reason="manual",
+                )
+            elif action_type == "finish":
+                raw_result = self._finish_tool_result(agent=agent, action=action, agents=agents)
+            else:
+                raw_result = await self._execute_read_only_action_with_timeout(
+                    agent=agent,
+                    action=action,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    tool_run_id=run.id,
+                )
+            execute_error = str(raw_result.get("error", "")).strip() or None
+            execute_succeeded = execute_error is None
+        except Exception as exc:
+            execute_error = str(exc)
+            raise
+        finally:
+            self._log_debug_timing(
+                stage="tool_run.execute",
+                started_monotonic=execute_started_monotonic,
+                session_id=session.id,
                 agent=agent,
-                action=action,
-                agents=agents,
-                session=session,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "steer_agent":
-            raw_result = self._steer_agent_tool_result(
-                agent=agent,
-                action=action,
-                agents=agents,
-            )
-        elif action_type == "list_tool_runs":
-            raw_result = self._tool_run_list_result(agent=agent, action=action, agents=agents)
-        elif action_type == "get_tool_run":
-            raw_result = self._tool_run_get_result(agent=agent, action=action, agents=agents)
-        elif action_type == "wait_run":
-            raw_result = await self._run_wait_result(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-            )
-        elif action_type == "cancel_tool_run":
-            raw_result = await self._tool_run_cancel_result(
-                session=session,
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-                root_loop=root_loop,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "cancel_agent":
-            raw_result = await self._execute_read_only_action_with_timeout(
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
-            )
-            await self._apply_cancel_agent_side_effects(
-                session=session,
-                requesting_agent=agent,
-                action=action,
-                raw_result=raw_result,
-                agents=agents,
-                tracked_pending_ids=tracked_pending_ids,
-            )
-        elif action_type == "wait_time":
-            raw_result = await self._wait_time_result(action=action)
-        elif action_type == "compress_context":
-            raw_result = await self.agent_runtime.compress_context(
-                agent,
-                llm_client=self.llm_client,
-                reason="manual",
-            )
-        elif action_type == "finish":
-            raw_result = self._finish_tool_result(agent=agent, action=action, agents=agents)
-        else:
-            raw_result = await self._execute_read_only_action_with_timeout(
-                agent=agent,
-                action=action,
-                agents=agents,
-                workspace_manager=workspace_manager,
+                payload={
+                    "tool_run_id": run.id,
+                    "action_type": action_type or None,
+                    "success": execute_succeeded,
+                    "error": execute_error,
+                },
             )
 
         refreshed = self.storage.load_tool_run(run.id)
@@ -5204,6 +7168,229 @@ class Orchestrator:
         if str(run.get("session_id")) != agent.session_id:
             return {"error": f"Tool run {tool_run_id} is outside the current session."}
         return {"tool_run": run}
+
+    @staticmethod
+    def _agent_mcp_state(agent: AgentNode) -> dict[str, Any]:
+        metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
+        state = metadata.get("mcp")
+        return state if isinstance(state, dict) else {}
+
+    def _is_dynamic_mcp_tool(self, *, agent: AgentNode, action_type: str) -> bool:
+        normalized_action_type = str(action_type or "").strip()
+        if not normalized_action_type:
+            return False
+        state = self._agent_mcp_state(agent)
+        dynamic_tools = state.get("dynamic_tools")
+        if not isinstance(dynamic_tools, list):
+            return False
+        return normalized_action_type in {
+            str(item.get("function", {}).get("name", "")).strip()
+            for item in dynamic_tools
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+
+    def _timeout_action_type(self, *, agent: AgentNode, action_type: str) -> str:
+        if self._is_dynamic_mcp_tool(agent=agent, action_type=action_type):
+            return "mcp_tool"
+        return action_type
+
+    async def _execute_async_tool_action_with_timeout(
+        self,
+        *,
+        agent: AgentNode,
+        action: dict[str, Any],
+        action_type: str,
+        operation: Awaitable[dict[str, Any]],
+        timeout_action_type: str | None = None,
+    ) -> dict[str, Any]:
+        timeout_key = str(timeout_action_type or action_type).strip() or action_type
+        timeout_seconds = self.tool_executor.timeout_seconds_for_action(timeout_key)
+        timeout_budget_ms = int(timeout_seconds * 1000)
+        started = time.perf_counter()
+        public_action = _public_action(action)
+        try:
+            result = await asyncio.wait_for(operation, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            self._log_agent_event(
+                agent,
+                event_type="tool_timeout",
+                phase="tool",
+                payload={
+                    "action": public_action,
+                    "timeout_seconds": timeout_seconds,
+                    "duration_ms": duration_ms,
+                    "budget_exceeded": True,
+                },
+            )
+            self._log_diagnostic(
+                "tool_action_timeout_budget_exceeded",
+                level="warning",
+                session_id=agent.session_id,
+                agent_id=agent.id,
+                payload={
+                    "action_type": action_type,
+                    "timeout_action_type": timeout_key,
+                    "timeout_seconds": timeout_seconds,
+                    "duration_ms": duration_ms,
+                    "action": public_action,
+                },
+            )
+            return {
+                "error": f"Tool '{action_type}' timed out after {timeout_seconds}s.",
+                "timed_out": True,
+                "timeout_seconds": timeout_seconds,
+                "duration_ms": duration_ms,
+            }
+        except McpError as exc:
+            return {"error": str(exc)}
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if duration_ms > timeout_budget_ms:
+            result = dict(result)
+            result.setdefault(
+                "warning",
+                (
+                    f"Tool '{action_type}' exceeded timeout budget ({timeout_seconds}s) "
+                    f"and finished after {duration_ms}ms."
+                ),
+            )
+            result["timeout_budget_exceeded"] = True
+            result["timeout_seconds"] = timeout_seconds
+            result["duration_ms"] = duration_ms
+            self._log_agent_event(
+                agent,
+                event_type="tool_timeout",
+                phase="tool",
+                payload={
+                    "action": public_action,
+                    "timeout_seconds": timeout_seconds,
+                    "duration_ms": duration_ms,
+                    "budget_exceeded": True,
+                },
+            )
+            self._log_diagnostic(
+                "tool_action_timeout_budget_exceeded",
+                level="warning",
+                session_id=agent.session_id,
+                agent_id=agent.id,
+                payload={
+                    "action_type": action_type,
+                    "timeout_action_type": timeout_key,
+                    "timeout_seconds": timeout_seconds,
+                    "duration_ms": duration_ms,
+                    "action": public_action,
+                },
+            )
+        else:
+            result = dict(result)
+            result.setdefault("duration_ms", duration_ms)
+        return result
+
+    async def _list_mcp_servers_result(
+        self,
+        *,
+        action: dict[str, Any],
+        agent: AgentNode,
+    ) -> dict[str, Any]:
+        return await self._execute_async_tool_action_with_timeout(
+            agent=agent,
+            action=action,
+            action_type="list_mcp_servers",
+            operation=self.mcp_manager.list_servers(
+                session_id=agent.session_id,
+                agent_id=agent.id,
+            ),
+        )
+
+    @staticmethod
+    def _decode_mcp_cursor(value: Any) -> int | None:
+        if value is None:
+            return 0
+        normalized = str(value).strip()
+        if not normalized:
+            return 0
+        try:
+            parsed = int(normalized)
+        except (TypeError, ValueError):
+            return None
+        if parsed < 0:
+            return None
+        return parsed
+
+    async def _list_mcp_resources_result(
+        self,
+        *,
+        agent: AgentNode,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        default_limit, max_limit = self.config.runtime.tools.list_limit_bounds()
+        limit = normalize_tool_run_limit(
+            action.get("limit", default_limit),
+            default=default_limit,
+            minimum=1,
+            maximum=max_limit,
+        )
+        cursor = self._decode_mcp_cursor(action.get("cursor"))
+        if cursor is None:
+            return {"error": "list_mcp_resources received an invalid 'cursor'."}
+        return await self._execute_async_tool_action_with_timeout(
+            agent=agent,
+            action=action,
+            action_type="list_mcp_resources",
+            operation=self.mcp_manager.list_resources(
+                session_id=agent.session_id,
+                agent_id=agent.id,
+                server_id=str(action.get("server_id", "")).strip() or None,
+                cursor=cursor,
+                limit=limit,
+            ),
+        )
+
+    async def _read_mcp_resource_result(
+        self,
+        *,
+        agent: AgentNode,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        uri = str(action.get("uri", "")).strip()
+        if not uri:
+            return {"error": "read_mcp_resource requires 'uri'."}
+        return await self._execute_async_tool_action_with_timeout(
+            agent=agent,
+            action=action,
+            action_type="read_mcp_resource",
+            operation=self.mcp_manager.read_resource(
+                session_id=agent.session_id,
+                agent_id=agent.id,
+                uri=uri,
+                server_id=str(action.get("server_id", "")).strip() or None,
+            ),
+        )
+
+    async def _execute_mcp_dynamic_tool(
+        self,
+        *,
+        agent: AgentNode,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        arguments = {
+            key: value
+            for key, value in action.items()
+            if key not in {"type", "_tool_call_id"}
+        }
+        action_type = str(action.get("type", "")).strip()
+        return await self._execute_async_tool_action_with_timeout(
+            agent=agent,
+            action=action,
+            action_type=action_type,
+            timeout_action_type="mcp_tool",
+            operation=self.mcp_manager.call_dynamic_tool(
+                session_id=agent.session_id,
+                agent_id=agent.id,
+                synthetic_name=action_type,
+                arguments=arguments,
+            ),
+        )
 
     def _steer_agent_tool_result(
         self,
@@ -5384,7 +7571,7 @@ class Orchestrator:
         root_loop: int,
         tracked_pending_ids: list[str] | None,
     ) -> dict[str, Any]:
-        del workspace_manager, root_loop
+        del root_loop
         tool_run_id = str(action.get("tool_run_id", "")).strip()
         if not tool_run_id:
             return {"error": "cancel_tool_run requires 'tool_run_id'."}
@@ -5458,6 +7645,7 @@ class Orchestrator:
                 summary_payload = await self._request_cancelled_worker_summary(
                     session=session,
                     worker=child,
+                    workspace_manager=workspace_manager,
                 )
                 if summary_payload is not None:
                     child.summary = str(summary_payload.get("summary", "")).strip() or child.summary
@@ -5616,6 +7804,7 @@ class Orchestrator:
         if not agent_ids:
             return
         tasks: list[asyncio.Task[None]] = []
+        session_id = self.latest_session_id or ""
         for agent_id in agent_ids:
             root_task = self._active_root_tasks.pop(agent_id, None)
             if root_task is not None and not root_task.done():
@@ -5628,6 +7817,9 @@ class Orchestrator:
             tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if session_id:
+            for agent_id in agent_ids:
+                await self.mcp_manager.close_agent(session_id=session_id, agent_id=agent_id)
         self._signal_runtime_change()
 
     async def _request_cancelled_worker_summary(
@@ -5635,6 +7827,7 @@ class Orchestrator:
         *,
         session: RunSession,
         worker: AgentNode,
+        workspace_manager: WorkspaceManager,
     ) -> dict[str, Any] | None:
         task = self._active_worker_tasks.pop(worker.id, None)
         if task is not None and not task.done():
@@ -5669,7 +7862,11 @@ class Orchestrator:
             payload={"reason": reason},
         )
         try:
-            actions = await self._ask_agent(worker)
+            actions = await self._ask_agent(
+                worker,
+                session=session,
+                workspace_manager=workspace_manager,
+            )
         except Exception as exc:
             self._log_diagnostic(
                 "cancelled_summary_failed",
@@ -6020,7 +8217,7 @@ class Orchestrator:
         normalized_agent_id = str(agent_id or "").strip()
         if not normalized_agent_id:
             return None
-        for row in self.storage.load_agents(normalized_session_id):
+        for row in self._session_agent_rows(normalized_session_id):
             if str(row.get("id", "")).strip() == normalized_agent_id:
                 return row
         return None
@@ -6278,6 +8475,94 @@ class Orchestrator:
                 projected["timeout_seconds"] = raw_result.get("timeout_seconds")
             if error_text:
                 projected["error"] = error_text
+            return projected
+
+        if action_type == "list_mcp_servers":
+            if error_text:
+                return self._project_error_result(raw_result, error_text)
+            rows = raw_result.get("mcp_servers", [])
+            projected_rows = [
+                dict(row)
+                for row in rows
+                if isinstance(row, dict)
+            ]
+            projected = {
+                "mcp_servers_count": len(projected_rows),
+                "mcp_servers": projected_rows,
+            }
+            warning = str(raw_result.get("warning", "")).strip()
+            if warning:
+                projected["warning"] = warning
+            return projected
+
+        if action_type == "list_mcp_resources":
+            if error_text:
+                return self._project_error_result(raw_result, error_text)
+            rows = raw_result.get("mcp_resources", [])
+            projected_rows = [
+                dict(row)
+                for row in rows
+                if isinstance(row, dict)
+            ]
+            projected = {
+                "mcp_resources_count": len(projected_rows),
+                "mcp_resources": projected_rows,
+                "next_cursor": raw_result.get("next_cursor"),
+                "has_more": bool(raw_result.get("has_more", False)),
+            }
+            warning = str(raw_result.get("warning", "")).strip()
+            if warning:
+                projected["warning"] = warning
+            return projected
+
+        if action_type == "read_mcp_resource":
+            if error_text:
+                return self._project_error_result(raw_result, error_text)
+            contents = raw_result.get("contents", [])
+            projected_contents = [
+                dict(item)
+                for item in contents
+                if isinstance(item, dict)
+            ]
+            projected = {
+                "server_id": str(raw_result.get("server_id", "")).strip(),
+                "uri": str(raw_result.get("uri", "")).strip(),
+                "contents_count": len(projected_contents),
+                "contents": projected_contents,
+            }
+            if "contents_truncated" in raw_result:
+                projected["contents_truncated"] = bool(raw_result.get("contents_truncated", False))
+            warning = str(raw_result.get("warning", "")).strip()
+            if warning:
+                projected["warning"] = warning
+            return projected
+
+        if action_type.startswith("mcp__"):
+            if error_text:
+                return self._project_error_result(raw_result, error_text)
+            projected = {
+                "server_id": str(raw_result.get("server_id", "")).strip(),
+                "tool_name": str(raw_result.get("tool_name", "")).strip() or action_type,
+                "is_error": bool(raw_result.get("is_error", False)),
+                "content": [
+                    dict(item)
+                    for item in raw_result.get("content", [])
+                    if isinstance(item, dict)
+                ],
+            }
+            if "content_truncated" in raw_result:
+                projected["content_truncated"] = bool(raw_result.get("content_truncated", False))
+            if "structured_content" in raw_result:
+                projected["structured_content"] = raw_result.get("structured_content")
+            warning = str(raw_result.get("warning", "")).strip()
+            if warning:
+                projected["warning"] = warning
+            if "timed_out" in raw_result:
+                projected["timed_out"] = bool(raw_result.get("timed_out", False))
+            if "timeout_seconds" in raw_result:
+                projected["timeout_seconds"] = raw_result.get("timeout_seconds")
+            if "duration_ms" in raw_result:
+                projected["duration_ms"] = raw_result.get("duration_ms")
             return projected
 
         if action_type == "list_tool_runs":
@@ -6735,6 +9020,7 @@ class Orchestrator:
             self._background_worker_failures.append((agent_id, exc))
         finally:
             self._active_worker_tasks.pop(agent_id, None)
+            await self.mcp_manager.close_agent(session_id=session.id, agent_id=agent_id)
             self._log_diagnostic(
                 "agent_task_finished",
                 session_id=session.id,
@@ -6778,14 +9064,26 @@ class Orchestrator:
         action: dict[str, Any],
         agents: dict[str, AgentNode],
         workspace_manager: WorkspaceManager,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         self.tool_executor.set_project_dir(self.project_dir)
-        return self.tool_executor.execute_read_only(
-            agent=agent,
-            action=action,
-            agents=agents,
-            workspace_manager=workspace_manager,
-        )
+        try:
+            return self.tool_executor.execute_read_only(
+                agent=agent,
+                action=action,
+                agents=agents,
+                workspace_manager=workspace_manager,
+                tool_run_id=tool_run_id,
+            )
+        except TypeError as exc:
+            if "tool_run_id" not in str(exc):
+                raise
+            return self.tool_executor.execute_read_only(
+                agent=agent,
+                action=action,
+                agents=agents,
+                workspace_manager=workspace_manager,
+            )
 
     async def _execute_read_only_action_with_timeout(
         self,
@@ -6794,9 +9092,11 @@ class Orchestrator:
         action: dict[str, Any],
         agents: dict[str, AgentNode],
         workspace_manager: WorkspaceManager,
+        tool_run_id: str | None = None,
     ) -> dict[str, Any]:
         action_type = str(action.get("type", "tool"))
-        timeout_seconds = self.tool_executor.timeout_seconds_for_action(action_type)
+        timeout_action_type = self._timeout_action_type(agent=agent, action_type=action_type)
+        timeout_seconds = self.tool_executor.timeout_seconds_for_action(timeout_action_type)
         timeout_budget_ms = int(timeout_seconds * 1000)
         started = time.perf_counter()
         public_action = _public_action(action)
@@ -6805,6 +9105,7 @@ class Orchestrator:
             action=action,
             agents=agents,
             workspace_manager=workspace_manager,
+            tool_run_id=tool_run_id,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         if duration_ms > timeout_budget_ms:
@@ -6828,6 +9129,7 @@ class Orchestrator:
                     "timeout_seconds": timeout_seconds,
                     "duration_ms": duration_ms,
                     "budget_exceeded": True,
+                    "timeout_action_type": timeout_action_type,
                 },
             )
             self._log_diagnostic(
@@ -6837,6 +9139,7 @@ class Orchestrator:
                 agent_id=agent.id,
                 payload={
                     "action_type": action_type,
+                    "timeout_action_type": timeout_action_type,
                     "timeout_seconds": timeout_seconds,
                     "duration_ms": duration_ms,
                     "action": public_action,
@@ -6864,12 +9167,23 @@ class Orchestrator:
                 text=text,
             )
 
-        return await self.tool_executor.execute_shell(
-            agent,
-            action,
-            workspace_manager,
-            stream_listener=_on_stream if normalized_tool_run_id else None,
-        )
+        try:
+            return await self.tool_executor.execute_shell(
+                agent,
+                action,
+                workspace_manager,
+                stream_listener=_on_stream if normalized_tool_run_id else None,
+                tool_run_id=normalized_tool_run_id or None,
+            )
+        except TypeError as exc:
+            if "tool_run_id" not in str(exc):
+                raise
+            return await self.tool_executor.execute_shell(
+                agent,
+                action,
+                workspace_manager,
+                stream_listener=_on_stream if normalized_tool_run_id else None,
+            )
 
     def _append_tool_result(
         self,
@@ -6944,12 +9258,24 @@ class Orchestrator:
     def _sync_agent_messages(self, agent: AgentNode) -> None:
         self._get_message_logger(agent.session_id).sync_conversation(agent)
 
-    def _sync_session_messages_from_checkpoint(self, session_id: str) -> None:
+    def _sync_session_messages_from_checkpoint(
+        self,
+        session_id: str,
+        *,
+        agent_ids: set[str] | None = None,
+    ) -> None:
         normalized_session_id = self._normalize_session_id(session_id)
         checkpoint = self.storage.latest_checkpoint(normalized_session_id)
         if not checkpoint:
             return
-        for payload in checkpoint["state"].get("agents", {}).values():
+        normalized_agent_ids = (
+            {str(agent_id).strip() for agent_id in agent_ids if str(agent_id).strip()}
+            if agent_ids is not None
+            else None
+        )
+        for agent_id, payload in checkpoint["state"].get("agents", {}).items():
+            if normalized_agent_ids is not None and str(agent_id).strip() not in normalized_agent_ids:
+                continue
             self._sync_agent_messages(self._agent_from_state(payload))
 
     def _restore_agent_conversations_from_messages(
@@ -7232,7 +9558,11 @@ class Orchestrator:
         if direct_mode:
             diff_artifact = ""
         else:
-            diff = workspace_manager.create_diff_artifact(agent.id, agent.workspace_id)
+            diff = workspace_manager.create_diff_artifact(
+                agent.id,
+                agent.workspace_id,
+                exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
+            )
             diff_artifact = str(diff.artifact_path)
         completion = WorkerCompletion(
             summary=str(payload.get("summary", "")),
@@ -7254,6 +9584,7 @@ class Orchestrator:
                         workspace_manager.apply_workspace_changes,
                         agent.workspace_id,
                         parent_workspace.path,
+                        exclude_relative_prefixes=self._skill_bundle_exclude_prefixes(session),
                     )
                 self._log_diagnostic(
                     "workspace_changes_promoted",
@@ -7708,6 +10039,55 @@ class Orchestrator:
             status = SessionStatus(raw_status)
         except ValueError:
             status = fallback.status
+        enabled_skill_ids = list(fallback.enabled_skill_ids)
+        raw_enabled_skill_ids = row.get("enabled_skill_ids_json")
+        if isinstance(raw_enabled_skill_ids, str) and raw_enabled_skill_ids.strip():
+            try:
+                parsed_enabled_skill_ids = json.loads(raw_enabled_skill_ids)
+            except json.JSONDecodeError:
+                parsed_enabled_skill_ids = None
+            if isinstance(parsed_enabled_skill_ids, list):
+                enabled_skill_ids = normalize_skill_ids(
+                    [str(item).strip() for item in parsed_enabled_skill_ids if str(item).strip()]
+                )
+        enabled_mcp_server_ids = list(fallback.enabled_mcp_server_ids)
+        raw_enabled_mcp_server_ids = row.get("enabled_mcp_server_ids_json")
+        if isinstance(raw_enabled_mcp_server_ids, str) and raw_enabled_mcp_server_ids.strip():
+            try:
+                parsed_enabled_mcp_server_ids = json.loads(raw_enabled_mcp_server_ids)
+            except json.JSONDecodeError:
+                parsed_enabled_mcp_server_ids = None
+            if isinstance(parsed_enabled_mcp_server_ids, list):
+                enabled_mcp_server_ids = sorted(
+                    {
+                        str(item).strip()
+                        for item in parsed_enabled_mcp_server_ids
+                        if str(item).strip()
+                    }
+                )
+        skill_bundle_root = str(
+            row.get("skill_bundle_root", fallback.skill_bundle_root) or fallback.skill_bundle_root
+        )
+        skills_state = (
+            dict(fallback.skills_state) if isinstance(fallback.skills_state, dict) else {}
+        )
+        raw_skills_state = row.get("skills_state_json")
+        if isinstance(raw_skills_state, str) and raw_skills_state.strip():
+            try:
+                parsed_skills_state = json.loads(raw_skills_state)
+            except json.JSONDecodeError:
+                parsed_skills_state = None
+            if isinstance(parsed_skills_state, dict):
+                skills_state = parsed_skills_state
+        mcp_state = dict(fallback.mcp_state) if isinstance(fallback.mcp_state, dict) else {}
+        raw_mcp_state = row.get("mcp_state_json")
+        if isinstance(raw_mcp_state, str) and raw_mcp_state.strip():
+            try:
+                parsed_mcp_state = json.loads(raw_mcp_state)
+            except json.JSONDecodeError:
+                parsed_mcp_state = None
+            if isinstance(parsed_mcp_state, dict):
+                mcp_state = parsed_mcp_state
         return RunSession(
             id=str(row.get("id", fallback.id) or fallback.id),
             project_dir=Path(str(row.get("project_dir", fallback.project_dir))),
@@ -7740,6 +10120,11 @@ class Orchestrator:
                 ),
             ),
             follow_up_needed=bool(int(row.get("follow_up_needed", int(fallback.follow_up_needed)) or 0)),
+            enabled_skill_ids=enabled_skill_ids,
+            enabled_mcp_server_ids=enabled_mcp_server_ids,
+            skill_bundle_root=skill_bundle_root,
+            skills_state=skills_state,
+            mcp_state=mcp_state,
             config_snapshot=config_snapshot,
         )
 
@@ -8022,15 +10407,54 @@ class Orchestrator:
         error: BaseException | None = None,
         message: str = "",
     ) -> None:
+        resolved_session_id = session_id or self.latest_session_id
+        self._mirror_activity_diagnostic_event(
+            event_type,
+            session_id=resolved_session_id,
+            agent_id=agent_id,
+            level=level,
+            payload=payload,
+        )
         self.diagnostics.log(
             component="orchestrator",
             event_type=event_type,
             level=level,
-            session_id=session_id or self.latest_session_id,
+            session_id=resolved_session_id,
             agent_id=agent_id,
             message=message,
             payload=payload,
             error=error,
+        )
+
+    def _mirror_activity_diagnostic_event(
+        self,
+        event_type: str,
+        *,
+        session_id: str | None,
+        agent_id: str | None,
+        level: str,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        if event_type not in ACTIVITY_DIAGNOSTIC_EVENT_TYPES:
+            return
+        normalized_session_text = str(session_id or "").strip()
+        if not normalized_session_text:
+            return
+        try:
+            normalized_session_id = self._normalize_session_id(normalized_session_text)
+        except ValueError:
+            return
+        normalized_agent_id = str(agent_id or "").strip() or None
+        diagnostic_payload = dict(payload or {})
+        diagnostic_payload.setdefault("diagnostic_level", str(level or "info"))
+        self._get_logger(normalized_session_id).log(
+            session_id=normalized_session_id,
+            agent_id=normalized_agent_id,
+            parent_agent_id=None,
+            event_type=event_type,
+            phase="mcp",
+            payload=diagnostic_payload,
+            workspace_id=None,
         )
 
 def _public_action(action: dict[str, Any]) -> dict[str, Any]:

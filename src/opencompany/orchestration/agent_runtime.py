@@ -212,6 +212,13 @@ class AgentRuntime:
                         metadata.get("context_summary", "") or ""
                     ),
                     "compression_count": self._compression_count(agent),
+                    "enabled_skill_ids": [
+                        str(entry.get("id", "")).strip()
+                        for entry in metadata.get("skills_catalog", {}).get("entries", [])
+                        if isinstance(entry, dict) and str(entry.get("id", "")).strip()
+                    ]
+                    if isinstance(metadata.get("skills_catalog"), dict)
+                    else [],
                     "summary_version": self._summary_version(agent),
                     "summarized_until_message_index": _safe_int(
                         metadata.get("summarized_until_message_index"),

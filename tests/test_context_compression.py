@@ -71,6 +71,68 @@ class ContextAssemblerTests(unittest.TestCase):
             ],
         )
 
+    def test_root_system_prompt_includes_skills_guidance_when_catalog_present(self) -> None:
+        agent = self._agent(
+            [],
+            metadata={
+                "skills_catalog": {
+                    "bundle_root": ".opencompany_skills/session-1",
+                    "manifest_path": ".opencompany_skills/session-1/manifest.json",
+                    "entries": [
+                        {
+                            "id": "repo-map",
+                            "name": "Repo Map",
+                            "description": "Explain repository layout.",
+                            "main_doc_project_path": ".opencompany_skills/session-1/repo-map/SKILL.md",
+                            "resource_count": 1,
+                        }
+                    ],
+                    "warnings": [],
+                }
+            },
+        )
+
+        prompt = self.assembler.system_prompt(agent)
+
+        self.assertIn("Enabled Skills:", prompt)
+        self.assertIn("prefer to use relevant skills when needed", prompt)
+        self.assertIn("planning and delegation", prompt)
+        self.assertIn("do not invent new tools or capabilities from a skill name", prompt)
+
+    def test_worker_system_prompt_includes_skills_guidance_when_catalog_present(self) -> None:
+        agent = AgentNode(
+            id="agent-worker",
+            session_id="session-1",
+            name="Worker",
+            role=AgentRole.WORKER,
+            instruction="test",
+            workspace_id="workspace-root",
+            conversation=[],
+            metadata={
+                "skills_catalog": {
+                    "bundle_root": ".opencompany_skills/session-1",
+                    "manifest_path": ".opencompany_skills/session-1/manifest.json",
+                    "entries": [
+                        {
+                            "id": "repo-map",
+                            "name": "Repo Map",
+                            "description": "Explain repository layout.",
+                            "main_doc_project_path": ".opencompany_skills/session-1/repo-map/SKILL.md",
+                            "resource_count": 1,
+                        }
+                    ],
+                    "warnings": [],
+                }
+            },
+        )
+
+        prompt = self.assembler.system_prompt(agent)
+
+        self.assertIn("Enabled Skills:", prompt)
+        self.assertIn("prefer to use relevant skills when needed", prompt)
+        self.assertIn("Read the referenced skill docs before relying on a skill", prompt)
+        self.assertIn("inspect or execute skill scripts/binaries only through `shell`", prompt)
+
     def test_messages_with_summary_include_pinned_summary_and_unsummarized(self) -> None:
         agent = self._agent(
             [

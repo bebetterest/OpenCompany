@@ -92,6 +92,51 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(args.model, "fake/model")
         self.assertEqual(args.root_agent_name, "Demo Root")
 
+    def test_run_resume_and_skills_command_accept_skill_flags(self) -> None:
+        run_args = build_parser().parse_args(
+            ["run", "--skill", "skill-a", "--skill", "skill-b", "inspect repo"]
+        )
+        resume_args = build_parser().parse_args(
+            ["resume", "session-123", "--skill", "skill-c", "continue"]
+        )
+        skills_args = build_parser().parse_args(["skills", "--project-dir", "/tmp/demo"])
+
+        self.assertEqual(run_args.skills, ["skill-a", "skill-b"])
+        self.assertEqual(resume_args.skills, ["skill-c"])
+        self.assertEqual(skills_args.project_dir, "/tmp/demo")
+
+    def test_run_resume_and_mcp_servers_command_accept_mcp_flags(self) -> None:
+        run_args = build_parser().parse_args(
+            ["run", "--mcp-server", "filesystem", "--mcp-server", "docs", "inspect repo"]
+        )
+        resume_args = build_parser().parse_args(
+            ["resume", "session-123", "--mcp-server", "docs", "continue"]
+        )
+        inspect_args = build_parser().parse_args(
+            ["mcp-servers", "--mcp-server", "filesystem", "--project-dir", "/tmp/demo"]
+        )
+
+        self.assertEqual(run_args.mcp_servers, ["filesystem", "docs"])
+        self.assertEqual(resume_args.mcp_servers, ["docs"])
+        self.assertEqual(inspect_args.mcp_servers, ["filesystem"])
+        self.assertEqual(inspect_args.project_dir, "/tmp/demo")
+
+    def test_mcp_login_command_accepts_flags(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "mcp-login",
+                "--mcp-server",
+                "notion",
+                "--timeout-seconds",
+                "120",
+                "--no-browser",
+            ]
+        )
+
+        self.assertEqual(args.mcp_server, "notion")
+        self.assertEqual(args.timeout_seconds, 120.0)
+        self.assertTrue(args.no_browser)
+
     def test_run_tui_and_ui_accept_remote_flags(self) -> None:
         run_args = build_parser().parse_args(
             [
@@ -241,6 +286,15 @@ class CliParserTests(unittest.TestCase):
     def test_resume_requires_instruction(self) -> None:
         with self.assertRaises(SystemExit):
             build_parser().parse_args(["resume", "session-123"])
+
+    def test_clone_accepts_session_id_and_common_flags(self) -> None:
+        args = build_parser().parse_args(
+            ["clone", "session-123", "--app-dir", "/tmp/app", "--locale", "zh", "--debug"]
+        )
+        self.assertEqual(args.session_id, "session-123")
+        self.assertEqual(args.app_dir, "/tmp/app")
+        self.assertEqual(args.locale, "zh")
+        self.assertTrue(args.debug)
 
     def test_apply_and_undo_commands_are_available(self) -> None:
         apply_args = build_parser().parse_args(["apply", "session-123", "--yes"])
@@ -924,8 +978,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                 self._subscriber = callback
 
             def load_session_context(self, session_id: str):  # type: ignore[no-untyped-def]
-                del session_id
-                return SimpleNamespace(id="session-copy-123")
+                return SimpleNamespace(id=str(session_id))
 
             async def run_task(self, _task: str):  # type: ignore[no-untyped-def]
                 self.latest_session_id = "session-123"
@@ -1116,6 +1169,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                             workspace_mode="staged",
                             model="fake/model",
                             root_agent_name="Demo Root",
+                            enabled_mcp_server_ids=["filesystem", "docs"],
                             sandbox_backend="none",
                         )
                     )
@@ -1127,6 +1181,7 @@ class CliRunResumePanelTests(unittest.TestCase):
                 "model": "fake/model",
                 "root_agent_name": "Demo Root",
                 "workspace_mode": "staged",
+                "enabled_mcp_server_ids": ["filesystem", "docs"],
             },
         )
         orchestrator = captured["orchestrator"]
@@ -1198,7 +1253,7 @@ class CliRunResumePanelTests(unittest.TestCase):
         self.assertEqual(orchestrator.tool_executor.sandbox_backend_cls, "backend::none")
         self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
 
-    def test_resume_passes_model_and_applies_sandbox_backend_before_load(self) -> None:
+    def test_resume_passes_model_and_applies_sandbox_backend(self) -> None:
         captured: dict[str, object] = {}
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -1220,12 +1275,6 @@ class CliRunResumePanelTests(unittest.TestCase):
                     )
                     self.diagnostics = SimpleNamespace(log=lambda **kwargs: None)
                     captured["orchestrator"] = self
-
-                def load_session_context(self, session_id: str):  # type: ignore[no-untyped-def]
-                    captured["loaded_session_id"] = session_id
-                    captured["load_backend"] = self.config.sandbox.backend
-                    captured["load_backend_cls"] = self.tool_executor.sandbox_backend_cls
-                    return SimpleNamespace(id="session-copy-123")
 
                 async def resume(self, session_id: str, instruction: str, **kwargs):  # type: ignore[no-untyped-def]
                     captured["resumed_session_id"] = session_id
@@ -1263,20 +1312,219 @@ class CliRunResumePanelTests(unittest.TestCase):
                             instruction="continue from latest status",
                             debug=False,
                             model="fake/model",
+                            enabled_mcp_server_ids=["filesystem"],
                             sandbox_backend="none",
                         )
                     )
 
-        self.assertEqual(captured["loaded_session_id"], "session-123")
-        self.assertEqual(captured["resumed_session_id"], "session-copy-123")
+        self.assertEqual(captured["resumed_session_id"], "session-123")
         self.assertEqual(captured["instruction"], "continue from latest status")
-        self.assertEqual(captured["resume_kwargs"], {"model": "fake/model"})
-        self.assertEqual(captured["load_backend"], "none")
+        self.assertEqual(
+            captured["resume_kwargs"],
+            {"model": "fake/model", "enabled_mcp_server_ids": ["filesystem"]},
+        )
         self.assertEqual(captured["resume_backend"], "none")
-        self.assertEqual(captured["load_backend_cls"], "backend::none")
         self.assertEqual(captured["resume_backend_cls"], "backend::none")
         orchestrator = captured["orchestrator"]
         self.assertIsNone(orchestrator.tool_executor._shell_backend_instance)
+
+    def test_skills_command_prints_json_and_forwards_remote_args(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    captured["init"] = {
+                        "project_dir": project_dir,
+                        "locale": locale,
+                        "app_dir": app_dir,
+                        "debug": debug,
+                    }
+
+                async def discover_skills(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["discover_kwargs"] = kwargs
+                    return [{"id": "skill-a"}]
+
+            remote_config = SimpleNamespace(remote_dir="/home/demo/workspace")
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._skills(
+                            project_dir=project_dir,
+                            app_dir=app_dir,
+                            locale="en",
+                            debug=False,
+                            remote_config=remote_config,  # type: ignore[arg-type]
+                            remote_password="secret",
+                        )
+                    )
+
+        self.assertEqual(json.loads(output.getvalue()), [{"id": "skill-a"}])
+        self.assertEqual(
+            captured["discover_kwargs"],
+            {
+                "project_dir": None,
+                "remote_config": remote_config,
+                "remote_password": "secret",
+            },
+        )
+
+    def test_mcp_servers_command_prints_json_and_cleans_up_remote_runtime(self) -> None:
+        captured: dict[str, object] = {"events": []}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+
+            class _FakeMcpManager:
+                async def inspect_servers(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["inspect_kwargs"] = kwargs
+                    return [{"id": "filesystem"}]
+
+                async def close_session(self, session_id: str) -> None:
+                    captured["closed_session_id"] = session_id
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.app_dir = app_dir
+                    self.config = SimpleNamespace(sandbox=SimpleNamespace(backend="anthropic"))
+                    self.tool_executor = SimpleNamespace(
+                        cleanup_session_remote_runtime=lambda session_id: captured.setdefault(
+                            "cleaned_session_ids", []
+                        ).append(session_id)
+                    )
+                    self.mcp_manager = _FakeMcpManager()
+                    self.diagnostics = SimpleNamespace(
+                        log=lambda **kwargs: captured["events"].append(kwargs)
+                    )
+
+                def _apply_session_remote_runtime(self, **kwargs):  # type: ignore[no-untyped-def]
+                    captured["remote_runtime_kwargs"] = kwargs
+
+            remote_config = SimpleNamespace(remote_dir="/home/demo/workspace")
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._mcp_servers(
+                            project_dir=project_dir,
+                            app_dir=app_dir,
+                            locale="en",
+                            debug=False,
+                            enabled_mcp_server_ids=["filesystem"],
+                            remote_config=remote_config,  # type: ignore[arg-type]
+                            remote_password="secret",
+                        )
+                    )
+
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered, [{"id": "filesystem"}])
+        inspect_kwargs = captured["inspect_kwargs"]
+        assert isinstance(inspect_kwargs, dict)
+        self.assertEqual(inspect_kwargs["enabled_server_ids"], ["filesystem"])
+        self.assertEqual(inspect_kwargs["workspace_path"], Path("/home/demo/workspace"))
+        self.assertTrue(inspect_kwargs["workspace_is_remote"])
+        self.assertTrue(str(captured["closed_session_id"]).startswith("mcp-inspect-"))
+        self.assertEqual(
+            captured["cleaned_session_ids"],
+            [captured["closed_session_id"]],
+        )
+
+    def test_mcp_login_command_prints_json(self) -> None:
+        captured: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                encoding="utf-8",
+            )
+
+            async def _fake_complete_mcp_oauth_login(**kwargs):  # type: ignore[no-untyped-def]
+                captured["kwargs"] = kwargs
+                return SimpleNamespace(
+                    authorization_url="https://auth.example.com/authorize?demo=1",
+                    browser_opened=False,
+                    record=SimpleNamespace(
+                        server_id="notion",
+                        authorization_server="https://auth.example.com",
+                        resource="https://mcp.notion.com/mcp",
+                        scope="",
+                        expires_at=1234.0,
+                    ),
+                )
+
+            with patch.object(cli, "complete_mcp_oauth_login", _fake_complete_mcp_oauth_login):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    asyncio.run(
+                        cli._mcp_login(
+                            app_dir=app_dir,
+                            locale="en",
+                            mcp_server_id="notion",
+                            timeout_seconds=30.0,
+                            open_browser=False,
+                        )
+                    )
+
+        rendered = json.loads(output.getvalue())
+        self.assertTrue(rendered["authorized"])
+        self.assertEqual(rendered["server_id"], "notion")
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        self.assertEqual(kwargs["server"].id, "notion")
+        self.assertFalse(kwargs["open_browser"])
+
+    def test_clone_command_calls_explicit_clone_and_prints_ids(self) -> None:
+        captured: dict[str, object] = {"events": []}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+
+            class _FakeOrchestrator:
+                def __init__(self, project_dir, locale=None, app_dir=None, debug=False):  # type: ignore[no-untyped-def]
+                    del project_dir, locale, debug
+                    self.app_dir = Path(app_dir).resolve() if app_dir is not None else Path(temp_dir).resolve()
+                    self.diagnostics = SimpleNamespace(log=lambda **kwargs: captured["events"].append(kwargs))
+
+                def clone_session(self, session_id: str):  # type: ignore[no-untyped-def]
+                    captured["cloned_from"] = session_id
+                    return SimpleNamespace(
+                        id="session-clone-456",
+                        status=SimpleNamespace(value="interrupted"),
+                    )
+
+            with patch.object(cli, "Orchestrator", _FakeOrchestrator):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    cli._clone_session(
+                        app_dir=app_dir,
+                        locale="en",
+                        session_id="session-123",
+                        debug=False,
+                    )
+
+        rendered = output.getvalue()
+        self.assertEqual(captured["cloned_from"], "session-123")
+        self.assertIn("source_session_id=session-123", rendered)
+        self.assertIn("session_id=session-clone-456", rendered)
+        self.assertIn("session_status=interrupted", rendered)
+        event_types = [str(item.get("event_type", "")) for item in captured["events"]]
+        self.assertEqual(
+            event_types,
+            ["clone_command_started", "clone_command_finished"],
+        )
 
     def test_run_tty_panel_includes_agent_fields(self) -> None:
         output = self._TTYBuffer()
@@ -1425,9 +1673,9 @@ class CliRunResumePanelTests(unittest.TestCase):
                     )
         rendered = output.getvalue()
         self.assertIn("mode=resume", rendered)
-        self.assertIn("session=session-copy-123", rendered)
+        self.assertIn("session=session-123", rendered)
         self.assertIn("Session resumed.", rendered)
-        self.assertIn("session_id=session-copy-123", rendered)
+        self.assertIn("session_id=session-123", rendered)
 
     def test_detail_lines_wrap_long_goal_and_summary(self) -> None:
         panel = cli._RunStatusPanel(

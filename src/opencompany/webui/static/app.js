@@ -42,13 +42,17 @@ const TASK_INPUT_MIN_ROWS = 1;
 const TASK_INPUT_MAX_ROWS = 8;
 const AGENT_MASONRY_MIN_COLUMN_WIDTH_PX = 360;
 const AGENT_MASONRY_COLUMN_GAP_PX = 10;
-const WORKFLOW_ACTIVITY_MAX_ENTRIES = 600;
+const WORKFLOW_ACTIVITY_MAX_ENTRIES = 2000;
+const SESSION_ACTIVITY_WINDOW_LIMIT = 200;
+const SESSION_MESSAGE_WINDOW_LIMIT = 200;
 
 const state = {
   locale: "en",
   translations: {},
   launchConfig: {
     project_dir: null,
+    project_dir_display: null,
+    project_dir_is_remote: false,
     session_id: null,
     session_mode: "direct",
     session_mode_locked: false,
@@ -66,12 +70,29 @@ const state = {
     model: "",
     keep_pinned_messages: 1,
     root_agent_name: "",
+    selected_skill_ids: [],
+    skills_state: {},
+    available_skills: [],
+    selected_mcp_server_ids: [],
+    mcp_state: {},
+    available_mcp_servers: [],
     session_status: "idle",
     summary: "",
     status_message: "",
     running: false,
     runSubmitting: false,
     project_sync_action_in_progress: false,
+  },
+  skillsUi: {
+    discovering: false,
+    expanded: false,
+    detailsExpanded: {},
+  },
+  mcpUi: {
+    discovering: false,
+    expanded: false,
+    detailsExpanded: {},
+    loginFlows: {},
   },
   sessionsDir: "",
   appDir: "",
@@ -144,6 +165,11 @@ const state = {
     entries: [],
     error: "",
   },
+  activity: {
+    beforeCursor: null,
+    hasMoreBefore: false,
+    loadingOlder: false,
+  },
   activityEntries: [],
   agents: new Map(),
   agentOrder: [],
@@ -196,7 +222,10 @@ const state = {
   },
   messages: {
     cursor: null,
+    beforeCursor: null,
+    hasMoreBefore: false,
     syncing: false,
+    loadingOlder: false,
     timer: null,
     needsSync: false,
     reloadAll: false,
@@ -208,6 +237,7 @@ const state = {
     expandedSteps: new Map(),
     preserveScrollNextRender: false,
     preservedScrollTop: null,
+    preservedScrollHeight: null,
     suppressAutoStickToBottomUntil: 0,
   },
   renderScheduled: false,
@@ -223,6 +253,43 @@ const dom = {
   modelInput: document.getElementById("model-input"),
   rootAgentNameLabel: document.getElementById("root-agent-name-label"),
   rootAgentNameInput: document.getElementById("root-agent-name-input"),
+  skillsShell: document.getElementById("skills-shell"),
+  skillsToggleButton: document.getElementById("skills-toggle-button"),
+  skillsLabel: document.getElementById("skills-label"),
+  skillsSummary: document.getElementById("skills-summary"),
+  skillsToggleState: document.getElementById("skills-toggle-state"),
+  skillsPanelBody: document.getElementById("skills-panel-body"),
+  skillsOverviewTitle: document.getElementById("skills-overview-title"),
+  skillsSelectedTitle: document.getElementById("skills-selected-title"),
+  skillsCatalogTitle: document.getElementById("skills-catalog-title"),
+  skillsWarningsTitle: document.getElementById("skills-warnings-title"),
+  skillsOverview: document.getElementById("skills-overview"),
+  skillsInput: document.getElementById("skills-input"),
+  skillsDiscoverButton: document.getElementById("skills-discover-button"),
+  skillsSelectAllButton: document.getElementById("skills-select-all-button"),
+  skillsClearButton: document.getElementById("skills-clear-button"),
+  skillsSelected: document.getElementById("skills-selected"),
+  skillsList: document.getElementById("skills-list"),
+  skillsWarnings: document.getElementById("skills-warnings"),
+  mcpShell: document.getElementById("mcp-shell"),
+  mcpToggleButton: document.getElementById("mcp-toggle-button"),
+  mcpLabel: document.getElementById("mcp-label"),
+  mcpSummary: document.getElementById("mcp-summary"),
+  mcpToggleState: document.getElementById("mcp-toggle-state"),
+  mcpPanelBody: document.getElementById("mcp-panel-body"),
+  mcpOverviewTitle: document.getElementById("mcp-overview-title"),
+  mcpSelectedTitle: document.getElementById("mcp-selected-title"),
+  mcpCatalogTitle: document.getElementById("mcp-catalog-title"),
+  mcpWarningsTitle: document.getElementById("mcp-warnings-title"),
+  mcpInput: document.getElementById("mcp-input"),
+  mcpDiscoverButton: document.getElementById("mcp-discover-button"),
+  mcpUseDefaultsButton: document.getElementById("mcp-use-defaults-button"),
+  mcpSelectAllButton: document.getElementById("mcp-select-all-button"),
+  mcpClearButton: document.getElementById("mcp-clear-button"),
+  mcpInsight: document.getElementById("mcp-insight"),
+  mcpSelected: document.getElementById("mcp-selected"),
+  mcpList: document.getElementById("mcp-list"),
+  mcpWarnings: document.getElementById("mcp-warnings"),
   runButton: document.getElementById("run-button"),
   terminalButton: document.getElementById("terminal-button"),
   setupButton: document.getElementById("setup-button"),
@@ -355,6 +422,1043 @@ function t(key) {
   return state.translations[key] || key;
 }
 
+function normalizeSkillIdsFromText(text) {
+  const parts = String(text || "")
+    .split(/[\s,]+/)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(parts)];
+}
+
+function selectedSkillIds() {
+  return Array.isArray(state.runtime.selected_skill_ids)
+    ? state.runtime.selected_skill_ids.filter((item) => String(item || "").trim())
+    : [];
+}
+
+function skillsInputValue() {
+  return selectedSkillIds().join(", ");
+}
+
+function syncSkillsInputValue({ force = false } = {}) {
+  if (!dom.skillsInput) {
+    return;
+  }
+  if (!force && document.activeElement === dom.skillsInput) {
+    return;
+  }
+  const nextSkillsValue = skillsInputValue();
+  if (dom.skillsInput.value !== nextSkillsValue) {
+    dom.skillsInput.value = nextSkillsValue;
+  }
+}
+
+function setSelectedSkillIds(nextIds, { syncInput = false } = {}) {
+  const normalized = Array.isArray(nextIds)
+    ? normalizeSkillIdsFromText(nextIds.join(","))
+    : normalizeSkillIdsFromText(nextIds);
+  state.runtime.selected_skill_ids = normalized;
+  if (syncInput) {
+    syncSkillsInputValue({ force: true });
+  }
+  scheduleRender();
+}
+
+function isSkillDetailExpanded(skillId) {
+  const normalizedId = String(skillId || "").trim();
+  if (!normalizedId) {
+    return false;
+  }
+  return truthyFlag(state.skillsUi?.detailsExpanded?.[normalizedId]);
+}
+
+function setSkillDetailExpanded(skillId, expanded) {
+  const normalizedId = String(skillId || "").trim();
+  if (!normalizedId) {
+    return;
+  }
+  state.skillsUi.detailsExpanded = {
+    ...(state.skillsUi.detailsExpanded || {}),
+    [normalizedId]: Boolean(expanded),
+  };
+}
+
+function toggleSkillDetailExpanded(skillId) {
+  setSkillDetailExpanded(skillId, !isSkillDetailExpanded(skillId));
+  scheduleRender();
+}
+
+function currentSkillsState() {
+  return state.runtime.skills_state && typeof state.runtime.skills_state === "object"
+    ? state.runtime.skills_state
+    : {};
+}
+
+function currentSkillEntries() {
+  const entries = currentSkillsState().entries;
+  return Array.isArray(entries)
+    ? entries.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function normalizeMcpServerIdsFromText(text) {
+  const parts = String(text || "")
+    .split(/[\s,]+/)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(parts)];
+}
+
+function selectedMcpServerIds() {
+  return Array.isArray(state.runtime.selected_mcp_server_ids)
+    ? state.runtime.selected_mcp_server_ids.filter((item) => String(item || "").trim())
+    : [];
+}
+
+function mcpInputValue() {
+  return selectedMcpServerIds().join(", ");
+}
+
+function syncMcpInputValue({ force = false } = {}) {
+  if (!dom.mcpInput) {
+    return;
+  }
+  if (!force && document.activeElement === dom.mcpInput) {
+    return;
+  }
+  const nextValue = mcpInputValue();
+  if (dom.mcpInput.value !== nextValue) {
+    dom.mcpInput.value = nextValue;
+  }
+}
+
+function setSelectedMcpServerIds(nextIds, { syncInput = false } = {}) {
+  const normalized = Array.isArray(nextIds)
+    ? normalizeMcpServerIdsFromText(nextIds.join(","))
+    : normalizeMcpServerIdsFromText(nextIds);
+  state.runtime.selected_mcp_server_ids = normalized;
+  if (syncInput) {
+    syncMcpInputValue({ force: true });
+  }
+  scheduleRender();
+}
+
+function isMcpDetailExpanded(serverId) {
+  const normalizedId = String(serverId || "").trim();
+  if (!normalizedId) {
+    return false;
+  }
+  return truthyFlag(state.mcpUi?.detailsExpanded?.[normalizedId]);
+}
+
+function setMcpDetailExpanded(serverId, expanded) {
+  const normalizedId = String(serverId || "").trim();
+  if (!normalizedId) {
+    return;
+  }
+  state.mcpUi.detailsExpanded = {
+    ...(state.mcpUi.detailsExpanded || {}),
+    [normalizedId]: Boolean(expanded),
+  };
+}
+
+function toggleMcpDetailExpanded(serverId) {
+  setMcpDetailExpanded(serverId, !isMcpDetailExpanded(serverId));
+  scheduleRender();
+}
+
+function currentMcpState() {
+  return state.runtime.mcp_state && typeof state.runtime.mcp_state === "object"
+    ? state.runtime.mcp_state
+    : {};
+}
+
+function currentMcpEntries() {
+  const entries = currentMcpState().entries;
+  return Array.isArray(entries)
+    ? entries.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function availableMcpServers() {
+  return Array.isArray(state.runtime.available_mcp_servers)
+    ? state.runtime.available_mcp_servers.filter((item) => item && typeof item === "object")
+    : [];
+}
+
+function truthyFlag(value) {
+  return value === true || String(value) === "true";
+}
+
+function mergedMcpServerCatalog() {
+  const catalog = new Map();
+  availableMcpServers().forEach((server) => {
+    const serverId = String(server.id || "").trim();
+    if (!serverId) {
+      return;
+    }
+    catalog.set(serverId, {
+      ...server,
+      config_enabled: truthyFlag(server.enabled),
+      discovered: true,
+    });
+  });
+  currentMcpEntries().forEach((entry) => {
+    const serverId = String(entry.id || "").trim();
+    if (!serverId) {
+      return;
+    }
+    const current = catalog.get(serverId) || {};
+    catalog.set(serverId, {
+      ...current,
+      ...entry,
+      id: serverId,
+      config_enabled:
+        typeof current.config_enabled === "boolean" ? current.config_enabled : undefined,
+      session_enabled: truthyFlag(entry.enabled),
+      discovered: Boolean(current.discovered),
+      materialized: true,
+    });
+  });
+  return [...catalog.values()].sort((left, right) =>
+    String(left.id || "").localeCompare(String(right.id || ""))
+  );
+}
+
+function configDefaultMcpServerIds(catalog = mergedMcpServerCatalog()) {
+  return catalog
+    .filter((server) => typeof server?.config_enabled === "boolean" && server.config_enabled)
+    .map((server) => String(server.id || "").trim())
+    .filter(Boolean);
+}
+
+function nonNegativeCount(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(parsed));
+}
+
+function mcpToolCount(server) {
+  const explicitCount = nonNegativeCount(server?.tool_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const runtimeItems = mcpRuntimeToolItems(server);
+  if (runtimeItems.length > 0) {
+    return runtimeItems.length;
+  }
+  if (Array.isArray(server?.tools)) {
+    return server.tools.filter((item) => item && typeof item === "object").length;
+  }
+  return 0;
+}
+
+function mcpResourceCount(server) {
+  const explicitCount = nonNegativeCount(server?.resource_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const runtimeItems = mcpRuntimeResourceItems(server);
+  if (runtimeItems.length > 0) {
+    return runtimeItems.length;
+  }
+  if (Array.isArray(server?.resources)) {
+    return server.resources.filter((item) => item && typeof item === "object").length;
+  }
+  return 0;
+}
+
+function mcpConnectedCount(entries = currentMcpEntries()) {
+  return entries.filter((entry) => truthyFlag(entry?.connected)).length;
+}
+
+function totalMcpToolCount(entries = currentMcpEntries()) {
+  return entries.reduce((total, entry) => total + mcpToolCount(entry), 0);
+}
+
+function totalMcpResourceCount(entries = currentMcpEntries()) {
+  return entries.reduce((total, entry) => total + mcpResourceCount(entry), 0);
+}
+
+function sameIdSet(leftValues, rightValues) {
+  const left = [...new Set((Array.isArray(leftValues) ? leftValues : []).map((item) => String(item || "").trim()).filter(Boolean))].sort();
+  const right = [...new Set((Array.isArray(rightValues) ? rightValues : []).map((item) => String(item || "").trim()).filter(Boolean))].sort();
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every((value, index) => value === right[index]);
+}
+
+function uniqueTextValues(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  const seen = new Set();
+  const normalized = [];
+  for (const item of values) {
+    const text = String(item || "").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    normalized.push(text);
+  }
+  return normalized;
+}
+
+function mcpConfigStateText(server) {
+  if (typeof server?.config_enabled !== "boolean") {
+    return t("unset_value");
+  }
+  return server.config_enabled ? t("mcp_config_enabled") : t("mcp_config_disabled");
+}
+
+function mcpEndpointLabel(server) {
+  return String(server?.transport || "").trim() === "stdio"
+    ? t("mcp_command_label")
+    : t("mcp_endpoint_label");
+}
+
+function mcpEndpointValue(server) {
+  if (!server || typeof server !== "object") {
+    return "";
+  }
+  const transport = String(server.transport || "").trim();
+  if (transport === "stdio") {
+    const command = String(server.command || "").trim();
+    const args = Array.isArray(server.args)
+      ? server.args.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    return [command, ...args].filter(Boolean).join(" ");
+  }
+  return String(server.url || "").trim();
+}
+
+function mcpRootsPolicyText(server) {
+  if (!server || typeof server !== "object") {
+    return t("unset_value");
+  }
+  if (server.expose_roots === true || String(server.expose_roots) === "true") {
+    return t("mcp_roots_on");
+  }
+  if (server.expose_roots === false || String(server.expose_roots) === "false") {
+    return t("mcp_roots_off");
+  }
+  return t("mcp_roots_auto");
+}
+
+function mcpRootsRuntimeText(server) {
+  if (!server || typeof server !== "object" || !server.materialized) {
+    return t("mcp_pending_materialization");
+  }
+  return truthyFlag(server.roots_enabled) ? t("mcp_roots_exposed") : t("mcp_roots_not_exposed");
+}
+
+function mcpAllowedToolsText(server) {
+  const allowedTools = uniqueTextValues(server?.allowed_tools);
+  return allowedTools.length ? allowedTools.join(", ") : t("mcp_allowed_tools_all");
+}
+
+function mcpRuntimeToolItems(server) {
+  const runtimeItems = [];
+  const seen = new Set();
+  if (Array.isArray(server?.tool_items)) {
+    for (const item of server.tool_items) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const toolName = String(item.tool_name || "").trim();
+      const title = String(item.title || "").trim();
+      const syntheticName = String(item.synthetic_name || "").trim();
+      const description = String(item.description || "").trim();
+      const label = toolName || title || syntheticName;
+      if (!label || seen.has(label)) {
+        continue;
+      }
+      seen.add(label);
+      runtimeItems.push({
+        label,
+        tool_name: toolName,
+        title,
+        synthetic_name: syntheticName,
+        description,
+      });
+    }
+  }
+  if (runtimeItems.length) {
+    return runtimeItems;
+  }
+  const names = uniqueTextValues(server?.tool_names);
+  for (const name of names) {
+    if (seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    runtimeItems.push({
+      label: name,
+      tool_name: name,
+      title: "",
+      synthetic_name: "",
+      description: "",
+    });
+  }
+  return runtimeItems;
+}
+
+function mcpRuntimeResourceItems(server) {
+  const runtimeItems = [];
+  const seen = new Set();
+  if (Array.isArray(server?.resource_items)) {
+    for (const item of server.resource_items) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const uri = String(item.uri || "").trim();
+      const name = String(item.name || "").trim();
+      const title = String(item.title || "").trim();
+      const description = String(item.description || "").trim();
+      const mimeType = String(item.mime_type || "").trim();
+      const label = title || name || uri;
+      if (!label || seen.has(label)) {
+        continue;
+      }
+      seen.add(label);
+      runtimeItems.push({
+        label,
+        uri,
+        name,
+        title,
+        description,
+        mime_type: mimeType,
+      });
+    }
+  }
+  if (runtimeItems.length) {
+    return runtimeItems;
+  }
+  const names = uniqueTextValues(server?.resource_names);
+  const uris = uniqueTextValues(server?.resource_uris);
+  const fallbackRefs = names.length ? names : uris;
+  for (const ref of fallbackRefs) {
+    if (seen.has(ref)) {
+      continue;
+    }
+    seen.add(ref);
+    runtimeItems.push({
+      label: ref,
+      uri: uris.includes(ref) ? ref : "",
+      name: "",
+      title: "",
+      description: "",
+      mime_type: "",
+    });
+  }
+  return runtimeItems;
+}
+
+function mcpToolHoverText(toolItem) {
+  const description = String(toolItem?.description || "").trim();
+  if (description) {
+    return description;
+  }
+  const title = String(toolItem?.title || "").trim();
+  if (title) {
+    return title;
+  }
+  return t("mcp_definition_unavailable");
+}
+
+function mcpResourceHoverText(resourceItem) {
+  const description = String(resourceItem?.description || "").trim();
+  if (description) {
+    return description;
+  }
+  const parts = [];
+  const uri = String(resourceItem?.uri || "").trim();
+  if (uri) {
+    parts.push(uri);
+  }
+  const mimeType = String(resourceItem?.mime_type || "").trim();
+  if (mimeType) {
+    parts.push(mimeType);
+  }
+  if (parts.length) {
+    return parts.join(" · ");
+  }
+  return t("mcp_definition_unavailable");
+}
+
+function renderMcpStructurePills(items, hoverTextFn) {
+  if (!items.length) {
+    return escapeHtml(t("none_value"));
+  }
+  return `<div class="structure-pill-row">${items
+    .map((item) => {
+      const label = String(item?.label || "").trim();
+      if (!label) {
+        return "";
+      }
+      const hover = String(hoverTextFn(item) || "").trim() || t("mcp_definition_unavailable");
+      return `<span class="structure-pill" title="${escapeHtml(hover)}">${escapeHtml(label)}</span>`;
+    })
+    .join("")}</div>`;
+}
+
+function skillFileRelativePaths(skill) {
+  if (!skill || typeof skill !== "object" || !Array.isArray(skill.files)) {
+    return [];
+  }
+  return uniqueTextValues(
+    skill.files.map((file) => (file && typeof file === "object" ? file.relative_path : ""))
+  );
+}
+
+function skillResourceCount(skill) {
+  const explicitCount = nonNegativeCount(skill?.resource_count);
+  if (explicitCount > 0) {
+    return explicitCount;
+  }
+  const files = skillFileRelativePaths(skill);
+  if (files.length > 0) {
+    return files.length;
+  }
+  return 0;
+}
+
+function skillPathsBySegment(paths, segment) {
+  const needle = String(segment || "").trim();
+  if (!needle) {
+    return [];
+  }
+  return uniqueTextValues(
+    paths.filter((path) => {
+      const normalized = String(path || "").trim();
+      if (!normalized) {
+        return false;
+      }
+      return normalized === needle || normalized.startsWith(`${needle}/`) || normalized.includes(`/${needle}/`);
+    })
+  );
+}
+
+function skillDocPaths(skill) {
+  return uniqueTextValues([skill?.main_doc_path, skill?.localized_doc_path]);
+}
+
+function skillStructureRows(skill) {
+  const rows = [];
+  const docs = skillDocPaths(skill);
+  if (docs.length) {
+    rows.push([t("docs_label"), docs.join(", ")]);
+  }
+  const files = skillFileRelativePaths(skill);
+  if (files.length) {
+    rows.push([t("files_label"), String(files.length)]);
+    const scripts = skillPathsBySegment(files, "scripts");
+    if (scripts.length) {
+      rows.push([t("scripts_label"), scripts.join(", ")]);
+    }
+    const assets = skillPathsBySegment(files, "assets");
+    if (assets.length) {
+      rows.push([t("assets_label"), assets.join(", ")]);
+    }
+  } else {
+    const resourceHint = skillResourceCount(skill);
+    if (resourceHint > 0) {
+      rows.push([t("files_label"), String(resourceHint)]);
+    }
+  }
+  if (!rows.length) {
+    rows.push([t("structure_label"), t("skills_structure_unavailable")]);
+  }
+  return rows;
+}
+
+function mcpStructureRows(server) {
+  const rows = [];
+  const toolItems = mcpRuntimeToolItems(server);
+  const resourceItems = mcpRuntimeResourceItems(server);
+  const toolCount = mcpToolCount(server);
+  const resourceCount = mcpResourceCount(server);
+  const toolsValueHtml = toolItems.length
+    ? renderMcpStructurePills(toolItems, mcpToolHoverText)
+    : escapeHtml(toolCount > 0 ? String(toolCount) : mcpAllowedToolsText(server));
+  const resourcesValueHtml = resourceItems.length
+    ? renderMcpStructurePills(resourceItems, mcpResourceHoverText)
+    : escapeHtml(resourceCount > 0 ? String(resourceCount) : t("none_value"));
+  rows.push([t("tools_label"), toolsValueHtml, true]);
+  rows.push([t("resources_label"), resourcesValueHtml, true]);
+  return rows;
+}
+
+function mcpTimeoutText(server) {
+  const timeoutSeconds = Number(server?.timeout_seconds || 0);
+  return timeoutSeconds > 0 ? `${timeoutSeconds}s` : t("unset_value");
+}
+
+function mcpAuthStateText(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return t("none_value");
+  }
+  if (truthyFlag(server.oauth_login_pending)) {
+    return t("mcp_oauth_pending");
+  }
+  if (truthyFlag(server.oauth_authorized)) {
+    return t("mcp_oauth_authorized");
+  }
+  return t("mcp_oauth_required");
+}
+
+function mcpOauthScopeText(server) {
+  const scope = String(server?.oauth_scope || "").trim();
+  return scope || t("none_value");
+}
+
+function mcpOauthExpiresText(server) {
+  const expiresAtSeconds = Number(server?.oauth_expires_at || 0);
+  if (!Number.isFinite(expiresAtSeconds) || expiresAtSeconds <= 0) {
+    return t("unset_value");
+  }
+  const timestamp = new Date(expiresAtSeconds * 1000);
+  if (Number.isNaN(timestamp.getTime())) {
+    return t("unset_value");
+  }
+  return `${timestamp.getFullYear()}-${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(
+    timestamp.getDate()
+  ).padStart(2, "0")} ${String(timestamp.getHours()).padStart(2, "0")}:${String(
+    timestamp.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
+function mcpOauthButtonText(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return "";
+  }
+  if (truthyFlag(server.oauth_login_pending)) {
+    return t("mcp_oauth_continue");
+  }
+  return truthyFlag(server.oauth_authorized) ? t("mcp_oauth_relogin") : t("mcp_oauth_login");
+}
+
+function canClearMcpOauth(server) {
+  if (!server || typeof server !== "object" || !truthyFlag(server.oauth_enabled)) {
+    return false;
+  }
+  return truthyFlag(server.oauth_authorized) || truthyFlag(server.oauth_login_pending);
+}
+
+function mcpEnvAuthKeys(server) {
+  if (!server || typeof server !== "object" || !Array.isArray(server.env_auth_keys)) {
+    return [];
+  }
+  return server.env_auth_keys
+    .map((item) => String(item || "").trim())
+    .filter((item) => item.length > 0);
+}
+
+function hasMcpEnvAuth(server) {
+  return truthyFlag(server?.env_auth_required) || mcpEnvAuthKeys(server).length > 0;
+}
+
+function mcpEnvAuthConfigured(server) {
+  return truthyFlag(server?.env_auth_configured);
+}
+
+function mcpEnvAuthStateText(server) {
+  if (!hasMcpEnvAuth(server)) {
+    return t("none_value");
+  }
+  return mcpEnvAuthConfigured(server) ? t("mcp_env_auth_configured") : t("mcp_env_auth_required");
+}
+
+function mcpSessionStateText(server) {
+  if (!server || typeof server !== "object" || !server.materialized) {
+    return t("mcp_pending_materialization");
+  }
+  const parts = [truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected")];
+  const protocolVersion = String(server.protocol_version || "").trim();
+  if (protocolVersion) {
+    parts.push(protocolVersion);
+  }
+  return parts.join(" · ");
+}
+
+function renderSelectorOverview(container, cards, note = "") {
+  if (!container) {
+    return;
+  }
+  const safeCards = Array.isArray(cards) ? cards : [];
+  const safeNote = String(note || "").trim();
+  container.innerHTML = `
+    <div class="selector-overview-grid">
+      ${safeCards
+        .map(
+          (card) => `
+            <div class="selector-overview-card">
+              <div class="selector-overview-label">${escapeHtml(String(card.label || ""))}</div>
+              <div class="selector-overview-value">${escapeHtml(String(card.value || "0"))}</div>
+              <div class="selector-overview-sub">${escapeHtml(String(card.sub || t("none_value")))}</div>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+    ${safeNote ? `<div class="selector-overview-note">${escapeHtml(safeNote)}</div>` : ""}
+  `;
+}
+
+function renderSkillsOverview(catalog) {
+  if (!dom.skillsOverview) {
+    return;
+  }
+  const warnings = Array.isArray(currentSkillsState().warnings) ? currentSkillsState().warnings : [];
+  const selectedCount = selectedSkillIds().length;
+  const materializedCount = currentSkillEntries().length;
+  const cards = [
+    {
+      label: t("skills_selected_label"),
+      value: String(selectedCount),
+      sub: selectedCount ? t("selected_items_label") : t("none_value"),
+    },
+    {
+      label: t("skills_catalog_label"),
+      value: String(catalog.length),
+      sub: materializedCount
+        ? `${materializedCount} ${t("skills_active_label")}`
+        : t("mcp_pending_materialization"),
+    },
+    {
+      label: t("skills_warnings_label"),
+      value: String(warnings.length),
+      sub: warnings.length ? t("mcp_help_warning") : t("none_value"),
+    },
+  ];
+
+  let note = "";
+  if (!catalog.length) {
+    note = t("skills_catalog_empty");
+  } else if (!selectedCount) {
+    note = t("skills_selected_empty");
+  } else if (warnings.length) {
+    note = t("mcp_help_warning");
+  } else if (!materializedCount) {
+    note = t("mcp_help_materialize");
+  } else {
+    note = t("ready");
+  }
+  renderSelectorOverview(dom.skillsOverview, cards, note);
+}
+
+function renderMcpInsight(catalog) {
+  if (!dom.mcpInsight) {
+    return;
+  }
+  const selectedIds = selectedMcpServerIds();
+  const defaultIds = configDefaultMcpServerIds(catalog);
+  const entries = currentMcpEntries();
+  const summaryEntries = entries.length ? entries : catalog;
+  const hasMaterialized = summaryEntries.some((entry) => truthyFlag(entry?.materialized));
+  const warnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  const cards = [
+    {
+      label: t("mcp_selected_label"),
+      value: String(selectedIds.length),
+      sub: selectedIds.length ? shortDisplayText(selectedIds.join(", "), 52) : t("none_value"),
+    },
+    {
+      label: t("mcp_connected_count_label"),
+      value: String(mcpConnectedCount(summaryEntries)),
+      sub: hasMaterialized ? t("mcp_materialized") : t("mcp_pending_materialization"),
+    },
+    {
+      label: t("mcp_warnings_label"),
+      value: String(warnings.length),
+      sub: warnings.length ? t("mcp_help_warning") : t("none_value"),
+    },
+  ];
+
+  let note = "";
+  if (!catalog.length) {
+    note = t("mcp_help_empty_catalog");
+  } else if (!selectedIds.length && defaultIds.length) {
+    note = t("mcp_help_use_defaults");
+  } else if (!selectedIds.length) {
+    note = t("mcp_help_manual_selection");
+  } else if (warnings.length) {
+    note = t("mcp_help_warning");
+  } else if (!hasMaterialized) {
+    note = t("mcp_help_materialize");
+  } else if (defaultIds.length && !sameIdSet(selectedIds, defaultIds)) {
+    note = t("mcp_help_manual_override");
+  } else {
+    note = t("mcp_help_defaults_active");
+  }
+
+  renderSelectorOverview(dom.mcpInsight, cards, note);
+}
+
+function openMcpOauthPopup(authorizationUrl, existingPopup = null) {
+  const normalizedUrl = String(authorizationUrl || "").trim();
+  if (!normalizedUrl) {
+    return existingPopup;
+  }
+  let popup = existingPopup;
+  if (!popup || popup.closed) {
+    try {
+      popup = window.open("", "_blank");
+    } catch (_error) {
+      popup = null;
+    }
+  }
+  if (popup && !popup.closed) {
+    popup.location.href = normalizedUrl;
+    popup.focus();
+    return popup;
+  }
+  window.open(normalizedUrl, "_blank");
+  return null;
+}
+
+function seedMcpOauthPopup(popup) {
+  if (!popup || popup.closed) {
+    return;
+  }
+  try {
+    const doc = popup.document;
+    if (!doc) {
+      return;
+    }
+    doc.open();
+    doc.write(
+      "<!doctype html><html><head><meta charset='utf-8'><title>OpenCompany MCP Login</title></head>" +
+        "<body><p>Preparing OAuth login...</p></body></html>"
+    );
+    doc.close();
+  } catch (_error) {
+    // Ignore cross-origin and popup write failures; redirect will still be attempted.
+  }
+}
+
+function ensureMcpOauthFlowPolling(flowId) {
+  const flow = state.mcpUi.loginFlows[flowId];
+  if (!flow || flow.polling) {
+    return;
+  }
+  flow.polling = true;
+  void pollMcpOauthFlow(flowId)
+    .catch((error) => {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    })
+    .finally(() => {
+      const currentFlow = state.mcpUi.loginFlows[flowId];
+      if (currentFlow) {
+        currentFlow.polling = false;
+      }
+    });
+}
+
+function mergeSkillCatalogRecord(current, rawSkill, flags = {}) {
+  const skill = rawSkill && typeof rawSkill === "object" ? rawSkill : {};
+  const normalizedTags = Array.isArray(skill.tags)
+    ? skill.tags
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    : Array.isArray(current?.tags)
+      ? current.tags
+      : [];
+  return {
+    ...(current || {}),
+    ...skill,
+    tags: normalizedTags,
+    discovered: Boolean((current && current.discovered) || flags.discovered),
+    materialized: Boolean((current && current.materialized) || flags.materialized),
+  };
+}
+
+function mergedSkillCatalog() {
+  const catalog = new Map();
+  const append = (rawSkill, flags = {}) => {
+    if (!rawSkill || typeof rawSkill !== "object") {
+      return;
+    }
+    const skillId = String(rawSkill.id || "").trim();
+    if (!skillId) {
+      return;
+    }
+    const current = catalog.get(skillId);
+    catalog.set(skillId, mergeSkillCatalogRecord(current, rawSkill, flags));
+  };
+
+  currentSkillEntries().forEach((item) => append(item, { materialized: true }));
+  const availableSkills = Array.isArray(state.runtime.available_skills)
+    ? state.runtime.available_skills
+    : [];
+  availableSkills.forEach((item) => append(item, { discovered: true }));
+
+  return [...catalog.values()].sort((left, right) =>
+    String(left.id || "").localeCompare(String(right.id || ""))
+  );
+}
+
+function skillDisplayName(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const localizedName = state.locale === "zh" ? skill.name_cn : skill.name;
+  return String(localizedName || skill.name || skill.id || "").trim();
+}
+
+function skillDescription(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const localizedDescription = state.locale === "zh" ? skill.description_cn : skill.description;
+  return String(localizedDescription || skill.description || "").trim();
+}
+
+function skillPreferredDocPath(skill) {
+  if (!skill || typeof skill !== "object") {
+    return "";
+  }
+  const candidates =
+    state.locale === "zh"
+      ? [
+          skill.localized_doc_project_path,
+          skill.main_doc_project_path,
+          skill.localized_doc_path,
+          skill.main_doc_path,
+        ]
+      : [
+          skill.main_doc_project_path,
+          skill.localized_doc_project_path,
+          skill.main_doc_path,
+          skill.localized_doc_path,
+        ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function skillSourceLabel(skill) {
+  const sourceType = String(skill?.source_type || "").trim().toLowerCase();
+  if (sourceType === "project") {
+    return t("skills_source_project");
+  }
+  if (sourceType === "global") {
+    return t("skills_source_global");
+  }
+  return sourceType || "";
+}
+
+function skillWarningMessage(warning) {
+  if (!warning || typeof warning !== "object") {
+    return "";
+  }
+  if (state.locale === "zh") {
+    return String(warning.message_cn || warning.message || "").trim();
+  }
+  return String(warning.message || warning.message_cn || "").trim();
+}
+
+function currentSkillWarningIds() {
+  const warnings = Array.isArray(currentSkillsState().warnings) ? currentSkillsState().warnings : [];
+  return new Set(
+    warnings
+      .map((warning) => String(warning?.skill_id || "").trim())
+      .filter((skillId) => skillId.length > 0)
+  );
+}
+
+function currentMcpWarningIds() {
+  const warnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  return new Set(
+    warnings
+      .map((warning) => String(warning?.server_id || "").trim())
+      .filter((serverId) => serverId.length > 0)
+  );
+}
+
+function sortedSkillCatalog(catalog) {
+  const items = Array.isArray(catalog) ? [...catalog] : [];
+  const selected = new Set(selectedSkillIds());
+  const warningIds = currentSkillWarningIds();
+  return items.sort((left, right) => {
+    const leftId = String(left?.id || "").trim();
+    const rightId = String(right?.id || "").trim();
+    const leftTuple = [
+      selected.has(leftId) ? 0 : 1,
+      warningIds.has(leftId) ? 0 : 1,
+      truthyFlag(left?.materialized) ? 0 : truthyFlag(left?.discovered) ? 1 : 2,
+      String(skillDisplayName(left) || leftId).toLowerCase(),
+      leftId,
+    ];
+    const rightTuple = [
+      selected.has(rightId) ? 0 : 1,
+      warningIds.has(rightId) ? 0 : 1,
+      truthyFlag(right?.materialized) ? 0 : truthyFlag(right?.discovered) ? 1 : 2,
+      String(skillDisplayName(right) || rightId).toLowerCase(),
+      rightId,
+    ];
+    for (let index = 0; index < leftTuple.length; index += 1) {
+      if (leftTuple[index] < rightTuple[index]) return -1;
+      if (leftTuple[index] > rightTuple[index]) return 1;
+    }
+    return 0;
+  });
+}
+
+function mcpServerHasWarning(server, warningIds = currentMcpWarningIds()) {
+  const serverId = String(server?.id || "").trim();
+  if (!serverId) {
+    return false;
+  }
+  if (warningIds.has(serverId)) {
+    return true;
+  }
+  const inlineWarning = String(server?.warning || "").trim();
+  return inlineWarning.length > 0;
+}
+
+function sortedMcpServerCatalog(catalog) {
+  const items = Array.isArray(catalog) ? [...catalog] : [];
+  const selected = new Set(selectedMcpServerIds());
+  const warningIds = currentMcpWarningIds();
+  return items.sort((left, right) => {
+    const leftId = String(left?.id || "").trim();
+    const rightId = String(right?.id || "").trim();
+    const leftMaterialized = truthyFlag(left?.materialized);
+    const rightMaterialized = truthyFlag(right?.materialized);
+    const leftConnected = leftMaterialized && truthyFlag(left?.connected);
+    const rightConnected = rightMaterialized && truthyFlag(right?.connected);
+    const leftTuple = [
+      selected.has(leftId) ? 0 : 1,
+      mcpServerHasWarning(left, warningIds) ? 0 : 1,
+      leftConnected ? 0 : leftMaterialized ? 1 : 2,
+      String(left?.title || leftId).toLowerCase(),
+      leftId,
+    ];
+    const rightTuple = [
+      selected.has(rightId) ? 0 : 1,
+      mcpServerHasWarning(right, warningIds) ? 0 : 1,
+      rightConnected ? 0 : rightMaterialized ? 1 : 2,
+      String(right?.title || rightId).toLowerCase(),
+      rightId,
+    ];
+    for (let index = 0; index < leftTuple.length; index += 1) {
+      if (leftTuple[index] < rightTuple[index]) return -1;
+      if (leftTuple[index] > rightTuple[index]) return 1;
+    }
+    return 0;
+  });
+}
+
 function scheduleRender() {
   if (state.renderScheduled) {
     return;
@@ -411,6 +1515,12 @@ async function fetchJson(path, options = {}) {
     throw new Error(message);
   }
   return payload;
+}
+
+function waitMs(delayMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+  });
 }
 
 async function bootstrap() {
@@ -483,11 +1593,17 @@ function applySnapshot(payload) {
 }
 
 function resetRuntimeViews() {
+  state.activity.beforeCursor = null;
+  state.activity.hasMoreBefore = false;
+  state.activity.loadingOlder = false;
   state.activityEntries = [];
   state.agents.clear();
   state.agentOrder = [];
   state.messages.cursor = null;
+  state.messages.beforeCursor = null;
+  state.messages.hasMoreBefore = false;
   state.messages.syncing = false;
+  state.messages.loadingOlder = false;
   if (state.messages.timer !== null) {
     window.clearTimeout(state.messages.timer);
     state.messages.timer = null;
@@ -497,6 +1613,7 @@ function resetRuntimeViews() {
   state.agentPanel.expandedSteps.clear();
   state.agentPanel.preserveScrollNextRender = false;
   state.agentPanel.preservedScrollTop = null;
+  state.agentPanel.preservedScrollHeight = null;
   state.agentPanel.suppressAutoStickToBottomUntil = 0;
   if (state.agentPanel.deferredTimer !== null) {
     window.clearTimeout(state.agentPanel.deferredTimer);
@@ -657,6 +1774,19 @@ function remoteWorkspaceLabel() {
     return t("unset_value");
   }
   return `${remote.ssh_target}:${remote.remote_dir}`;
+}
+
+function displayProjectDirLabel() {
+  const raw = String(
+    state.launchConfig.project_dir_display || state.launchConfig.project_dir || ""
+  ).trim();
+  if (!raw) {
+    return t("unset_value");
+  }
+  if (state.launchConfig.project_dir_is_remote) {
+    return `${raw} (${t("remote_short")})`;
+  }
+  return raw;
 }
 
 function syncRemoteDraftFromLaunch() {
@@ -2147,6 +3277,9 @@ function updateToolRunDetailSnapshot(toolRunId) {
     if (nextSnapshot.result === undefined && existingSnapshot.result !== undefined) {
       nextSnapshot.result = existingSnapshot.result;
     }
+    if (!Array.isArray(nextSnapshot.timeline) && Array.isArray(existingSnapshot.timeline)) {
+      nextSnapshot.timeline = existingSnapshot.timeline;
+    }
   }
   state.toolRuns.detail.runSnapshot = nextSnapshot;
 }
@@ -2345,6 +3478,38 @@ function appendActivity(record) {
   markWorkflowActivityDirty();
 }
 
+function replaceActivityEntries(records) {
+  if (!Array.isArray(records)) {
+    state.activityEntries = [];
+    markWorkflowActivityDirty({ full: true });
+    return;
+  }
+  state.activityEntries = records
+    .filter((record) => record && !STREAM_SKIP_ACTIVITY.has(String(record.event_type || "")))
+    .map((record) => formatActivity(record));
+  if (state.activityEntries.length > WORKFLOW_ACTIVITY_MAX_ENTRIES) {
+    state.activityEntries = state.activityEntries.slice(-WORKFLOW_ACTIVITY_MAX_ENTRIES);
+  }
+  markWorkflowActivityDirty({ full: true });
+}
+
+function prependActivityEntries(records) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return;
+  }
+  const rendered = records
+    .filter((record) => record && !STREAM_SKIP_ACTIVITY.has(String(record.event_type || "")))
+    .map((record) => formatActivity(record));
+  if (rendered.length === 0) {
+    return;
+  }
+  state.activityEntries = [...rendered, ...state.activityEntries];
+  if (state.activityEntries.length > WORKFLOW_ACTIVITY_MAX_ENTRIES) {
+    state.activityEntries = state.activityEntries.slice(0, WORKFLOW_ACTIVITY_MAX_ENTRIES);
+  }
+  markWorkflowActivityDirty({ full: true });
+}
+
 function formatActivity(record) {
   const timestampText = String(record.timestamp || "");
   const hhmmss = timestampText.length >= 19 ? timestampText.slice(11, 19) : "--:--:--";
@@ -2377,6 +3542,33 @@ function formatActivity(record) {
   }
   if (eventType === "session_failed") {
     return `[${hhmmss}] ❌ session failed ${String(payload.error || "").slice(0, 120)}`;
+  }
+  if (eventType === "mcp_connect_started") {
+    return `[${hhmmss}] 🔌 MCP connect started server=${String(payload.server_id || "-")} transport=${String(payload.transport || "-")}`;
+  }
+  if (eventType === "mcp_transport_fallback_started") {
+    return `[${hhmmss}] 🔁 MCP transport fallback started server=${String(payload.server_id || "-")} ${String(payload.from_transport || "-")}→${String(payload.to_transport || "-")}`;
+  }
+  if (eventType === "mcp_transport_fallback_succeeded") {
+    return `[${hhmmss}] ✅ MCP transport fallback succeeded server=${String(payload.server_id || "-")} ${String(payload.from_transport || "-")}→${String(payload.to_transport || "-")}`;
+  }
+  if (eventType === "mcp_transport_fallback_failed") {
+    return `[${hhmmss}] ❌ MCP transport fallback failed server=${String(payload.server_id || "-")} ${String(payload.from_transport || "-")}→${String(payload.to_transport || "-")}`;
+  }
+  if (eventType === "mcp_initialized") {
+    return `[${hhmmss}] ✅ MCP initialized server=${String(payload.server_id || "-")} protocol=${String(payload.protocol_version || "-")}`;
+  }
+  if (eventType === "mcp_tools_refreshed") {
+    return `[${hhmmss}] 🧰 MCP tools refreshed server=${String(payload.server_id || "-")} tools=${String(payload.tool_count ?? "-")}`;
+  }
+  if (eventType === "mcp_resources_refreshed") {
+    return `[${hhmmss}] 📚 MCP resources refreshed server=${String(payload.server_id || "-")} resources=${String(payload.resource_count ?? "-")}`;
+  }
+  if (eventType === "mcp_resources_not_supported") {
+    return `[${hhmmss}] ℹ️ MCP resources unsupported server=${String(payload.server_id || "-")}`;
+  }
+  if (eventType === "mcp_server_prepare_failed") {
+    return `[${hhmmss}] ⚠️ MCP prepare failed server=${String(payload.server_id || "-")} ${String(payload.error || "").slice(0, 120)}`;
   }
   if (eventType === "llm_retry") {
     return `[${hhmmss}] 🔁 ${actor} ${llmRetryText(payload).slice(0, 120)}`;
@@ -2457,6 +3649,29 @@ function consumeRuntimeEvent(record) {
     state.runtime.session_status = String(payload.session_status || state.runtime.session_status || "idle");
     state.runtime.status_message = t("configuration_saved");
     state.runtime.running = false;
+  } else if (eventType === "session_skills_materialized") {
+    if (Array.isArray(payload.enabled_skill_ids)) {
+      state.runtime.selected_skill_ids = normalizeSkillIdsFromText(payload.enabled_skill_ids.join(","));
+    }
+    const previousSkillsState =
+      state.runtime.skills_state && typeof state.runtime.skills_state === "object"
+        ? state.runtime.skills_state
+        : {};
+    state.runtime.skills_state = {
+      ...previousSkillsState,
+      bundle_root: String(payload.skill_bundle_root || ""),
+      manifest_path: String(payload.manifest_path || ""),
+      warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
+    };
+  } else if (eventType === "session_mcp_refreshed") {
+    if (Array.isArray(payload.enabled_mcp_server_ids)) {
+      state.runtime.selected_mcp_server_ids = normalizeMcpServerIdsFromText(
+        payload.enabled_mcp_server_ids.join(",")
+      );
+    }
+    if (payload.mcp_state && typeof payload.mcp_state === "object") {
+      state.runtime.mcp_state = { ...payload.mcp_state };
+    }
   } else if (eventType === "session_finalized") {
     state.runtime.session_status = String(payload.session_status || "completed");
     state.runtime.summary = String(payload.user_summary || "");
@@ -2721,15 +3936,22 @@ async function loadSessionEvents(sessionId) {
   if (!sessionId) {
     return;
   }
-  const payload = await fetchJson(`/api/session/${encodeURIComponent(sessionId)}/events`);
+  const query = new URLSearchParams({
+    limit: String(SESSION_ACTIVITY_WINDOW_LIMIT),
+    activity_only: "true",
+  });
+  const payload = await fetchJson(
+    `/api/session/${encodeURIComponent(sessionId)}/events?${query.toString()}`
+  );
   if (!payload || !Array.isArray(payload.events)) {
     return;
   }
   const snapshotAgents = payload && Array.isArray(payload.agents) ? payload.agents : [];
   resetRuntimeViews();
-  for (const record of payload.events) {
-    consumeRuntimeEvent(record);
-  }
+  replaceActivityEntries(payload.events);
+  state.activity.beforeCursor =
+    payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+  state.activity.hasMoreBefore = Boolean(payload && payload.has_more_before);
   await loadSessionMessages(sessionId);
   if (snapshotAgents.length > 0) {
     applyAgentSnapshot(snapshotAgents);
@@ -2742,13 +3964,74 @@ async function loadSessionMessages(sessionId) {
     return;
   }
   state.messages.cursor = null;
+  state.messages.beforeCursor = null;
+  state.messages.hasMoreBefore = false;
   resetAgentMessageEntries({ preserveNonMessage: false });
-  let cursor = null;
-  for (let pageIndex = 0; pageIndex < 200; pageIndex += 1) {
-    const query = new URLSearchParams({ limit: "500" });
-    if (cursor) {
-      query.set("cursor", cursor);
-    }
+  const query = new URLSearchParams({
+    limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
+    tail: String(SESSION_MESSAGE_WINDOW_LIMIT),
+  });
+  const payload = await fetchJson(
+    `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
+  );
+  const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
+  if (records.length > 0) {
+    applyMessageRecords(records);
+  }
+  state.messages.cursor =
+    payload && typeof payload.next_cursor === "string" ? payload.next_cursor : null;
+  state.messages.beforeCursor =
+    payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+  state.messages.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  markAgentPanelDirty();
+}
+
+async function loadOlderActivity() {
+  const sessionId = activeSessionId();
+  const beforeCursor = String(state.activity.beforeCursor || "").trim();
+  if (!sessionId || !beforeCursor || state.activity.loadingOlder) {
+    return;
+  }
+  state.activity.loadingOlder = true;
+  scheduleRender();
+  try {
+    const query = new URLSearchParams({
+      limit: String(SESSION_ACTIVITY_WINDOW_LIMIT),
+      activity_only: "true",
+      before: beforeCursor,
+      include_agents: "false",
+    });
+    const payload = await fetchJson(
+      `/api/session/${encodeURIComponent(sessionId)}/events?${query.toString()}`
+    );
+    const records = payload && Array.isArray(payload.events) ? payload.events : [];
+    prependActivityEntries(records);
+    state.activity.beforeCursor =
+      payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+    state.activity.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  } finally {
+    state.activity.loadingOlder = false;
+    scheduleRender();
+  }
+}
+
+async function loadOlderMessages() {
+  const sessionId = activeSessionId();
+  const beforeCursor = String(state.messages.beforeCursor || "").trim();
+  if (!sessionId || !beforeCursor || state.messages.loadingOlder) {
+    return;
+  }
+  state.messages.loadingOlder = true;
+  state.agentPanel.preserveScrollNextRender = true;
+  state.agentPanel.preservedScrollTop = dom.agentsLive.scrollTop;
+  state.agentPanel.preservedScrollHeight = dom.agentsLive.scrollHeight;
+  state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
+  scheduleRender();
+  try {
+    const query = new URLSearchParams({
+      limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
+      before: beforeCursor,
+    });
     const payload = await fetchJson(
       `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
     );
@@ -2756,19 +4039,14 @@ async function loadSessionMessages(sessionId) {
     if (records.length > 0) {
       applyMessageRecords(records);
     }
-    const nextCursor = payload && typeof payload.next_cursor === "string" ? payload.next_cursor : null;
-    const hasMore = Boolean(payload && payload.has_more);
-    if (!hasMore) {
-      cursor = nextCursor || cursor;
-      break;
-    }
-    if (!nextCursor || nextCursor === cursor) {
-      break;
-    }
-    cursor = nextCursor;
+    state.messages.beforeCursor =
+      payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+    state.messages.hasMoreBefore = Boolean(payload && payload.has_more_before);
+  } finally {
+    state.messages.loadingOlder = false;
+    markAgentPanelDirty();
+    scheduleRender();
   }
-  state.messages.cursor = cursor;
-  markAgentPanelDirty();
 }
 
 async function syncSessionMessagesIncremental() {
@@ -2915,6 +4193,491 @@ function syncTaskInputValue() {
   }
 }
 
+function renderCardMetaLines(rows) {
+  const normalizedRows = Array.isArray(rows) ? rows : [];
+  return normalizedRows
+    .map(([key, value, valueIsHtml]) => {
+      const hasValue = value !== null && value !== undefined && value !== "";
+      const text = hasValue ? String(value) : t("none_value");
+      const valueHtml = valueIsHtml ? text : escapeHtml(text);
+      return `<div class="skill-card-meta-line"><span class="skill-card-meta-key">${escapeHtml(
+        String(key || "")
+      )}</span><span class="skill-card-meta-value">${valueHtml}</span></div>`;
+    })
+    .join("");
+}
+
+function renderSelectedSkillChips(catalog, controlsDisabled) {
+  const selectedIds = selectedSkillIds();
+  if (!selectedIds.length) {
+    dom.skillsSelected.innerHTML = `<div class="skills-empty">${escapeHtml(
+      t("skills_selected_empty")
+    )}</div>`;
+    return;
+  }
+  const catalogById = new Map(catalog.map((skill) => [String(skill.id || "").trim(), skill]));
+  dom.skillsSelected.innerHTML = selectedIds
+    .map((skillId) => {
+      const skill = catalogById.get(skillId) || null;
+      const title = skillDisplayName(skill) || skillId;
+      const meta = [];
+      if (skill && title !== skillId) {
+        meta.push(skillId);
+      }
+      if (skill?.materialized) {
+        meta.push(t("skills_active_label"));
+      }
+      if (!skill) {
+        meta.push(t("skills_manual_label"));
+      } else {
+        const sourceLabel = skillSourceLabel(skill);
+        if (sourceLabel) {
+          meta.push(sourceLabel);
+        }
+      }
+      return `
+        <button
+          type="button"
+          class="skills-selection-chip${skill ? "" : " is-manual"}"
+          data-action="remove-skill"
+          data-skill-id="${escapeHtml(skillId)}"
+          ${controlsDisabled ? "disabled" : ""}
+          title="${escapeHtml(t("skills_disable"))}"
+        >
+          <span class="skills-selection-chip-main">
+            <span class="skills-selection-label">${escapeHtml(title)}</span>
+            <span class="skills-selection-meta">${escapeHtml(meta.join(" · "))}</span>
+          </span>
+          <span class="skills-selection-remove" aria-hidden="true">×</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderSkillsCatalog(catalog, controlsDisabled) {
+  if (!catalog.length) {
+    const message = state.skillsUi.discovering ? t("loading") : t("skills_catalog_empty");
+    dom.skillsList.innerHTML = `<div class="skills-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+  const selected = new Set(selectedSkillIds());
+  const orderedCatalog = sortedSkillCatalog(catalog);
+  dom.skillsList.innerHTML = orderedCatalog
+    .map((skill) => {
+      const skillId = String(skill.id || "").trim();
+      const isSelected = selected.has(skillId);
+      const detailsExpanded = isSkillDetailExpanded(skillId);
+      const description = skillDescription(skill);
+      const docPath = skillPreferredDocPath(skill);
+      const sourceLabel = skillSourceLabel(skill);
+      const tags = Array.isArray(skill.tags) ? skill.tags : [];
+      const resourceCount = skillResourceCount(skill);
+      const badges = [];
+      if (sourceLabel) {
+        badges.push(`<span class="skill-badge">${escapeHtml(sourceLabel)}</span>`);
+      }
+      if (skill.materialized) {
+        badges.push(`<span class="skill-badge is-active">${escapeHtml(t("skills_active_label"))}</span>`);
+      }
+      if (skill.discovered) {
+        badges.push(
+          `<span class="skill-badge is-discovered">${escapeHtml(t("skills_available_label"))}</span>`
+        );
+      }
+      if (resourceCount > 0) {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(
+            `${t("skills_resources_label")}: ${resourceCount}`
+          )}</span>`
+        );
+      }
+      const tagsHtml = tags.length
+        ? `<div class="skill-tag-row">${tags
+            .map((tag) => `<span class="skill-tag">${escapeHtml(String(tag))}</span>`)
+            .join("")}</div>`
+        : "";
+      const docHtml = docPath
+        ? renderCardMetaLines([[t("skills_doc_label"), docPath]])
+        : "";
+      const sourcePath = String(skill.source_path || "").trim();
+      const sourceHtml = sourcePath
+        ? renderCardMetaLines([[t("skills_source_label"), sourcePath]])
+        : "";
+      const structureRows = skillStructureRows(skill);
+      const structureHtml = `
+        <div class="skill-card-structure">
+          <div class="skill-card-structure-title">${escapeHtml(t("structure_label"))}</div>
+          <div class="skill-card-meta">
+            ${renderCardMetaLines(structureRows)}
+          </div>
+        </div>
+      `;
+      const detailsToggleText = detailsExpanded ? t("selector_hide_details") : t("selector_show_details");
+      const detailsHtml = `
+        <div class="selector-card-detail${detailsExpanded ? " is-open" : ""}">
+          ${tagsHtml}
+          ${structureHtml}
+          <div class="skill-card-meta">
+            ${docHtml}
+            ${sourceHtml}
+          </div>
+        </div>
+      `;
+      return `
+        <article
+          class="skill-card skill-card-toggle${isSelected ? " is-selected" : ""}${
+            controlsDisabled ? " is-disabled" : ""
+          }"
+          data-action="toggle-skill"
+          data-skill-id="${escapeHtml(skillId)}"
+          role="button"
+          tabindex="${controlsDisabled ? "-1" : "0"}"
+          aria-pressed="${isSelected ? "true" : "false"}"
+          aria-disabled="${controlsDisabled ? "true" : "false"}"
+        >
+          <div class="skill-card-head">
+            <div class="skill-card-title-block">
+              <div class="skill-card-title">${escapeHtml(skillDisplayName(skill) || skillId)}</div>
+              <div class="skill-card-id">${escapeHtml(skillId)}</div>
+            </div>
+            <div class="skill-card-head-actions">
+              <button
+                type="button"
+                class="skill-card-action skill-card-secondary-button selector-detail-toggle"
+                data-action="toggle-skill-detail"
+                data-skill-id="${escapeHtml(skillId)}"
+              >
+                ${escapeHtml(detailsToggleText)}
+              </button>
+              <span class="skill-card-toggle-state">${escapeHtml(
+                isSelected ? t("skills_disable") : t("skills_enable")
+              )}</span>
+            </div>
+          </div>
+          <div class="skill-badge-row">${badges.join("")}</div>
+          <div class="skill-card-description">${escapeHtml(description || t("none_value"))}</div>
+          ${detailsHtml}
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderSkillWarnings() {
+  const warnings = Array.isArray(currentSkillsState().warnings)
+    ? currentSkillsState().warnings
+    : [];
+  if (!warnings.length) {
+    dom.skillsWarnings.classList.add("hidden");
+    dom.skillsWarnings.innerHTML = "";
+    return;
+  }
+  dom.skillsWarnings.classList.remove("hidden");
+  dom.skillsWarnings.innerHTML = warnings
+    .map((warning) => {
+      const skillId = String(warning?.skill_id || "").trim();
+      const message = skillWarningMessage(warning);
+      return `
+        <div class="skill-warning-card">
+          <div class="skill-warning-head">
+            <span class="skill-warning-badge">${escapeHtml(t("skills_warnings_label"))}</span>
+            ${skillId ? `<span class="skill-warning-skill">${escapeHtml(skillId)}</span>` : ""}
+          </div>
+          <div class="skill-warning-text">${escapeHtml(message)}</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderSelectedMcpServerChips(catalog, controlsDisabled) {
+  const selectedIds = selectedMcpServerIds();
+  if (!selectedIds.length) {
+    dom.mcpSelected.innerHTML = `<div class="skills-empty">${escapeHtml(
+      t("mcp_selected_empty")
+    )}</div>`;
+    return;
+  }
+  const catalogById = new Map(catalog.map((server) => [String(server.id || "").trim(), server]));
+  dom.mcpSelected.innerHTML = selectedIds
+    .map((serverId) => {
+      const server = catalogById.get(serverId) || null;
+      const title = String(server?.title || serverId).trim() || serverId;
+      const meta = [];
+      if (server && title !== serverId) {
+        meta.push(serverId);
+      }
+      if (!server) {
+        meta.push(t("skills_manual_label"));
+      } else {
+        const transport = String(server.transport || "").trim();
+        if (transport) {
+          meta.push(transport);
+        }
+        if (server.materialized) {
+          meta.push(truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected"));
+        } else {
+          meta.push(t("mcp_pending_materialization"));
+        }
+        if (typeof server.config_enabled === "boolean" && server.config_enabled) {
+          meta.push(t("mcp_defaults_label"));
+        }
+      }
+      return `
+        <button
+          type="button"
+          class="skills-selection-chip${server ? "" : " is-manual"}"
+          data-action="remove-mcp-server"
+          data-mcp-server-id="${escapeHtml(serverId)}"
+          ${controlsDisabled ? "disabled" : ""}
+          title="${escapeHtml(t("mcp_disable"))}"
+        >
+          <span class="skills-selection-chip-main">
+            <span class="skills-selection-label">${escapeHtml(title)}</span>
+            <span class="skills-selection-meta">${escapeHtml(meta.join(" · "))}</span>
+          </span>
+          <span class="skills-selection-remove" aria-hidden="true">×</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderMcpServerCatalog(catalog, controlsDisabled) {
+  if (!catalog.length) {
+    const message = state.mcpUi.discovering ? t("loading") : t("mcp_catalog_empty");
+    dom.mcpList.innerHTML = `<div class="skills-empty">${escapeHtml(message)}</div>`;
+    return;
+  }
+  const selected = new Set(selectedMcpServerIds());
+  const orderedCatalog = sortedMcpServerCatalog(catalog);
+  dom.mcpList.innerHTML = orderedCatalog
+    .map((server) => {
+      const serverId = String(server.id || "").trim();
+      const title = String(server.title || serverId).trim() || serverId;
+      const isSelected = selected.has(serverId);
+      const detailsExpanded = isMcpDetailExpanded(serverId);
+      const transport = String(server.transport || "").trim();
+      const toolCount = mcpToolCount(server);
+      const resourceCount = mcpResourceCount(server);
+      const warning = String(server.warning || "").trim();
+      const endpointValue = mcpEndpointValue(server);
+      const badges = [];
+      if (transport) {
+        badges.push(`<span class="skill-badge">${escapeHtml(transport)}</span>`);
+      }
+      if (typeof server.config_enabled === "boolean") {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(
+            server.config_enabled ? t("mcp_config_enabled") : t("mcp_config_disabled")
+          )}</span>`
+        );
+      }
+      if (truthyFlag(server.oauth_enabled)) {
+        badges.push(
+          `<span class="skill-badge ${truthyFlag(server.oauth_authorized) ? "is-active" : ""}">${escapeHtml(
+            mcpAuthStateText(server)
+          )}</span>`
+        );
+      }
+      if (hasMcpEnvAuth(server)) {
+        badges.push(
+          `<span class="skill-badge ${mcpEnvAuthConfigured(server) ? "is-active" : ""}">${escapeHtml(
+            mcpEnvAuthStateText(server)
+          )}</span>`
+        );
+      }
+      badges.push(
+        `<span class="skill-badge ${server.materialized ? "is-active" : ""}">${escapeHtml(
+          server.materialized ? t("mcp_materialized") : t("mcp_pending_materialization")
+        )}</span>`
+      );
+      if (server.materialized) {
+        badges.push(
+          `<span class="skill-badge ${truthyFlag(server.connected) ? "is-active" : ""}">${escapeHtml(
+            truthyFlag(server.connected) ? t("mcp_connected") : t("mcp_disconnected")
+          )}</span>`
+        );
+      }
+      if (toolCount > 0) {
+        badges.push(`<span class="skill-badge">${escapeHtml(`${t("tools_label")}: ${toolCount}`)}</span>`);
+      }
+      if (resourceCount > 0) {
+        badges.push(
+          `<span class="skill-badge">${escapeHtml(`${t("resources_label")}: ${resourceCount}`)}</span>`
+        );
+      }
+      const infoRows = [
+        [t("mcp_config_state_label"), mcpConfigStateText(server)],
+        [t("mcp_session_state_label"), mcpSessionStateText(server)],
+      ];
+      if (truthyFlag(server.oauth_enabled)) {
+        infoRows.push([t("mcp_auth_label"), mcpAuthStateText(server)]);
+        infoRows.push([t("mcp_oauth_scope_label"), mcpOauthScopeText(server)]);
+        infoRows.push([t("mcp_oauth_expires_label"), mcpOauthExpiresText(server)]);
+      }
+      if (hasMcpEnvAuth(server)) {
+        infoRows.push([t("mcp_env_auth_label"), mcpEnvAuthStateText(server)]);
+        const envKeysText = mcpEnvAuthKeys(server).join(", ");
+        infoRows.push([t("mcp_env_auth_keys_label"), envKeysText || t("none_value")]);
+      }
+      infoRows.push(
+        [t("mcp_roots_policy_label"), mcpRootsPolicyText(server)],
+        [t("mcp_roots_runtime_label"), mcpRootsRuntimeText(server)],
+        [mcpEndpointLabel(server), endpointValue || t("none_value")],
+        [t("mcp_timeout_label"), mcpTimeoutText(server)],
+        [t("mcp_allowed_tools_label"), mcpAllowedToolsText(server)]
+      );
+      const structureRows = mcpStructureRows(server);
+      const structureHtml = `
+        <div class="skill-card-structure">
+          <div class="skill-card-structure-title">${escapeHtml(t("structure_label"))}</div>
+          <div class="skill-card-meta">
+            ${renderCardMetaLines(structureRows)}
+          </div>
+        </div>
+      `;
+      const detailsToggleText = detailsExpanded ? t("selector_hide_details") : t("selector_show_details");
+      const oauthButtonText = mcpOauthButtonText(server);
+      const showClearOauth = canClearMcpOauth(server);
+      const showEnvAuthConfig = hasMcpEnvAuth(server);
+      const actionButtons = [];
+      if (oauthButtonText) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-oauth-login"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+            ${controlsDisabled ? "disabled" : ""}
+          >
+            ${escapeHtml(oauthButtonText)}
+          </button>
+        `);
+      }
+      if (showClearOauth) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-oauth-clear"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+            ${controlsDisabled ? "disabled" : ""}
+          >
+            ${escapeHtml(t("mcp_oauth_clear"))}
+          </button>
+        `);
+      }
+      if (showEnvAuthConfig) {
+        actionButtons.push(`
+          <button
+            type="button"
+            class="skill-card-action skill-card-secondary-button"
+            data-action="mcp-env-auth-configure"
+            data-mcp-server-id="${escapeHtml(serverId)}"
+            ${controlsDisabled ? "disabled" : ""}
+          >
+            ${escapeHtml(t("mcp_env_auth_configure"))}
+          </button>
+        `);
+      }
+      const detailsHtml = `
+        <div class="selector-card-detail${detailsExpanded ? " is-open" : ""}">
+          ${structureHtml}
+          <div class="skill-card-meta">${renderInfoRows(infoRows)}</div>
+        </div>
+      `;
+      return `
+        <article
+          class="skill-card mcp-card skill-card-toggle${isSelected ? " is-selected" : ""}${
+            controlsDisabled ? " is-disabled" : ""
+          }"
+          data-action="toggle-mcp-server"
+          data-mcp-server-id="${escapeHtml(serverId)}"
+          role="button"
+          tabindex="${controlsDisabled ? "-1" : "0"}"
+          aria-pressed="${isSelected ? "true" : "false"}"
+          aria-disabled="${controlsDisabled ? "true" : "false"}"
+        >
+          <div class="skill-card-head">
+            <div class="skill-card-title-block">
+              <div class="skill-card-title">${escapeHtml(title)}</div>
+              <div class="skill-card-id">${escapeHtml(serverId)}</div>
+            </div>
+            <div class="skill-card-head-actions">
+              <button
+                type="button"
+                class="skill-card-action skill-card-secondary-button selector-detail-toggle"
+                data-action="toggle-mcp-detail"
+                data-mcp-server-id="${escapeHtml(serverId)}"
+              >
+                ${escapeHtml(detailsToggleText)}
+              </button>
+              <span class="skill-card-toggle-state">${escapeHtml(
+                isSelected ? t("mcp_disable") : t("mcp_enable")
+              )}</span>
+            </div>
+          </div>
+          <div class="skill-badge-row">${badges.join("")}</div>
+          <div class="skill-card-description">${escapeHtml(
+            warning || endpointValue || t("none_value")
+          )}</div>
+          ${detailsHtml}
+          ${
+            actionButtons.length
+              ? `<div class="skill-card-actions">${actionButtons.join("")}</div>`
+              : ""
+          }
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderMcpWarnings() {
+  const warnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  if (!warnings.length) {
+    dom.mcpWarnings.classList.add("hidden");
+    dom.mcpWarnings.innerHTML = "";
+    return;
+  }
+  dom.mcpWarnings.classList.remove("hidden");
+  dom.mcpWarnings.innerHTML = warnings
+    .map((warning) => {
+      const serverId = String(warning?.server_id || "").trim();
+      const message = String(warning?.message || "").trim();
+      return `
+        <div class="skill-warning-card">
+          <div class="skill-warning-head">
+            <span class="skill-warning-badge">${escapeHtml(t("mcp_warnings_label"))}</span>
+            ${serverId ? `<span class="skill-warning-skill">${escapeHtml(serverId)}</span>` : ""}
+          </div>
+          <div class="skill-warning-text">${escapeHtml(message || t("none_value"))}</div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderControlSection(shell, button, summary, toggleState, body, expanded, summaryText) {
+  if (summary) {
+    summary.textContent = summaryText;
+  }
+  if (toggleState) {
+    toggleState.textContent = expanded ? t("collapse") : t("expand");
+  }
+  if (button) {
+    button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
+  if (shell) {
+    shell.classList.toggle("is-collapsed", !expanded);
+  }
+  if (body) {
+    body.classList.toggle("hidden", !expanded);
+  }
+}
+
 function renderControls() {
   dom.taskInput.placeholder = t("task_input");
   syncTaskInputValue();
@@ -2927,6 +4690,43 @@ function renderControls() {
   dom.rootAgentNameInput.placeholder = t("root_agent_name_placeholder");
   if (state.runtime.root_agent_name && !dom.rootAgentNameInput.value.trim()) {
     dom.rootAgentNameInput.value = state.runtime.root_agent_name;
+  }
+  dom.skillsLabel.textContent = t("skills_label");
+  syncSkillsInputValue();
+  dom.skillsDiscoverButton.textContent = state.skillsUi.discovering
+    ? t("loading")
+    : t("skills_discover");
+  dom.skillsSelectAllButton.textContent = t("skills_select_all");
+  dom.skillsClearButton.textContent = t("skills_clear");
+  if (dom.skillsOverviewTitle) {
+    dom.skillsOverviewTitle.textContent = t("selector_overview_label");
+  }
+  if (dom.skillsSelectedTitle) {
+    dom.skillsSelectedTitle.textContent = t("skills_selected_label");
+  }
+  if (dom.skillsCatalogTitle) {
+    dom.skillsCatalogTitle.textContent = t("skills_catalog_label");
+  }
+  if (dom.skillsWarningsTitle) {
+    dom.skillsWarningsTitle.textContent = t("skills_warnings_label");
+  }
+  dom.mcpLabel.textContent = t("mcp_servers_label");
+  syncMcpInputValue();
+  dom.mcpDiscoverButton.textContent = state.mcpUi.discovering ? t("loading") : t("mcp_discover");
+  dom.mcpUseDefaultsButton.textContent = t("mcp_use_defaults");
+  dom.mcpSelectAllButton.textContent = t("mcp_select_all");
+  dom.mcpClearButton.textContent = t("mcp_clear");
+  if (dom.mcpOverviewTitle) {
+    dom.mcpOverviewTitle.textContent = t("selector_overview_label");
+  }
+  if (dom.mcpSelectedTitle) {
+    dom.mcpSelectedTitle.textContent = t("mcp_selected_label");
+  }
+  if (dom.mcpCatalogTitle) {
+    dom.mcpCatalogTitle.textContent = t("mcp_catalog_label");
+  }
+  if (dom.mcpWarningsTitle) {
+    dom.mcpWarningsTitle.textContent = t("mcp_warnings_label");
   }
   autoSizeTaskInput();
   const runSubmitting = Boolean(state.runtime.runSubmitting);
@@ -2942,21 +4742,79 @@ function renderControls() {
   const running = Boolean(state.runtime.running);
   const syncBusy = Boolean(state.runtime.project_sync_action_in_progress);
   const setupBusy = Boolean(state.setup.busy);
+  const discovering = Boolean(state.skillsUi.discovering);
+  const mcpDiscovering = Boolean(state.mcpUi.discovering);
   const directMode = isDirectWorkspaceMode();
+  const controlsDisabled = running || syncBusy || setupBusy || discovering || mcpDiscovering;
+  const catalog = mergedSkillCatalog();
+  const warnings = Array.isArray(currentSkillsState().warnings)
+    ? currentSkillsState().warnings
+    : [];
+  const mcpCatalog = mergedMcpServerCatalog();
+  const defaultMcpIds = configDefaultMcpServerIds(mcpCatalog);
+  const mcpWarnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  const mcpEntries = currentMcpEntries();
+  const mcpSummarySource = mcpEntries.length ? mcpEntries : mcpCatalog;
+  const connectedMcpCount = mcpConnectedCount(mcpSummarySource);
+  const skillsSummaryText = `${selectedSkillIds().length} ${t("skills_selected_label")} · ${catalog.length} ${t(
+    "skills_catalog_label"
+  )} · ${warnings.length} ${t("skills_warnings_label")}`;
+  const mcpSummaryText = `${selectedMcpServerIds().length} ${t("mcp_selected_label")} · ${connectedMcpCount} ${t(
+    "mcp_connected_count_label"
+  )} · ${mcpWarnings.length} ${t("mcp_warnings_label")}`;
   dom.runButton.disabled = runSubmitting || syncBusy || setupBusy || !state.launchConfig.can_run;
   dom.modelInput.disabled = syncBusy || setupBusy;
   dom.rootAgentNameInput.disabled = syncBusy || setupBusy;
+  if (dom.skillsInput) {
+    dom.skillsInput.disabled = controlsDisabled;
+  }
+  dom.skillsDiscoverButton.disabled = controlsDisabled || !state.launchConfig.can_run;
+  dom.skillsSelectAllButton.disabled = controlsDisabled || catalog.length === 0;
+  dom.skillsClearButton.disabled = controlsDisabled || selectedSkillIds().length === 0;
+  if (dom.mcpInput) {
+    dom.mcpInput.disabled = controlsDisabled;
+  }
+  dom.mcpDiscoverButton.disabled = controlsDisabled;
+  dom.mcpUseDefaultsButton.disabled = controlsDisabled || defaultMcpIds.length === 0;
+  dom.mcpSelectAllButton.disabled = controlsDisabled || mcpCatalog.length === 0;
+  dom.mcpClearButton.disabled = controlsDisabled || selectedMcpServerIds().length === 0;
   dom.terminalButton.disabled = syncBusy || setupBusy || !activeSessionId();
   dom.setupButton.disabled = running || syncBusy || setupBusy;
   dom.interruptButton.disabled = !running;
   dom.applyButton.disabled = running || syncBusy || setupBusy || directMode || !activeSessionId();
   dom.undoButton.disabled = running || syncBusy || setupBusy || directMode || !activeSessionId();
+  renderControlSection(
+    dom.skillsShell,
+    dom.skillsToggleButton,
+    dom.skillsSummary,
+    dom.skillsToggleState,
+    dom.skillsPanelBody,
+    Boolean(state.skillsUi.expanded),
+    skillsSummaryText
+  );
+  renderControlSection(
+    dom.mcpShell,
+    dom.mcpToggleButton,
+    dom.mcpSummary,
+    dom.mcpToggleState,
+    dom.mcpPanelBody,
+    Boolean(state.mcpUi.expanded),
+    mcpSummaryText
+  );
 
   const stats = agentStats();
   const statusText = localizeStatus(state.runtime.session_status || "idle");
   const sessionIdText = activeSessionId() || t("pending_value");
   const remoteText = isRemoteWorkspaceConfigured() ? remoteWorkspaceLabel() : t("unset_value");
-  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
+  renderSkillsOverview(catalog);
+  renderSelectedSkillChips(catalog, controlsDisabled);
+  renderSkillsCatalog(catalog, controlsDisabled);
+  renderSkillWarnings();
+  renderMcpInsight(mcpCatalog);
+  renderSelectedMcpServerChips(mcpCatalog, controlsDisabled);
+  renderMcpServerCatalog(mcpCatalog, controlsDisabled);
+  renderMcpWarnings();
+  dom.controlSummary.textContent = `${t("session_status")}: ${statusText} | ${t("session_id")}: ${sessionIdText} | ${t("workspace_mode_label")}: ${localizeWorkspaceMode(activeWorkspaceMode())} | ${t("sandbox_backend_label")}: ${localizeSandboxBackend(activeSandboxBackend())} | ${t("remote_workspace_label")}: ${remoteText} | ${t("skills_label")}: ${selectedSkillIds().length} | ${t("mcp_servers_label")}: ${selectedMcpServerIds().length} | ${t("agents")}: ${stats.total} | ${t("status_running")}: ${stats.running} | ${t("status_paused")}: ${stats.paused} | ${t("status_completed")}: ${stats.completed} | ${t("status_failed")}: ${stats.failed} | ${t("status_cancelled")}: ${stats.cancelled} | ${t("status_terminated")}: ${stats.terminated}`;
 }
 
 function renderTabs() {
@@ -3036,11 +4894,21 @@ function renderTabs() {
 
 function renderOverviewTab() {
   const runtimeMessage = state.runtime.summary || state.runtime.status_message || "-";
+  const skillsState = currentSkillsState();
+  const skillWarnings = Array.isArray(skillsState.warnings) ? skillsState.warnings : [];
+  const mcpWarnings = Array.isArray(currentMcpState().warnings) ? currentMcpState().warnings : [];
+  const enabledSkillsText = selectedSkillIds().length
+    ? selectedSkillIds().join(", ")
+    : t("none_value");
+  const enabledMcpText = selectedMcpServerIds().length
+    ? selectedMcpServerIds().join(", ")
+    : t("none_value");
   const focusAgent = state.agentOrder
     .map((id) => state.agents.get(id))
     .filter((agent) => agent !== undefined)
     .at(-1);
   const recentActivity = state.activityEntries.slice(-16).reverse();
+  const mcpEntries = currentMcpEntries();
   const stats = agentStats();
   const statusClass = `status-${normalizeStatus(state.runtime.session_status || "idle")}`;
   const currentSessionId = activeSessionId() || t("pending_value");
@@ -3056,8 +4924,16 @@ function renderOverviewTab() {
     [t("workspace_mode_label"), localizeWorkspaceMode(activeWorkspaceMode())],
     [t("sandbox_backend_label"), localizeSandboxBackend(activeSandboxBackend())],
     [t("remote_workspace_label"), remoteWorkspaceLabel()],
-    [t("project_dir"), state.launchConfig.project_dir || t("unset_value")],
+    [t("project_dir"), displayProjectDirLabel()],
     [t("session_id"), state.launchConfig.session_id || t("unset_value")],
+    [t("skills_selected_label"), enabledSkillsText],
+    [t("skills_bundle_root_label"), String(skillsState.bundle_root || "") || t("unset_value")],
+    [t("skills_warnings_label"), String(skillWarnings.length)],
+    [t("mcp_selected_label"), enabledMcpText],
+    [t("mcp_connected_count_label"), String(mcpConnectedCount(mcpEntries))],
+    [t("tools_label"), String(totalMcpToolCount(mcpEntries))],
+    [t("resources_label"), String(totalMcpResourceCount(mcpEntries))],
+    [t("mcp_warnings_label"), String(mcpWarnings.length)],
     [t("sessions_root"), state.sessionsDir || t("unset_value")],
   ])}</div>`;
 
@@ -3065,6 +4941,16 @@ function renderOverviewTab() {
     ? renderMarkdown(state.runtime.summary)
     : `<div class="plain-inline">${escapeHtml(runtimeMessage)}</div>`;
   const insightMessageTitle = state.runtime.summary ? t("summary") : t("message");
+  const activityActions = state.activity.hasMoreBefore
+    ? `<button
+          type="button"
+          class="history-load-button"
+          data-action="load-older-activity"
+          ${state.activity.loadingOlder ? "disabled" : ""}
+        >${escapeHtml(
+          state.activity.loadingOlder ? t("loading") : t("load_older_activity")
+        )}</button>`
+    : "";
   const activityHtml =
     recentActivity.length > 0
       ? recentActivity
@@ -3134,7 +5020,11 @@ function renderOverviewTab() {
         <div class="overview-insight-message">${insightMessageBody}</div>
       </div>
       <div class="overview-insight-block">
-        <div class="overview-insight-head">${escapeHtml(t("activity"))}</div>
+        <div class="overview-insight-head overview-insight-head-with-action">
+          <span>${escapeHtml(t("activity"))}</span>
+          ${activityActions}
+        </div>
+        <div class="entry-sub">${escapeHtml(t("recent_history_window_note"))}</div>
         <div class="overview-insight-activity">${activityHtml}</div>
       </div>
     </div>
@@ -3156,6 +5046,22 @@ function renderWorkflowTab() {
   }
   if (dom.workflowZoomResetButton) {
     dom.workflowZoomResetButton.textContent = `${Math.round(state.workflow.scale * 100)}%`;
+  }
+  if (dom.activityTitle) {
+    const action = state.activity.hasMoreBefore
+      ? `<button
+            type="button"
+            class="history-load-button"
+            data-action="load-older-activity"
+            ${state.activity.loadingOlder ? "disabled" : ""}
+          >${escapeHtml(
+            state.activity.loadingOlder ? t("loading") : t("load_older_activity")
+          )}</button>`
+      : "";
+    dom.activityTitle.innerHTML = `
+      <span>${escapeHtml(t("activity"))}</span>
+      ${action}
+    `;
   }
   renderWorkflowActivityLog();
 }
@@ -3737,6 +5643,7 @@ function renderAgentPanel() {
   const previousTop = dom.agentsLive.scrollTop;
   const preserveScrollNextRender = Boolean(state.agentPanel.preserveScrollNextRender);
   const preservedScrollTop = Number(state.agentPanel.preservedScrollTop);
+  const preservedScrollHeight = Number(state.agentPanel.preservedScrollHeight);
   const suppressAutoStickToBottom = now < Number(state.agentPanel.suppressAutoStickToBottomUntil || 0);
   const atBottom =
     dom.agentsLive.scrollTop + dom.agentsLive.clientHeight >= dom.agentsLive.scrollHeight - 8;
@@ -3744,6 +5651,7 @@ function renderAgentPanel() {
     dom.agentsLive.innerHTML = `<div class="entry-sub">${escapeHtml(t("no_active_stream"))}</div>`;
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
     state.agentPanel.dirty = false;
     state.agentPanel.lastRenderedAt = now;
     return;
@@ -3752,15 +5660,37 @@ function renderAgentPanel() {
     dom.agentsLive.innerHTML = `<div class="entry-sub">${escapeHtml(t("agents_filter_empty"))}</div>`;
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
     state.agentPanel.dirty = false;
     state.agentPanel.lastRenderedAt = now;
     return;
   }
-  dom.agentsLive.innerHTML = renderAgentMasonryLayout(agents);
+  const historyControls = `
+    <div class="history-controls">
+      <div class="entry-sub">${escapeHtml(t("recent_history_window_note"))}</div>
+      ${
+        state.messages.hasMoreBefore
+          ? `<button
+                type="button"
+                class="history-load-button"
+                data-action="load-older-messages"
+                ${state.messages.loadingOlder ? "disabled" : ""}
+              >${escapeHtml(
+                state.messages.loadingOlder ? t("loading") : t("load_older_messages")
+              )}</button>`
+          : ""
+      }
+    </div>
+  `;
+  dom.agentsLive.innerHTML = `${historyControls}${renderAgentMasonryLayout(agents)}`;
   if (preserveScrollNextRender && Number.isFinite(preservedScrollTop)) {
-    dom.agentsLive.scrollTop = Math.max(0, preservedScrollTop);
+    const heightDelta = Number.isFinite(preservedScrollHeight)
+      ? Math.max(0, dom.agentsLive.scrollHeight - preservedScrollHeight)
+      : 0;
+    dom.agentsLive.scrollTop = Math.max(0, preservedScrollTop + heightDelta);
     state.agentPanel.preserveScrollNextRender = false;
     state.agentPanel.preservedScrollTop = null;
+    state.agentPanel.preservedScrollHeight = null;
   } else if (atBottom && !suppressAutoStickToBottom) {
     dom.agentsLive.scrollTop = dom.agentsLive.scrollHeight;
   } else {
@@ -3944,8 +5874,40 @@ function renderToolRunJsonValue(value, emptyText) {
   return `<pre class="json-block"><code>${escapeHtml(formatted)}</code></pre>`;
 }
 
+function mergedToolRunTimeline(runId) {
+  const detailSnapshot =
+    state.toolRuns.detail.runSnapshot &&
+    typeof state.toolRuns.detail.runSnapshot === "object" &&
+    String(state.toolRuns.detail.runSnapshot.id || "").trim() === String(runId || "").trim()
+      ? state.toolRuns.detail.runSnapshot
+      : null;
+  const detailEntries = Array.isArray(detailSnapshot && detailSnapshot.timeline)
+    ? detailSnapshot.timeline
+    : [];
+  const liveEntries = state.toolRuns.eventTimelineByRunId.get(runId) || [];
+  const merged = [];
+  const seen = new Set();
+  for (const entry of [...detailEntries, ...liveEntries]) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const key = [
+      String(entry.timestamp || ""),
+      String(entry.event_type || ""),
+      String(entry.phase || ""),
+      String(entry.agent_id || ""),
+    ].join("::");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 function renderToolRunTimeline(runId) {
-  const entries = state.toolRuns.eventTimelineByRunId.get(runId) || [];
+  const entries = mergedToolRunTimeline(runId);
   if (!Array.isArray(entries) || entries.length === 0) {
     return `<div class="entry-sub">${escapeHtml(t("tool_runs_detail_no_timeline"))}</div>`;
   }
@@ -6151,6 +8113,8 @@ async function runSession(task, model, rootAgentName) {
     task,
     model: String(model || "").trim(),
     sandbox_backend: activeSandboxBackend(),
+    enabled_skill_ids: selectedSkillIds(),
+    enabled_mcp_server_ids: selectedMcpServerIds(),
   };
   const normalizedRootAgentName = String(rootAgentName || "").trim();
   if (normalizedRootAgentName) {
@@ -6197,6 +8161,233 @@ async function runSession(task, model, rootAgentName) {
   state.steerRuns.dirty = true;
   markAgentPanelDirty();
   scheduleRender();
+}
+
+async function discoverSkills() {
+  state.skillsUi.discovering = true;
+  scheduleRender();
+  try {
+    const body = {};
+    const remote = activeRemoteConfig();
+    if (remote) {
+      body.remote = remote;
+      const remotePassword = resolveRemotePassword({ allowPrompt: true });
+      if (remote.auth_mode === "password" && !remotePassword && !remote.password_saved) {
+        throw new Error(t("remote_password_required"));
+      }
+      if (remotePassword) {
+        body.remote_password = remotePassword;
+      }
+    } else if (state.launchConfig.project_dir) {
+      body.project_dir = state.launchConfig.project_dir;
+    }
+    const payload = await fetchJson("/api/skills/discover", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    applySnapshot(payload.snapshot || payload);
+    const skills = payload && Array.isArray(payload.skills) ? payload.skills : [];
+    state.runtime.status_message = `${skills.length} ${t("skills_discovered")}`;
+  } finally {
+    state.skillsUi.discovering = false;
+    scheduleRender();
+  }
+}
+
+async function discoverMcpServers() {
+  state.mcpUi.discovering = true;
+  scheduleRender();
+  try {
+    const payload = await fetchJson("/api/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    applySnapshot(payload.snapshot || payload);
+    const servers = payload && Array.isArray(payload.mcp_servers) ? payload.mcp_servers : [];
+    const defaultCount = servers.filter((server) => truthyFlag(server?.enabled)).length;
+    state.runtime.status_message = `${servers.length} ${t("mcp_servers_discovered")} | ${t(
+      "mcp_defaults_label"
+    )}: ${defaultCount}`;
+  } finally {
+    state.mcpUi.discovering = false;
+    scheduleRender();
+  }
+}
+
+async function pollMcpOauthFlow(flowId) {
+  for (;;) {
+    const payload = await fetchJson(`/api/mcp/oauth/${encodeURIComponent(flowId)}`);
+    applySnapshot(payload.snapshot || payload);
+    const flow = state.mcpUi.loginFlows[flowId];
+    if (flow) {
+      const authorizationUrl = String(
+        payload.authorization_url || flow.authorizationUrl || ""
+      ).trim();
+      if (authorizationUrl && authorizationUrl !== flow.authorizationUrl) {
+        flow.authorizationUrl = authorizationUrl;
+      }
+      if (authorizationUrl && !flow.popupOpened) {
+        flow.popup = openMcpOauthPopup(authorizationUrl, flow.popup || null);
+        flow.popupOpened = true;
+      }
+    }
+    const status = String(payload.status || "").trim().toLowerCase();
+    if (status === "completed") {
+      if (flow && flow.popup && !flow.popup.closed) {
+        try {
+          flow.popup.close();
+        } catch (_error) {
+          // Ignore popup close failures.
+        }
+      }
+      delete state.mcpUi.loginFlows[flowId];
+      state.runtime.status_message = `${payload.server_id || ""} · ${t("mcp_oauth_completed")}`.trim();
+      scheduleRender();
+      return payload;
+    }
+    if (status === "failed" || status === "cancelled") {
+      if (flow && flow.popup && !flow.popup.closed) {
+        try {
+          flow.popup.close();
+        } catch (_error) {
+          // Ignore popup close failures.
+        }
+      }
+      delete state.mcpUi.loginFlows[flowId];
+      const detail = String(payload.error || "").trim();
+      throw new Error(
+        detail
+          ? `${t("mcp_oauth_failed")}: ${detail}`
+          : t("mcp_oauth_failed")
+      );
+    }
+    await waitMs(1000);
+  }
+}
+
+async function startMcpOauthLogin(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  let popup = null;
+  try {
+    popup = window.open("about:blank", "_blank");
+  } catch (_error) {
+    popup = null;
+  }
+  seedMcpOauthPopup(popup);
+  try {
+    const payload = await fetchJson("/api/mcp/oauth/start", {
+      method: "POST",
+      body: JSON.stringify({ server_id: normalizedServerId }),
+    });
+    const flowId = String(payload.flow_id || "").trim();
+    const authorizationUrl = String(payload.authorization_url || "").trim();
+    if (!flowId) {
+      throw new Error(t("mcp_oauth_failed"));
+    }
+    const existingFlow = state.mcpUi.loginFlows[flowId];
+    const mergedAuthorizationUrl = String(
+      authorizationUrl || (existingFlow && existingFlow.authorizationUrl) || ""
+    ).trim();
+    let popupRef = (existingFlow && existingFlow.popup) || popup;
+    let popupOpened = Boolean(existingFlow && existingFlow.popupOpened);
+    if (mergedAuthorizationUrl) {
+      popupRef = openMcpOauthPopup(mergedAuthorizationUrl, popupRef);
+      popupOpened = true;
+    }
+    state.mcpUi.loginFlows[flowId] = {
+      serverId: normalizedServerId,
+      authorizationUrl: mergedAuthorizationUrl,
+      polling: Boolean(existingFlow && existingFlow.polling),
+      popup: popupRef || null,
+      popupOpened,
+    };
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_oauth_started")}`;
+    scheduleRender();
+    ensureMcpOauthFlowPolling(flowId);
+  } catch (error) {
+    if (popup && !popup.closed) {
+      popup.close();
+    }
+    state.runtime.status_message = String(error.message || "");
+    scheduleRender();
+  }
+}
+
+async function clearMcpOauthLogin(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  try {
+    const payload = await fetchJson("/api/mcp/oauth/clear", {
+      method: "POST",
+      body: JSON.stringify({ server_id: normalizedServerId }),
+    });
+    Object.entries(state.mcpUi.loginFlows).forEach(([flowId, flow]) => {
+      if (flow && String(flow.serverId || "").trim() === normalizedServerId) {
+        if (flow.popup && !flow.popup.closed) {
+          flow.popup.close();
+        }
+        delete state.mcpUi.loginFlows[flowId];
+      }
+    });
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_oauth_cleared")}`;
+    scheduleRender();
+  } catch (error) {
+    state.runtime.status_message = String(error.message || "");
+    scheduleRender();
+  }
+}
+
+async function configureMcpEnvAuth(serverId) {
+  const normalizedServerId = String(serverId || "").trim();
+  if (!normalizedServerId) {
+    return;
+  }
+  const server = mergedMcpServerCatalog().find(
+    (item) => String(item?.id || "").trim() === normalizedServerId
+  );
+  const envKeys = mcpEnvAuthKeys(server);
+  if (!envKeys.length) {
+    state.runtime.status_message = t("mcp_env_auth_missing");
+    scheduleRender();
+    return;
+  }
+  const values = {};
+  for (const envKey of envKeys) {
+    const promptMessage = `${t("mcp_env_auth_prompt")} ${envKey}`;
+    const inputValue = window.prompt(promptMessage, "");
+    if (inputValue === null) {
+      return;
+    }
+    const normalizedValue = String(inputValue || "").trim();
+    if (!normalizedValue) {
+      state.runtime.status_message = `${t("mcp_env_auth_failed")}: ${envKey}`;
+      scheduleRender();
+      return;
+    }
+    values[envKey] = normalizedValue;
+  }
+  try {
+    const payload = await fetchJson("/api/mcp/env-auth/configure", {
+      method: "POST",
+      body: JSON.stringify({
+        server_id: normalizedServerId,
+        values,
+      }),
+    });
+    applySnapshot(payload.snapshot || payload);
+    state.runtime.status_message = `${normalizedServerId} · ${t("mcp_env_auth_saved")}`;
+    scheduleRender();
+  } catch (error) {
+    state.runtime.status_message = String(error.message || "");
+    scheduleRender();
+  }
 }
 
 async function persistLaunchConfig({
@@ -6504,6 +8695,28 @@ function bindEvents() {
     setWorkflowExpanded(true);
     scheduleRender();
   });
+  dom.overviewFeed.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='load-older-activity']");
+    if (!button) {
+      return;
+    }
+    void loadOlderActivity();
+  });
+  dom.activityTitle.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='load-older-activity']");
+    if (!button) {
+      return;
+    }
+    void loadOlderActivity();
+  });
   dom.workflowGraph.addEventListener(
     "wheel",
     (event) => {
@@ -6646,11 +8859,249 @@ function bindEvents() {
     state.runtime.root_agent_name = dom.rootAgentNameInput.value;
   });
 
+  dom.skillsToggleButton.addEventListener("click", () => {
+    state.skillsUi.expanded = !state.skillsUi.expanded;
+    scheduleRender();
+  });
+
+  if (dom.skillsInput) {
+    dom.skillsInput.addEventListener("input", () => {
+      setSelectedSkillIds(dom.skillsInput.value);
+    });
+  }
+
+  dom.skillsDiscoverButton.addEventListener("click", async () => {
+    try {
+      await discoverSkills();
+    } catch (error) {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    }
+  });
+
+  dom.skillsSelectAllButton.addEventListener("click", () => {
+    const catalogIds = mergedSkillCatalog().map((skill) => String(skill.id || "").trim());
+    setSelectedSkillIds([...selectedSkillIds(), ...catalogIds], { syncInput: true });
+  });
+
+  dom.skillsClearButton.addEventListener("click", () => {
+    setSelectedSkillIds([], { syncInput: true });
+  });
+
+  dom.skillsSelected.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='remove-skill']");
+    if (!button) {
+      return;
+    }
+    const skillId = String(button.getAttribute("data-skill-id") || "").trim();
+    if (!skillId) {
+      return;
+    }
+    setSelectedSkillIds(
+      selectedSkillIds().filter((item) => item !== skillId),
+      { syncInput: true }
+    );
+  });
+
+  dom.skillsList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const detailsButton = target.closest("button[data-action='toggle-skill-detail']");
+    if (detailsButton) {
+      const skillId = String(detailsButton.getAttribute("data-skill-id") || "").trim();
+      if (skillId) {
+        toggleSkillDetailExpanded(skillId);
+      }
+      return;
+    }
+    const card = target.closest("[data-action='toggle-skill']");
+    if (!card) {
+      return;
+    }
+    if (card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    const skillId = String(card.getAttribute("data-skill-id") || "").trim();
+    if (!skillId) {
+      return;
+    }
+    const selected = new Set(selectedSkillIds());
+    if (selected.has(skillId)) {
+      selected.delete(skillId);
+    } else {
+      selected.add(skillId);
+    }
+    setSelectedSkillIds([...selected], { syncInput: true });
+  });
+
+  dom.skillsList.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (target.closest("button[data-action='toggle-skill-detail']")) {
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    const card = target.closest("[data-action='toggle-skill']");
+    if (!card || card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    event.preventDefault();
+    card.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+
+  if (dom.mcpInput) {
+    dom.mcpInput.addEventListener("input", () => {
+      setSelectedMcpServerIds(dom.mcpInput.value);
+    });
+  }
+
+  dom.mcpToggleButton.addEventListener("click", () => {
+    state.mcpUi.expanded = !state.mcpUi.expanded;
+    scheduleRender();
+  });
+
+  dom.mcpDiscoverButton.addEventListener("click", async () => {
+    try {
+      await discoverMcpServers();
+    } catch (error) {
+      state.runtime.status_message = String(error.message || "");
+      scheduleRender();
+    }
+  });
+
+  dom.mcpUseDefaultsButton.addEventListener("click", () => {
+    const defaultIds = configDefaultMcpServerIds();
+    if (!defaultIds.length) {
+      return;
+    }
+    setSelectedMcpServerIds(defaultIds, { syncInput: true });
+  });
+
+  dom.mcpSelectAllButton.addEventListener("click", () => {
+    const catalogIds = mergedMcpServerCatalog().map((server) => String(server.id || "").trim());
+    setSelectedMcpServerIds([...selectedMcpServerIds(), ...catalogIds], { syncInput: true });
+  });
+
+  dom.mcpClearButton.addEventListener("click", () => {
+    setSelectedMcpServerIds([], { syncInput: true });
+  });
+
+  dom.mcpSelected.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action='remove-mcp-server']");
+    if (!button) {
+      return;
+    }
+    const serverId = String(button.getAttribute("data-mcp-server-id") || "").trim();
+    if (!serverId) {
+      return;
+    }
+    setSelectedMcpServerIds(
+      selectedMcpServerIds().filter((item) => item !== serverId),
+      { syncInput: true }
+    );
+  });
+
+  dom.mcpList.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const clearButton = target.closest("button[data-action='mcp-oauth-clear']");
+    if (clearButton) {
+      const serverId = String(clearButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void clearMcpOauthLogin(serverId);
+      }
+      return;
+    }
+    const loginButton = target.closest("button[data-action='mcp-oauth-login']");
+    if (loginButton) {
+      const serverId = String(loginButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void startMcpOauthLogin(serverId);
+      }
+      return;
+    }
+    const envAuthButton = target.closest("button[data-action='mcp-env-auth-configure']");
+    if (envAuthButton) {
+      const serverId = String(envAuthButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        void configureMcpEnvAuth(serverId);
+      }
+      return;
+    }
+    const detailsButton = target.closest("button[data-action='toggle-mcp-detail']");
+    if (detailsButton) {
+      const serverId = String(detailsButton.getAttribute("data-mcp-server-id") || "").trim();
+      if (serverId) {
+        toggleMcpDetailExpanded(serverId);
+      }
+      return;
+    }
+    const card = target.closest("[data-action='toggle-mcp-server']");
+    if (!card) {
+      return;
+    }
+    if (card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    const serverId = String(card.getAttribute("data-mcp-server-id") || "").trim();
+    if (!serverId) {
+      return;
+    }
+    const selected = new Set(selectedMcpServerIds());
+    if (selected.has(serverId)) {
+      selected.delete(serverId);
+    } else {
+      selected.add(serverId);
+    }
+    setSelectedMcpServerIds([...selected], { syncInput: true });
+  });
+
+  dom.mcpList.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (
+      target.closest("button[data-action='mcp-oauth-login']") ||
+      target.closest("button[data-action='mcp-oauth-clear']") ||
+      target.closest("button[data-action='mcp-env-auth-configure']") ||
+      target.closest("button[data-action='toggle-mcp-detail']")
+    ) {
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    const card = target.closest("[data-action='toggle-mcp-server']");
+    if (!card || card.getAttribute("aria-disabled") === "true") {
+      return;
+    }
+    event.preventDefault();
+    card.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+
   if (dom.agentsRoleFilter) {
     dom.agentsRoleFilter.addEventListener("change", () => {
       state.agentsView.roleFilter = String(dom.agentsRoleFilter.value || "all").trim().toLowerCase();
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = 0;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1000;
       markAgentPanelDirty();
       scheduleRender();
@@ -6662,6 +9113,7 @@ function bindEvents() {
       state.agentsView.searchQuery = dom.agentsSearchInput.value;
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = 0;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1000;
       markAgentPanelDirty();
       scheduleRender();
@@ -7029,6 +9481,7 @@ function bindEvents() {
       const preservedTop = dom.agentsLive.scrollTop;
       state.agentPanel.preserveScrollNextRender = true;
       state.agentPanel.preservedScrollTop = preservedTop;
+      state.agentPanel.preservedScrollHeight = null;
       state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
       window.requestAnimationFrame(() => {
         dom.agentsLive.scrollTop = preservedTop;
@@ -7040,11 +9493,19 @@ function bindEvents() {
   dom.agentFocusBody.addEventListener("toggle", onStepGroupToggle, true);
 
   dom.agentsLive.addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-action]");
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const button = target.closest("button[data-action]");
     if (!button) {
       return;
     }
     const action = button.getAttribute("data-action");
+    if (action === "load-older-messages") {
+      void loadOlderMessages();
+      return;
+    }
     if (action === "copy-agent-id") {
       const value = button.getAttribute("data-copy-value") || "";
       void copyAgentField(value, "copied_agent_id");

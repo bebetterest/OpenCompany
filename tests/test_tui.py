@@ -348,7 +348,7 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
                 def load_session_context(self, session_id: str) -> RunSession:
                     del session_id
                     return RunSession(
-                        id="session-copy-1",
+                        id="session-live",
                         project_dir=project_dir,
                         task="loaded task",
                         locale="en",
@@ -380,6 +380,8 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
             app.orchestrator = _FakeOrchestrator()  # type: ignore[assignment]
             app._restore_session_history("session-live")
 
+            self.assertEqual(app.configured_resume_session_id, "session-live")
+            self.assertEqual(app.current_session_id, "session-live")
             self.assertEqual(app.session_mode, WorkspaceMode.DIRECT)
             self.assertTrue(app.session_mode_locked)
 
@@ -824,17 +826,21 @@ model = "openai/gpt-4.1-mini"
                 def subscribe(self, callback) -> None:  # type: ignore[no-untyped-def]
                     self.callback = callback
 
-                def submit_run_in_active_session(
+                async def submit_run_in_active_session(
                     self,
                     session_id: str,
                     task: str,
                     *,
                     model: str | None = None,
                     root_agent_name: str | None = None,
+                    enabled_mcp_server_ids: list[str] | None = None,
+                    remote_password: str | None = None,
                     source: str = "tui",
                 ) -> dict[str, str]:
+                    del remote_password
                     self.calls.append((session_id, task, str(model or ""), source))
                     self.root_agent_names.append(root_agent_name)
+                    self.enabled_mcp_server_ids = enabled_mcp_server_ids
                     return {
                         "session_id": session_id,
                         "root_agent_id": "agent-root-live",
@@ -855,6 +861,8 @@ model = "openai/gpt-4.1-mini"
                 model_input.value = "openai/gpt-4.1-mini"
                 root_agent_name_input = app.query_one("#root_agent_name_input", Input)
                 root_agent_name_input.value = "Root Live"
+                mcp_input = app.query_one("#mcp_servers_input", Input)
+                mcp_input.value = "filesystem, docs"
                 await pilot.pause()
                 run_button = app.query_one("#run_button", Button)
                 self.assertFalse(run_button.disabled)
@@ -872,6 +880,7 @@ model = "openai/gpt-4.1-mini"
                     ],
                 )
                 self.assertEqual(fake.root_agent_names, ["Root Live"])
+                self.assertEqual(fake.enabled_mcp_server_ids, ["filesystem", "docs"])
                 self.assertEqual(app.current_task, "root task live")
                 self.assertEqual(app.current_session_status, "running")
                 self.assertIsNotNone(app.session_task)

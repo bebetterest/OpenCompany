@@ -86,3 +86,54 @@ class AgentMessageCursorTests(unittest.TestCase):
             page = logger.list_records(cursor="not-a-cursor", limit=10)
             self.assertEqual(len(page["messages"]), 1)
             self.assertFalse(page["has_more"])
+
+    def test_tail_and_before_merge_globally_without_per_agent_window_reads(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            logger = AgentMessageLogger(Path(temp_dir))
+            agent_a = _agent(session_id="session-1", agent_id="agent-a", name="A")
+            agent_b = _agent(session_id="session-1", agent_id="agent-b", name="B")
+            agent_c = _agent(session_id="session-1", agent_id="agent-c", name="C")
+
+            logger.append(
+                agent_a,
+                {"role": "user", "content": "a-1"},
+                {"timestamp": "2026-03-18T10:00:00Z"},
+            )
+            logger.append(
+                agent_b,
+                {"role": "user", "content": "b-1"},
+                {"timestamp": "2026-03-18T10:00:01Z"},
+            )
+            logger.append(
+                agent_c,
+                {"role": "user", "content": "c-1"},
+                {"timestamp": "2026-03-18T10:00:02Z"},
+            )
+            logger.append(
+                agent_a,
+                {"role": "assistant", "content": "a-2"},
+                {"timestamp": "2026-03-18T10:00:03Z"},
+            )
+
+            original_read_range = logger._read_range
+            spans: list[int] = []
+
+            def _recording_read_range(agent_id: str, start_index: int, end_index: int | None):  # type: ignore[no-untyped-def]
+                upper_bound = start_index if end_index is None else end_index
+                spans.append(max(0, int(upper_bound) - int(start_index)))
+                return original_read_range(agent_id, start_index, end_index)
+
+            logger._read_range = _recording_read_range  # type: ignore[method-assign]
+
+            tail_page = logger.list_records(tail=2, limit=10)
+            self.assertEqual(
+                [record["message"]["content"] for record in tail_page["messages"]],
+                ["c-1", "a-2"],
+            )
+            self.assertTrue(tail_page["before_cursor"])
+            before_page = logger.list_records(before=tail_page["before_cursor"], limit=2)
+            self.assertEqual(
+                [record["message"]["content"] for record in before_page["messages"]],
+                ["a-1", "b-1"],
+            )
+            self.assertTrue(not spans or all(span <= 1 for span in spans))

@@ -17,6 +17,10 @@ from opencompany.models import (
 from opencompany.status_machine import normalize_session_completion_state
 from opencompany.utils import json_ready
 
+TOOL_RUN_TIMELINE_EVENT_TYPES = frozenset(
+    {"tool_call_started", "tool_call", "tool_run_submitted", "tool_run_updated"}
+)
+
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
@@ -45,6 +49,11 @@ class Storage:
                 final_summary TEXT,
                 completion_state TEXT,
                 follow_up_needed INTEGER NOT NULL,
+                enabled_skill_ids_json TEXT NOT NULL DEFAULT '[]',
+                enabled_mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
+                skill_bundle_root TEXT NOT NULL DEFAULT '',
+                skills_state_json TEXT NOT NULL DEFAULT '{}',
+                mcp_state_json TEXT NOT NULL DEFAULT '{}',
                 config_snapshot_json TEXT NOT NULL
             );
 
@@ -78,6 +87,31 @@ class Storage:
                 payload_json TEXT NOT NULL,
                 workspace_id TEXT,
                 checkpoint_seq INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_session_id_desc
+              ON events(session_id, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_events_session_event_type_id_desc
+              ON events(session_id, event_type, id DESC);
+
+            CREATE TABLE IF NOT EXISTS tool_run_timeline_events (
+                source_event_id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_run_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                agent_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_run_timeline_session_run_event
+              ON tool_run_timeline_events(session_id, tool_run_id, source_event_id ASC);
+
+            CREATE TABLE IF NOT EXISTS tool_run_timeline_backfills (
+                session_id TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS checkpoints (
@@ -151,6 +185,31 @@ class Storage:
     def _migrate_schema(self) -> None:
         self._ensure_column("sessions", "status_reason", "TEXT")
         self._ensure_column("sessions", "workspace_mode", "TEXT NOT NULL DEFAULT 'staged'")
+        self._ensure_column(
+            "sessions",
+            "enabled_skill_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        self._ensure_column(
+            "sessions",
+            "enabled_mcp_server_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )
+        self._ensure_column(
+            "sessions",
+            "skill_bundle_root",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            "sessions",
+            "skills_state_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "sessions",
+            "mcp_state_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
         self._ensure_column("agents", "status_reason", "TEXT")
         self._ensure_column("tool_runs", "status_reason", "TEXT")
         self._ensure_column("steer_runs", "status_reason", "TEXT")
@@ -266,8 +325,9 @@ class Storage:
             INSERT INTO sessions (
                 id, project_dir, task, locale, root_agent_id, workspace_mode, status, created_at,
                 status_reason, updated_at, loop_index, final_summary, completion_state,
-                follow_up_needed, config_snapshot_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                follow_up_needed, enabled_skill_ids_json, enabled_mcp_server_ids_json,
+                skill_bundle_root, skills_state_json, mcp_state_json, config_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 project_dir=excluded.project_dir,
                 task=excluded.task,
@@ -282,6 +342,11 @@ class Storage:
                 final_summary=excluded.final_summary,
                 completion_state=excluded.completion_state,
                 follow_up_needed=excluded.follow_up_needed,
+                enabled_skill_ids_json=excluded.enabled_skill_ids_json,
+                enabled_mcp_server_ids_json=excluded.enabled_mcp_server_ids_json,
+                skill_bundle_root=excluded.skill_bundle_root,
+                skills_state_json=excluded.skills_state_json,
+                mcp_state_json=excluded.mcp_state_json,
                 config_snapshot_json=excluded.config_snapshot_json
             """,
             (
@@ -299,6 +364,11 @@ class Storage:
                 session.final_summary,
                 completion_state,
                 int(session.follow_up_needed),
+                json.dumps(json_ready(session.enabled_skill_ids), ensure_ascii=False),
+                json.dumps(json_ready(session.enabled_mcp_server_ids), ensure_ascii=False),
+                str(session.skill_bundle_root or ""),
+                json.dumps(json_ready(session.skills_state), ensure_ascii=False),
+                json.dumps(json_ready(session.mcp_state), ensure_ascii=False),
                 json.dumps(json_ready(session.config_snapshot), ensure_ascii=False),
             ),
         )
@@ -350,8 +420,8 @@ class Storage:
         )
         self._commit()
 
-    def append_event(self, event: EventRecord) -> None:
-        self.connection.execute(
+    def append_event(self, event: EventRecord) -> int:
+        cursor = self.connection.execute(
             """
             INSERT INTO events (
                 timestamp, session_id, agent_id, parent_agent_id, event_type,
@@ -370,7 +440,152 @@ class Storage:
                 event.checkpoint_seq,
             ),
         )
+        event_id = int(cursor.lastrowid)
+        self._project_tool_run_timeline_event(event=event, source_event_id=event_id)
         self._commit()
+        return event_id
+
+    def append_tool_run_timeline_event(
+        self,
+        *,
+        source_event_id: int,
+        session_id: str,
+        tool_run_id: str,
+        timestamp: str,
+        event_type: str,
+        phase: str,
+        agent_id: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        self._insert_tool_run_timeline_event(
+            source_event_id=source_event_id,
+            session_id=session_id,
+            tool_run_id=tool_run_id,
+            timestamp=timestamp,
+            event_type=event_type,
+            phase=phase,
+            agent_id=agent_id,
+            payload=payload,
+        )
+        self._commit()
+
+    def _insert_tool_run_timeline_event(
+        self,
+        *,
+        source_event_id: int,
+        session_id: str,
+        tool_run_id: str,
+        timestamp: str,
+        event_type: str,
+        phase: str,
+        agent_id: str | None,
+        payload: dict[str, Any],
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO tool_run_timeline_events (
+                source_event_id,
+                session_id,
+                tool_run_id,
+                timestamp,
+                event_type,
+                phase,
+                agent_id,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(source_event_id),
+                session_id,
+                tool_run_id,
+                timestamp,
+                event_type,
+                phase,
+                agent_id,
+                json.dumps(json_ready(payload), ensure_ascii=False),
+            ),
+        )
+
+    def load_tool_run_timeline(
+        self,
+        *,
+        session_id: str,
+        tool_run_id: str,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        normalized_limit = max(1, int(limit))
+        rows = self.connection.execute(
+            """
+            SELECT source_event_id, session_id, tool_run_id, timestamp, event_type, phase, agent_id, payload_json
+            FROM tool_run_timeline_events
+            WHERE session_id = ? AND tool_run_id = ?
+            ORDER BY source_event_id DESC
+            LIMIT ?
+            """,
+            (session_id, tool_run_id, normalized_limit),
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            payload = row["payload_json"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            records.append(
+                {
+                    "timestamp": str(row["timestamp"]),
+                    "event_type": str(row["event_type"]),
+                    "phase": str(row["phase"]),
+                    "agent_id": str(row["agent_id"] or ""),
+                    "payload": payload,
+                    "source_event_id": int(row["source_event_id"]),
+                }
+            )
+        return records
+
+    def has_tool_run_timeline_backfill(self, session_id: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM tool_run_timeline_backfills WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return row is not None
+
+    def mark_tool_run_timeline_backfilled(self, session_id: str, completed_at: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO tool_run_timeline_backfills (session_id, completed_at)
+            VALUES (?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET completed_at = excluded.completed_at
+            """,
+            (session_id, completed_at),
+        )
+        self._commit()
+
+    def _project_tool_run_timeline_event(
+        self,
+        *,
+        event: EventRecord,
+        source_event_id: int,
+    ) -> None:
+        if event.event_type not in TOOL_RUN_TIMELINE_EVENT_TYPES:
+            return
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        tool_run_id = str(payload.get("tool_run_id", "")).strip()
+        if not tool_run_id:
+            return
+        self._insert_tool_run_timeline_event(
+            source_event_id=int(source_event_id),
+            session_id=event.session_id,
+            tool_run_id=tool_run_id,
+            timestamp=event.timestamp,
+            event_type=event.event_type,
+            phase=event.phase,
+            agent_id=event.agent_id,
+            payload=payload,
+        )
 
     def replace_pending_agents(self, session_id: str, agent_ids: list[str]) -> None:
         self.connection.execute("DELETE FROM pending_actions WHERE session_id = ?", (session_id,))
@@ -794,10 +1009,83 @@ class Storage:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def load_events(self, session_id: str) -> list[dict[str, Any]]:
+    def load_events(
+        self,
+        session_id: str,
+        *,
+        event_types: list[str] | None = None,
+        exclude_event_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if event_types:
+            normalized_event_types = [
+                str(event_type).strip()
+                for event_type in event_types
+                if str(event_type).strip()
+            ]
+            if normalized_event_types:
+                placeholders = ",".join("?" for _ in normalized_event_types)
+                clauses.append(f"event_type IN ({placeholders})")
+                params.extend(normalized_event_types)
+        if exclude_event_types:
+            normalized_excluded = [
+                str(event_type).strip()
+                for event_type in exclude_event_types
+                if str(event_type).strip()
+            ]
+            if normalized_excluded:
+                placeholders = ",".join("?" for _ in normalized_excluded)
+                clauses.append(f"event_type NOT IN ({placeholders})")
+                params.extend(normalized_excluded)
         rows = self.connection.execute(
-            "SELECT * FROM events WHERE session_id = ? ORDER BY id ASC",
-            (session_id,),
+            "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY id ASC",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_events_page(
+        self,
+        *,
+        session_id: str,
+        before_id: int | None = None,
+        limit: int = 200,
+        event_types: list[str] | None = None,
+        exclude_event_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(int(before_id))
+        if event_types:
+            normalized_event_types = [
+                str(event_type).strip()
+                for event_type in event_types
+                if str(event_type).strip()
+            ]
+            if normalized_event_types:
+                placeholders = ",".join("?" for _ in normalized_event_types)
+                clauses.append(f"event_type IN ({placeholders})")
+                params.extend(normalized_event_types)
+        if exclude_event_types:
+            normalized_excluded = [
+                str(event_type).strip()
+                for event_type in exclude_event_types
+                if str(event_type).strip()
+            ]
+            if normalized_excluded:
+                placeholders = ",".join("?" for _ in normalized_excluded)
+                clauses.append(f"event_type NOT IN ({placeholders})")
+                params.extend(normalized_excluded)
+        params.append(max(1, int(limit)))
+        rows = self.connection.execute(
+            (
+                "SELECT * FROM events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY id DESC LIMIT ?"
+            ),
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 

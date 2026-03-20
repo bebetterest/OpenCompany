@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from opencompany.models import ShellCommandRequest, ShellCommandResult
+from opencompany.models import InteractiveShellRequest, ShellCommandRequest, ShellCommandResult
 
 
 class SandboxError(RuntimeError):
@@ -12,6 +12,20 @@ class SandboxError(RuntimeError):
 
 
 ShellEventCallback = Callable[[str, str], Awaitable[None] | None]
+
+
+class InteractiveSandboxProcess(ABC):
+    @abstractmethod
+    async def write_line(self, text: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def wait_closed(self) -> None:
+        raise NotImplementedError
 
 
 class SandboxBackend(ABC):
@@ -29,6 +43,15 @@ class SandboxBackend(ABC):
         request: ShellCommandRequest,
         on_event: ShellEventCallback | None = None,
     ) -> ShellCommandResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def start_interactive(
+        self,
+        request: InteractiveShellRequest,
+        on_stdout: ShellEventCallback | None = None,
+        on_stderr: ShellEventCallback | None = None,
+    ) -> InteractiveSandboxProcess:
         raise NotImplementedError
 
     def should_block_outside_workspace_write(self) -> bool:

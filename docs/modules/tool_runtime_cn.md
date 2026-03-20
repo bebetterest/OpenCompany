@@ -14,11 +14,30 @@
 当前 root/worker 默认工具集合：
 
 - `shell`、`compress_context`、`wait_time`
+- `list_mcp_servers`、`list_mcp_resources`、`read_mcp_resource`
 - `list_agent_runs`、`get_agent_run`、`spawn_agent`、`cancel_agent`、`steer_agent`
 - `list_tool_runs`、`get_tool_run`、`wait_run`、`cancel_tool_run`
 - `finish`
 
 角色可用工具可通过 `[runtime.tools]` 配置，其中也包括 `steer_agent_scope`（`session` / `descendants`）。
+
+## MCP 工具与资源表面
+
+- helper 工具：
+  - `list_mcp_servers`：列出当前 agent runtime 可见的启用/已配置 MCP servers。
+  - `list_mcp_resources`：按分页列出缓存中的 MCP resources，并支持可选 `server_id` 过滤。
+  - `read_mcp_resource`：读取单个具体 MCP resource URI；v1 不做 resource template 展开。
+- 动态 MCP tools 会在运行时以 `mcp__<server_id>__<tool_name>__<hash>` 这种 synthetic name 注入。
+- 动态 MCP tools 仍然是一等工具调用：每次调用都会生成自己的 `tool_run` 行，并返回投影后的 agent 可见结果。
+- MCP resource 发现是运行时可选能力：当 server 对 `resources/list` 返回 `-32601 Method not found`（或等价错误）时，runtime 会保持该 server 已连接并保留已发现 tools，同时将 resources 计为 0，而不是把 server 视为不可用。
+- 动态 MCP tool 的超时预算统一归入 `runtime.tool_timeouts.actions.mcp_tool`。
+- 受 OAuth 保护的 Streamable HTTP MCP server 可通过 `opencompany mcp-login --mcp-server <id>` 或 Web UI 中的 MCP 卡片登录动作完成授权；runtime 会复用已保存的 bearer token，并在具备 refresh token 时自动刷新。
+- 运行进程内会按 MCP server 串行化 OAuth refresh；多个并发 agent 会复用最新轮换出的 token，而不是竞争同一份 refresh token。
+- 若启用 OAuth 的 server 在 MCP 连接初始化阶段仍持续返回 HTTP `401`（包括 `invalid_token`、登录过期或缺少 refresh token），runtime 会自动清理该 server 的本地 OAuth 记录，强制下一次走干净重登链路。
+- 对于在 URL 查询参数里暴露浏览器登录标记（例如 `?login`）的 hosted provider，可以直接按原地址配置；runtime 在 streamable HTTP 传输请求前会自动移除该查询标记。
+- MCP OAuth 行为支持按 server 单独配置；对于要求更严格的 hosted provider，可覆盖 `oauth_authorization_prompt`、`oauth_use_resource_param` 等细节。
+- 若某个 hosted server 配置在 `.../mcp` URL 上，且初次 Streamable HTTP 连接初始化失败，runtime 会在真正报错前自动重试同级的 `.../sse` 端点。
+- MCP tool/resource 输出会先做脱敏与尺寸截断，再返回给 agent 或持久化到 `tool_run.result`。
 
 ## 协议原则
 
@@ -136,6 +155,9 @@ agent 可见工具返回采用精简投影协议：
 - 状态：`queued` -> `running` -> `completed|failed|cancelled`
 - 时间戳：`created_at`、`started_at`、`completed_at`
 - 负载：arguments、原始 result、error
+- 详情时间线：按 `tool_run_id` 读取投影后的生命周期行（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
+  - 新 session 会在 event 追加时增量写入这些投影行
+  - 旧 session 会在首次打开详情时做一次投影回填
 
 ## 执行语义
 

@@ -58,6 +58,11 @@ Empty-protocol retry behavior:
 - tool list by role (from config + prompt-defined schemas)
 - request message packing (`system` + conversation)
 
+MCP integration adds two runtime context layers:
+
+- agent-specific MCP prompt block appended after skills, summarizing enabled servers, connection warnings, and discovered counts
+- agent-specific tool surface expansion, which merges built-in tools with helper MCP tools and dynamic MCP tool definitions discovered from connected servers
+
 `ContextStore` handles:
 
 - append conversation/tool-result messages

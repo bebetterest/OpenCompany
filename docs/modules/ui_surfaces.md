@@ -17,6 +17,8 @@ Major API groups:
 
 - bootstrap/configuration: `/api/bootstrap`, `/api/launch-config`, `/api/sessions`
 - execution control: `/api/run`, `/api/interrupt`
+- skill discovery: `/api/skills/discover`
+- MCP discovery: `/api/mcp/servers`
 - sandbox terminal launch: `/api/terminal/open`
 - remote workspace validation: `/api/remote/validate`
 - observability: `/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -28,16 +30,18 @@ Execution semantics:
 
 - `/api/run` starts a new session when launch config provides `project_dir`.
 - New-session launch config also carries `session_mode` (`direct` / `staged`), defaulting to `direct`.
+- `/api/run` accepts `enabled_skill_ids`; for loaded sessions this replaces the current skill set for the new run, while omitted values keep the existing set.
+- `/api/run` also accepts `enabled_mcp_server_ids`; for loaded sessions this replaces the enabled MCP server set for the new run, while omitted values keep the existing set.
 - New-session launch config may carry `remote` (SSH target + remote dir + auth policy) and request-only `remote_password`.
 - Remote workspace is accepted only when `session_mode=direct`; `staged + remote` is rejected.
 - For password auth sessions, request-time `remote_password` is used on `/api/run`, `/api/terminal/open`, and `/api/remote/validate`.
 - `/api/run` runs inside an existing session when launch config provides `session_id`, reactivates that session, and appends a fresh root agent for the new run.
-- When an existing session is loaded, Web UI resolves its persisted workspace mode, shows it as locked, and ignores any mode override attempts.
+- When an existing session is loaded, Web UI binds the original `session_id` directly, resolves its persisted workspace mode, shows it as locked, and ignores any mode override attempts.
 - When setup/reconfigure loads an existing remote session, Web UI validates remote runtime first if selected backend is `anthropic`; backend `none` skips this pre-check.
 - When `/api/run` is submitted while that session is already running, runtime immediately appends a fresh root agent to the live session and schedules it alongside existing active agents.
 - For live-session root append, Web UI keeps the current in-memory agent graph and consumes incremental WebSocket updates; it avoids full `/api/session/{id}/events` replay so parent/child links and cancelled states are not transiently overwritten.
 - `/api/session/{id}/steers` keeps normal enqueue semantics for active sessions; user steer submissions are tagged with a user source actor and share the same persisted steer-run path as agent-tool steering. When the target session is inactive and no other session is running, Web UI auto-continues that session and asks runtime to reactivate the steered agent before loop scheduling.
-- selecting session in setup/reconfigure triggers context import only (no auto-run).
+- selecting session in setup/reconfigure loads persisted session metadata only (no implicit clone, no auto-run).
 - selecting project in setup/reconfigure switches to new-session mode and clears volatile runtime views (`Overview`/`Agents` live stream/tool-run timelines) so stale data from the previously loaded session is not shown.
 - in `direct` mode, `Diff` is disabled and `Apply` / `Undo` controls are unavailable because changes are already live in the target project.
 
@@ -54,7 +58,28 @@ Web UI-specific capabilities:
   - default value comes from `opencompany.toml` (`[llm.openrouter].model`)
   - user can override it per run/continue; submitted value is forwarded to runtime and applied to root/worker LLM calls for that execution
 - control-bar exposes an optional root-agent-name input; when non-empty, `/api/run` forwards it and runtime uses it as the base root agent name (still deduplicated in-session)
+- skills and MCP selector sections are collapsible and default to collapsed on first load
+- control-bar also exposes a skills selector driven by clickable cards plus `Discover` / `Select All` / `Clear`
+  - skills are still submitted as `enabled_skill_ids`
+  - discover reads project/global skills for the current local or remote launch context
+  - skills panel is organized into `Overview` → `Enabled Skills` → `Catalog` → `Skill Warnings` sections
+  - cards default to compact mode (title/status/short description) and expose per-card detail toggle for structure/doc/source metadata
+  - header summary is count-only; duplicated long status text is removed from panel body
+  - discovered skills render as selectable cards with selected chips and warning cards; manual text entry is no longer part of the Web UI flow
+  - already-materialized session skills remain visible in the selector even before a fresh discover
+  - skills overview surfaces key counts (selected/catalog/warnings) and keeps guidance text concise
+- control-bar also exposes an MCP server selector driven by clickable cards plus `Discover` / `Use Defaults` / `Select All` / `Clear`
+  - selection is submitted as `enabled_mcp_server_ids`
+  - configured MCP servers are preloaded from `opencompany.toml`, and `Discover` refreshes the catalog
+  - `Use Defaults` mirrors servers marked `enabled = true` in config for the current run; manual selection remains a per-run override
+  - MCP panel is organized into `Overview` → `Enabled MCP Servers` → `Catalog` → `MCP Warnings` sections
+  - OAuth-enabled MCP cards also expose `Login` / `Continue Login` / `Re-login` plus `Clear Auth`; pending logins stay clickable so the authorization page can be reopened without creating a second polling loop, and `Clear Auth` removes the stored OAuth record for a full reconnect
+  - MCP OAuth start is asynchronous: `/api/mcp/oauth/start` may return a pending `flow_id` before an `authorization_url` is ready, and the client keeps polling `/api/mcp/oauth/{flow_id}` to open the auth page as soon as the URL becomes available
+  - MCP cards default to compact mode and expose per-card detail toggle for config/runtime structure fields (endpoint, roots, timeout, allowed tools, auth fields, protocol)
+  - selector surfaces both config metadata and runtime metadata per server, while the overview block keeps only selected/connected/warning KPIs to reduce duplication
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
+- session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
+- initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active
 - `Agents` views (Web/TUI) now show context-compression runtime metrics per agent:
   - `compression_count`
   - `current_context_tokens/context_limit_tokens`
@@ -70,6 +95,7 @@ Web UI-specific capabilities:
   - agent status KPIs now split `cancelled` and `terminated`; no `waiting` agent bucket
 - per-row `Tool Runs` detail dialog with lifecycle timeline (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`) and payload inspection
   - detail fetch uses `/api/session/{id}/tool-runs/{tool_run_id}` and keeps polling while the modal is open, so running `shell` runs show live accumulated `stdout/stderr`
+  - persisted detail timelines come from the projection-backed tool-run detail API; old sessions are lazily backfilled once instead of rescanning session-wide events on every open
 - per-agent full-row `Steer` button on live agent cards with a built-in compose overlay (no system prompt/confirm dialog; submit acts as confirmation) and a `Steer Runs` panel with filter/group/metrics/search
 - `Steer Runs` rows and related event text prioritize showing the steer source actor (`from`) and keep the raw source channel (`via`) as secondary detail
 - `Steer Runs` rows are rendered as multi-line cards: target/source/channel/created time are separated from message content, and successful runs show the inserted delivery step
@@ -107,12 +133,13 @@ TUI exposes run/interrupt, setup-based session loading, project sync actions, an
 New sessions default to `direct` mode in setup; users can switch to `staged` before choosing the project directory.
 In `direct` mode setup, users can choose local workspace or remote SSH workspace (target/dir/auth/known-hosts); `staged` disables remote selection.
 For remote SSH setup, clicking `Validate & Create` performs remote validation (SSH target/dir/dependency checks) and immediately creates the launch config if validation succeeds.
-Loaded sessions keep their original workspace mode locked.
+Loaded sessions keep their original `session_id` and workspace mode locked.
 When `Run` is used on an existing (non-active) session, runtime appends a fresh root agent for that run rather than reusing the previous root, then switches the session back to active.
 When `Run` is pressed again while the same session is running, runtime immediately appends another fresh root agent to the live session and schedules it with existing active agents.
 It also provides a `Terminal` action from the control row that directly launches a system terminal window using the same sandbox backend/config as agent `shell` calls, with workspace root fixed to the active session workspace. Edits made there are tracked by workspace diff/project sync just like agent edits.
 The control row is organized in three lines: model input + root-agent-name input + locale switch buttons (`EN` / `中文`), a task line with explicit `Task` label and multiline `TextArea` input (content-driven height expansion, min 3/max 9 rows), and run controls (`Run`, `Terminal`, `Reconfigure`, `Interrupt`).
 The model input defaults from config and remains overridable per run/continue.
+Web UI no longer exposes free-text skill/MCP inputs; selection happens through cards, while CLI/TUI still support explicit `--mcp-server` flags.
 Agent cards/status sections display each agent's selected model from persisted metadata.
 Agent cards/status sections also display context-compression metrics (`compression_count`, context token usage, usage ratio, latest compacted range).
 In `direct` mode, TUI disables the `Diff` tab and `Apply` / `Undo` controls.
@@ -120,6 +147,7 @@ In `direct` mode, TUI disables the `Diff` tab and `Apply` / `Undo` controls.
 CLI also exposes `opencompany terminal <session_id>` and `opencompany terminal <session_id> --self-check`.
 `--self-check` verifies policy parity with agent `shell` and backend-strategy enforcement (workspace write allowed; outside write expected blocked for `anthropic`, expected allowed for `none`).
 Interactive CLI run/resume status panels now include a per-agent `model` field.
+CLI also exposes `opencompany mcp-login --mcp-server <id>` for OAuth-protected hosted MCP servers.
 CLI `run`/`tui`/`ui` setup now supports remote flags for new sessions:
 - `--remote-target user@host[:port]`
 - `--remote-dir /abs/linux/path`
@@ -132,7 +160,7 @@ TUI `Tool Runs` capabilities now include:
 - grouped list rendering with run selection (`Previous` / `Next`)
 - `Detail` modal for the selected run
 - detail fields: overview, arguments, result, error, lifecycle timeline
-- lifecycle timeline built incrementally from runtime events (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`)
+- lifecycle timeline in persisted detail views is served by projection-backed tool-run detail reads; live updates still append incrementally from runtime events (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`)
 - auto-refresh while detail modal is open when related run events arrive
 
 TUI `Steer Runs` capabilities now include:

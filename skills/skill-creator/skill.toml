@@ -1,0 +1,7 @@
+[skill]
+id = "skill-creator"
+name = "Skill Creator"
+name_cn = "Skill 创建器"
+description = "Create or update OpenCompany skills with skill.toml metadata, focused SKILL docs, and resources under resources/."
+description_cn = "创建或更新符合 OpenCompany 规范的 skill，包括 skill.toml 元数据、精简的 SKILL 文档和 resources/ 资源布局。"
+tags = ["skills", "authoring", "templates"]

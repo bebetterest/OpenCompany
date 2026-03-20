@@ -146,6 +146,12 @@ def create_webui_app(
         session_mode_text = _optional_string(payload.get("session_mode"))
         sandbox_backend_text = _optional_string(payload.get("sandbox_backend"))
         remote_password = _optional_string(payload.get("remote_password"))
+        raw_enabled_skill_ids = payload.get("enabled_skill_ids")
+        raw_enabled_mcp_server_ids = payload.get("enabled_mcp_server_ids")
+        if raw_enabled_skill_ids is not None and not isinstance(raw_enabled_skill_ids, list):
+            raise HTTPException(status_code=400, detail="enabled_skill_ids must be an array.")
+        if raw_enabled_mcp_server_ids is not None and not isinstance(raw_enabled_mcp_server_ids, list):
+            raise HTTPException(status_code=400, detail="enabled_mcp_server_ids must be an array.")
         remote_payload = payload.get("remote")
         if remote_payload is not None and not isinstance(remote_payload, dict):
             raise HTTPException(status_code=400, detail="remote must be an object.")
@@ -189,13 +195,109 @@ def create_webui_app(
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
         task = str(payload.get("task", "")).strip()
         try:
-            return await state.start_run(
-                task,
-                model=model_text,
-                root_agent_name=root_agent_name_text,
+            start_run_kwargs: dict[str, Any] = {
+                "model": model_text,
+                "root_agent_name": root_agent_name_text,
+            }
+            if isinstance(raw_enabled_skill_ids, list):
+                start_run_kwargs["enabled_skill_ids"] = [
+                    str(item).strip()
+                    for item in raw_enabled_skill_ids
+                    if str(item).strip()
+                ]
+            if isinstance(raw_enabled_mcp_server_ids, list):
+                start_run_kwargs["enabled_mcp_server_ids"] = [
+                    str(item).strip()
+                    for item in raw_enabled_mcp_server_ids
+                    if str(item).strip()
+                ]
+            return await state.start_run(task, **start_run_kwargs)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/skills/discover")
+    async def api_skills_discover(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        remote_payload = body.get("remote")
+        if remote_payload is not None and not isinstance(remote_payload, dict):
+            raise HTTPException(status_code=400, detail="remote must be an object.")
+        try:
+            result = await state.discover_skills(
+                project_dir=_optional_string(body.get("project_dir")),
+                remote=remote_payload if isinstance(remote_payload, dict) else None,
+                remote_password=_optional_string(body.get("remote_password")),
             )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/servers")
+    async def api_mcp_servers() -> JSONResponse:
+        try:
+            result = await state.discover_mcp_servers()
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/oauth/start")
+    async def api_mcp_oauth_start(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        try:
+            result = await state.start_mcp_oauth_login(
+                _optional_string(body.get("server_id")) or "",
+                timeout_seconds=float(body.get("timeout_seconds") or 300.0),
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/api/mcp/oauth/{flow_id}")
+    async def api_mcp_oauth_status(flow_id: str) -> JSONResponse:
+        try:
+            result = await state.mcp_oauth_login_status(flow_id)
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/oauth/clear")
+    async def api_mcp_oauth_clear(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        try:
+            result = await state.clear_mcp_oauth_login(
+                _optional_string(body.get("server_id")) or ""
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/mcp/env-auth/configure")
+    async def api_mcp_env_auth_configure(payload: dict[str, Any] | None = None) -> JSONResponse:
+        body = payload if isinstance(payload, dict) else {}
+        raw_values = body.get("values")
+        if not isinstance(raw_values, dict):
+            raise HTTPException(status_code=400, detail="values must be an object.")
+        try:
+            result = await state.configure_mcp_env_auth(
+                _optional_string(body.get("server_id")) or "",
+                raw_values,
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/interrupt")
     async def api_interrupt() -> dict[str, Any]:
@@ -244,13 +346,38 @@ def create_webui_app(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/api/session/{session_id}/events")
-    async def api_session_events(session_id: str) -> dict[str, Any]:
+    async def api_session_events(
+        session_id: str,
+        limit: int | None = None,
+        before: str | None = None,
+        activity_only: bool = False,
+        include_agents: bool = True,
+    ) -> dict[str, Any]:
         try:
-            records = state.load_session_events(session_id)
-            agents = state.load_session_agents(session_id)
+            if limit is None and before is None and not activity_only:
+                records = state.load_session_events(session_id)
+                before_cursor = None
+                has_more_before = False
+            else:
+                page = state.list_session_events_page(
+                    session_id,
+                    limit=limit,
+                    before=before,
+                    activity_only=activity_only,
+                )
+                records = page.get("events", [])
+                before_cursor = page.get("before_cursor")
+                has_more_before = bool(page.get("has_more_before", False))
+            agents = state.load_session_agents(session_id) if include_agents else []
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"session_id": session_id, "events": records, "agents": agents}
+        return {
+            "session_id": session_id,
+            "events": records,
+            "agents": agents,
+            "before_cursor": before_cursor,
+            "has_more_before": has_more_before,
+        }
 
     @app.get("/api/session/{session_id}/messages")
     async def api_session_messages(
@@ -259,6 +386,7 @@ def create_webui_app(
         limit: int = 500,
         cursor: str | None = None,
         tail: int | None = None,
+        before: str | None = None,
     ) -> JSONResponse:
         try:
             page = state.list_session_messages_page(
@@ -267,6 +395,7 @@ def create_webui_app(
                 cursor=cursor,
                 limit=limit,
                 tail=tail,
+                before=before,
             )
             return JSONResponse(
                 {
@@ -274,6 +403,8 @@ def create_webui_app(
                     "messages": page.get("messages", []),
                     "next_cursor": page.get("next_cursor"),
                     "has_more": bool(page.get("has_more", False)),
+                    "before_cursor": page.get("before_cursor"),
+                    "has_more_before": bool(page.get("has_more_before", False)),
                 }
             )
         except ValueError as exc:

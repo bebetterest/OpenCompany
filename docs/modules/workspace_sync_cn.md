@@ -60,6 +60,7 @@ child 工作区创建：
 
 忽略路径包含内部运行噪声（`.git`、`.opencompany`、缓存、`.env*` 等）。
 symlink 在全链路都会被排除（快照、树遍历、搜索、diff、apply/undo 同步）。
+位于 `.opencompany_skills/<session_id>` 下的 session skill bundle 不会被加入全局忽略列表，因为 staged 工作区中的 worker 需要继承这些文件。
 
 ## 向上增量提升
 
@@ -75,6 +76,8 @@ symlink 在全链路都会被排除（快照、树遍历、搜索、diff、apply
 - summary/recommendation 会附带恢复建议
 
 在 `direct` 模式下，不再有向上提升步骤，因为 worker 改动已经直接落在共享 root 工作区里。同时也不会生成稳定的 per-worker diff artifact。
+
+当 session 启用了 skills 时，worker 向上提升与 diff artifact 生成都会排除 `.opencompany_skills/<session_id>`，避免把运行时 bundle 资产当成项目改动。
 
 ## Stage / Apply / Undo 模型
 
@@ -99,6 +102,8 @@ symlink 在全链路都会被排除（快照、树遍历、搜索、diff、apply
 - project-sync status 返回 `disabled`
 - diff preview/apply/undo API 会快速报错
 - Web UI 与 TUI 会禁用 `Diff` / `Apply` / `Undo`
+
+在 `staged` 模式下，project-sync preview/apply/undo 也会排除 `.opencompany_skills/<session_id>`，不把它计入 staged delta。
 
 ## 远程运行时清理
 

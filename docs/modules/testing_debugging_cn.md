@@ -54,6 +54,7 @@ GitHub Actions 通过 `.github/workflows/tests.yml` 执行测试：
 - 会话事件流：`.opencompany/sessions/<session_id>/events.jsonl`
 - agent 消息流：`.opencompany/sessions/<session_id>/<agent_id>_messages.jsonl`
 - 可选 LLM 请求/响应追踪（`--debug`）：`debug/<agent_id>__<module>.jsonl`
+- 可选分阶段耗时追踪（`--debug`）：`debug/timings.jsonl`
 - 跨层诊断：`.opencompany/diagnostics.jsonl`
 
 常用排障命令：

@@ -1,0 +1,7 @@
+[skill]
+id = "pdf"
+name = "PDF"
+name_cn = "PDF"
+description = "Read, create, and review PDF files with rendering-focused workflows and visual checks."
+description_cn = "通过重视渲染与目检的流程处理 PDF 读取、生成与审查任务。"
+tags = ["pdf", "documents", "review"]

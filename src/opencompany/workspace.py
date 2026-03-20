@@ -6,7 +6,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from opencompany.models import WorkspaceMode, WorkspaceRef, normalize_workspace_mode
 from opencompany.utils import ensure_directory, hash_bytes, resolve_in_workspace
@@ -90,7 +90,13 @@ class WorkspaceManager:
             shutil.rmtree(root_snapshot)
         if workspace_mode == WorkspaceMode.STAGED:
             resolved_project_dir = normalized_project_dir.resolve()
-            self._copy_tree(resolved_project_dir, root_base_snapshot)
+            # Fresh staged workspaces should not inherit runtime skill bundles
+            # from the source project directory.
+            self._copy_tree(
+                resolved_project_dir,
+                root_base_snapshot,
+                exclude_relative_prefixes=(".opencompany_skills",),
+            )
             self._copy_tree(root_base_snapshot, root_snapshot)
             workspace_path = root_snapshot
             base_snapshot_path = root_base_snapshot
@@ -132,9 +138,18 @@ class WorkspaceManager:
         )
         return self.register(workspace)
 
-    def create_diff_artifact(self, agent_id: str, workspace_id: str) -> DiffArtifact:
+    def create_diff_artifact(
+        self,
+        agent_id: str,
+        workspace_id: str,
+        *,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> DiffArtifact:
         workspace = self.workspace(workspace_id)
-        changes = self.compute_workspace_changes(workspace_id)
+        changes = self.compute_workspace_changes(
+            workspace_id,
+            exclude_relative_prefixes=exclude_relative_prefixes,
+        )
         patch_map: dict[str, str] = {}
         patch_metadata: dict[str, dict[str, Any]] = {}
         for path in changes.modified + changes.added + changes.deleted:
@@ -173,18 +188,33 @@ class WorkspaceManager:
             deleted=changes.deleted,
         )
 
-    def compute_workspace_changes(self, workspace_id: str) -> WorkspaceChangeSet:
+    def compute_workspace_changes(
+        self,
+        workspace_id: str,
+        *,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> WorkspaceChangeSet:
         workspace = self.workspace(workspace_id)
         return self._compute_changes_between(
             before_root=workspace.base_snapshot_path,
             after_root=workspace.path,
+            exclude_relative_prefixes=exclude_relative_prefixes,
         )
 
-    def apply_workspace_changes(self, workspace_id: str, destination_root: Path) -> WorkspaceChangeSet:
+    def apply_workspace_changes(
+        self,
+        workspace_id: str,
+        destination_root: Path,
+        *,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> WorkspaceChangeSet:
         destination_root = destination_root.resolve()
         if not destination_root.exists():
             destination_root.mkdir(parents=True, exist_ok=True)
-        changes = self.compute_workspace_changes(workspace_id)
+        changes = self.compute_workspace_changes(
+            workspace_id,
+            exclude_relative_prefixes=exclude_relative_prefixes,
+        )
         if not (changes.added or changes.modified or changes.deleted):
             return changes
         workspace = self.workspace(workspace_id)
@@ -192,6 +222,7 @@ class WorkspaceManager:
             source_root=workspace.path,
             destination_root=destination_root,
             changes=changes,
+            exclude_relative_prefixes=exclude_relative_prefixes,
         )
 
     def describe_tree(
@@ -287,8 +318,19 @@ class WorkspaceManager:
         }
         return manager
 
-    def _copy_tree(self, source: Path, destination: Path) -> None:
+    def _copy_tree(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> None:
         source = source.resolve()
+        excluded_prefixes = {
+            str(Path(prefix)).strip()
+            for prefix in exclude_relative_prefixes
+            if str(prefix).strip()
+        }
 
         def _ignore(current_dir: str, names: list[str]) -> set[str]:
             current = Path(current_dir)
@@ -298,8 +340,15 @@ class WorkspaceManager:
                 if candidate.is_symlink():
                     ignored.add(name)
                     continue
-                if is_ignored_path(candidate.relative_to(source)):
+                relative = candidate.relative_to(source)
+                if is_ignored_path(relative):
                     ignored.add(name)
+                    continue
+                for prefix in excluded_prefixes:
+                    prefix_path = Path(prefix)
+                    if relative == prefix_path or prefix_path in relative.parents:
+                        ignored.add(name)
+                        break
             return ignored
 
         shutil.copytree(
@@ -342,7 +391,13 @@ class WorkspaceManager:
                 }
         return manifest
 
-    def _compute_changes_between(self, *, before_root: Path, after_root: Path) -> WorkspaceChangeSet:
+    def _compute_changes_between(
+        self,
+        *,
+        before_root: Path,
+        after_root: Path,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> WorkspaceChangeSet:
         before = self._manifest(before_root)
         after = self._manifest(after_root)
         before_paths = set(before)
@@ -352,7 +407,11 @@ class WorkspaceManager:
         modified = sorted(
             path for path in before_paths & after_paths if before[path]["hash"] != after[path]["hash"]
         )
-        return WorkspaceChangeSet(added=added, modified=modified, deleted=deleted)
+        changes = WorkspaceChangeSet(added=added, modified=modified, deleted=deleted)
+        return self._exclude_change_prefixes(
+            changes,
+            exclude_relative_prefixes=exclude_relative_prefixes,
+        )
 
     def _apply_changes(
         self,
@@ -360,12 +419,17 @@ class WorkspaceManager:
         source_root: Path,
         destination_root: Path,
         changes: WorkspaceChangeSet,
+        exclude_relative_prefixes: Iterable[str] = (),
     ) -> WorkspaceChangeSet:
+        normalized_changes = self._exclude_change_prefixes(
+            changes,
+            exclude_relative_prefixes=exclude_relative_prefixes,
+        )
         applied_added: list[str] = []
         applied_modified: list[str] = []
         applied_deleted: list[str] = []
 
-        for relative_path in changes.added:
+        for relative_path in normalized_changes.added:
             path_obj = Path(relative_path)
             if is_ignored_path(path_obj):
                 continue
@@ -383,7 +447,7 @@ class WorkspaceManager:
             shutil.copy2(source_path, destination_path)
             applied_added.append(relative_path)
 
-        for relative_path in changes.modified:
+        for relative_path in normalized_changes.modified:
             path_obj = Path(relative_path)
             if is_ignored_path(path_obj):
                 continue
@@ -401,7 +465,7 @@ class WorkspaceManager:
             shutil.copy2(source_path, destination_path)
             applied_modified.append(relative_path)
 
-        for relative_path in changes.deleted:
+        for relative_path in normalized_changes.deleted:
             path_obj = Path(relative_path)
             if is_ignored_path(path_obj):
                 continue
@@ -415,6 +479,38 @@ class WorkspaceManager:
             added=sorted(applied_added),
             modified=sorted(applied_modified),
             deleted=sorted(applied_deleted),
+        )
+
+    @staticmethod
+    def _exclude_change_prefixes(
+        changes: WorkspaceChangeSet,
+        *,
+        exclude_relative_prefixes: Iterable[str] = (),
+    ) -> WorkspaceChangeSet:
+        prefixes = {
+            str(Path(prefix)).strip()
+            for prefix in exclude_relative_prefixes
+            if str(prefix).strip()
+        }
+        if not prefixes:
+            return WorkspaceChangeSet(
+                added=list(changes.added),
+                modified=list(changes.modified),
+                deleted=list(changes.deleted),
+            )
+
+        def _keep(relative_path: str) -> bool:
+            path_obj = Path(relative_path)
+            for prefix in prefixes:
+                prefix_path = Path(prefix)
+                if path_obj == prefix_path or prefix_path in path_obj.parents:
+                    return False
+            return True
+
+        return WorkspaceChangeSet(
+            added=[path for path in changes.added if _keep(path)],
+            modified=[path for path in changes.modified if _keep(path)],
+            deleted=[path for path in changes.deleted if _keep(path)],
         )
 
     def _prune_empty_parents(self, directory: Path, stop_at: Path) -> None:

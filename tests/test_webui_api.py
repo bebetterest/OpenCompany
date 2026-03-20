@@ -12,6 +12,7 @@ from opencompany.models import (
     AgentNode,
     AgentRole,
     AgentStatus,
+    EventRecord,
     RunSession,
     SessionStatus,
     SteerRun,
@@ -61,6 +62,73 @@ keep_pinned_messages = 3
                     3,
                 )
 
+    def test_bootstrap_preloads_configured_mcp_catalog_with_oauth_metadata(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir()
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.huggingface]
+transport = "streamable_http"
+enabled = true
+url = "https://huggingface.co/mcp?login"
+oauth_enabled = true
+
+[mcp.servers.notion]
+transport = "streamable_http"
+enabled = true
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                encoding="utf-8",
+            )
+            app = create_webui_app(project_dir=project_dir, app_dir=app_dir)
+            with TestClient(app) as client:
+                bootstrap = client.get("/api/bootstrap")
+                self.assertEqual(bootstrap.status_code, 200)
+                catalog = {
+                    str(item["id"]): item
+                    for item in bootstrap.json()["runtime"]["available_mcp_servers"]
+                }
+                self.assertIn("huggingface", catalog)
+                self.assertIn("notion", catalog)
+                self.assertTrue(catalog["huggingface"]["oauth_enabled"])
+                self.assertTrue(catalog["notion"]["oauth_enabled"])
+                self.assertFalse(catalog["huggingface"]["oauth_authorized"])
+                self.assertFalse(catalog["notion"]["oauth_authorized"])
+
+    def test_bootstrap_omits_disabled_mcp_servers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir()
+            (app_dir / "opencompany.toml").write_text(
+                """
+[mcp.servers.filesystem]
+transport = "stdio"
+enabled = true
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.docs]
+transport = "streamable_http"
+enabled = false
+url = "https://example.com/mcp"
+""".strip(),
+                encoding="utf-8",
+            )
+            app = create_webui_app(project_dir=project_dir, app_dir=app_dir)
+            with TestClient(app) as client:
+                bootstrap = client.get("/api/bootstrap")
+                self.assertEqual(bootstrap.status_code, 200)
+                ids = [
+                    str(item.get("id", ""))
+                    for item in bootstrap.json()["runtime"]["available_mcp_servers"]
+                ]
+                self.assertIn("filesystem", ids)
+                self.assertNotIn("docs", ids)
+
     def test_index_uses_multiline_task_textarea(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -76,6 +144,35 @@ keep_pinned_messages = 3
                 self.assertNotIn('<input id="task-input"', response.text)
                 self.assertIn('<input id="model-input"', response.text)
                 self.assertIn('<input id="root-agent-name-input"', response.text)
+                self.assertNotIn('<input id="skills-input"', response.text)
+                self.assertIn('id="skills-toggle-button"', response.text)
+                self.assertIn('aria-controls="skills-panel-body"', response.text)
+                self.assertIn('aria-expanded="false"', response.text)
+                self.assertIn('<div id="skills-panel-body" class="skills-control-shell collapsible-body hidden">', response.text)
+                self.assertIn('<button id="skills-select-all-button"', response.text)
+                self.assertIn('<button id="skills-clear-button"', response.text)
+                self.assertIn('<h3 id="skills-overview-title" class="selector-section-title">Overview</h3>', response.text)
+                self.assertIn('<div id="skills-overview" class="selector-overview"></div>', response.text)
+                self.assertIn('<h3 id="skills-selected-title" class="selector-section-title">Enabled Skills</h3>', response.text)
+                self.assertIn('<h3 id="skills-catalog-title" class="selector-section-title">Catalog</h3>', response.text)
+                self.assertIn('<h3 id="skills-warnings-title" class="selector-section-title">Skill Warnings</h3>', response.text)
+                self.assertIn('<div id="skills-selected"', response.text)
+                self.assertIn('<div id="skills-warnings"', response.text)
+                self.assertNotIn('id="skills-status"', response.text)
+                self.assertNotIn('<input id="mcp-input"', response.text)
+                self.assertIn('id="mcp-toggle-button"', response.text)
+                self.assertIn('aria-controls="mcp-panel-body"', response.text)
+                self.assertIn('<div id="mcp-panel-body" class="skills-control-shell collapsible-body hidden">', response.text)
+                self.assertIn('<button id="mcp-discover-button"', response.text)
+                self.assertIn('<button id="mcp-use-defaults-button"', response.text)
+                self.assertIn('<h3 id="mcp-overview-title" class="selector-section-title">Overview</h3>', response.text)
+                self.assertIn('<h3 id="mcp-selected-title" class="selector-section-title">Enabled MCP Servers</h3>', response.text)
+                self.assertIn('<h3 id="mcp-catalog-title" class="selector-section-title">Catalog</h3>', response.text)
+                self.assertIn('<h3 id="mcp-warnings-title" class="selector-section-title">MCP Warnings</h3>', response.text)
+                self.assertIn('<div id="mcp-insight"', response.text)
+                self.assertIn('<div id="mcp-selected"', response.text)
+                self.assertIn('<div id="mcp-warnings"', response.text)
+                self.assertNotIn('id="mcp-status"', response.text)
                 self.assertIn('<select id="agents-role-filter">', response.text)
                 self.assertIn('<input id="agents-search-input"', response.text)
                 self.assertIn('<input id="steer-runs-search-input"', response.text)
@@ -164,8 +261,293 @@ keep_pinned_messages = 3
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(captured["task"], "demo")
-                self.assertEqual(captured["model"], "openai/gpt-4.1-mini")
-                self.assertEqual(captured["root_agent_name"], "Root Alpha")
+            self.assertEqual(captured["model"], "openai/gpt-4.1-mini")
+            self.assertEqual(captured["root_agent_name"], "Root Alpha")
+
+    def test_run_forwards_enabled_skill_ids(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {}
+
+            async def _fake_start_run(
+                task: str,
+                model: str | None = None,
+                root_agent_name: str | None = None,
+                enabled_skill_ids: list[str] | None = None,
+            ) -> dict[str, object]:
+                captured["task"] = task
+                captured["model"] = model
+                captured["root_agent_name"] = root_agent_name
+                captured["enabled_skill_ids"] = enabled_skill_ids
+                return {"ok": True}
+
+            runtime_state.start_run = _fake_start_run  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/run",
+                    json={
+                        "task": "demo",
+                        "enabled_skill_ids": ["skill-a", " skill-b ", ""],
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(captured["task"], "demo")
+            self.assertEqual(captured["enabled_skill_ids"], ["skill-a", "skill-b"])
+
+    def test_run_forwards_enabled_mcp_server_ids(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {}
+
+            async def _fake_start_run(
+                task: str,
+                model: str | None = None,
+                root_agent_name: str | None = None,
+                enabled_mcp_server_ids: list[str] | None = None,
+            ) -> dict[str, object]:
+                captured["task"] = task
+                captured["model"] = model
+                captured["root_agent_name"] = root_agent_name
+                captured["enabled_mcp_server_ids"] = enabled_mcp_server_ids
+                return {"ok": True}
+
+            runtime_state.start_run = _fake_start_run  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/run",
+                    json={
+                        "task": "demo",
+                        "enabled_mcp_server_ids": ["filesystem", " docs ", ""],
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(captured["task"], "demo")
+            self.assertEqual(
+                captured["enabled_mcp_server_ids"],
+                ["filesystem", "docs"],
+            )
+
+    def test_run_rejects_invalid_skill_id_with_400(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/run",
+                    json={
+                        "task": "demo",
+                        "enabled_skill_ids": ["bad skill"],
+                    },
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("Invalid skill id", response.json()["detail"])
+
+    def test_skills_discover_endpoint_forwards_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {}
+
+            async def _fake_discover_skills(
+                *,
+                project_dir: str | None = None,
+                remote: dict[str, object] | None = None,
+                remote_password: str | None = None,
+            ) -> dict[str, object]:
+                captured["project_dir"] = project_dir
+                captured["remote"] = remote
+                captured["remote_password"] = remote_password
+                return {"skills": [{"id": "skill-a"}], "snapshot": {"ok": True}}
+
+            runtime_state.discover_skills = _fake_discover_skills  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/skills/discover",
+                    json={"project_dir": "/tmp/demo"},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["skills"], [{"id": "skill-a"}])
+            self.assertEqual(captured["project_dir"], "/tmp/demo")
+
+    def test_skills_discover_endpoint_returns_400_on_value_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _raise_discover_skills(**kwargs):  # type: ignore[no-untyped-def]
+                del kwargs
+                raise ValueError("skills config required")
+
+            runtime_state.discover_skills = _raise_discover_skills  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/skills/discover", json={})
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"], "skills config required")
+
+    def test_mcp_servers_discover_endpoint_forwards_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, object] = {"called": False}
+
+            async def _fake_discover_mcp_servers() -> dict[str, object]:
+                captured["called"] = True
+                return {"mcp_servers": [{"id": "filesystem"}], "snapshot": {"ok": True}}
+
+            runtime_state.discover_mcp_servers = _fake_discover_mcp_servers  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/mcp/servers", json={})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["mcp_servers"], [{"id": "filesystem"}])
+            self.assertTrue(bool(captured["called"]))
+
+    def test_mcp_servers_discover_endpoint_returns_500_on_runtime_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _raise_discover_mcp_servers() -> dict[str, object]:
+                raise RuntimeError("mcp discover failed")
+
+            runtime_state.discover_mcp_servers = _raise_discover_mcp_servers  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post("/api/mcp/servers", json={})
+
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(response.json()["detail"], "mcp discover failed")
+
+    def test_mcp_oauth_endpoints_forward_runtime_calls(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _fake_start(server_id: str, *, timeout_seconds: float = 300.0) -> dict[str, object]:
+                self.assertEqual(server_id, "notion")
+                self.assertEqual(timeout_seconds, 45.0)
+                return {
+                    "flow_id": "flow-1",
+                    "server_id": "notion",
+                    "status": "pending",
+                    "authorization_url": "https://auth.example.com/authorize",
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            async def _fake_status(flow_id: str) -> dict[str, object]:
+                self.assertEqual(flow_id, "flow-1")
+                return {
+                    "flow_id": "flow-1",
+                    "server_id": "notion",
+                    "status": "completed",
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            async def _fake_clear(server_id: str) -> dict[str, object]:
+                self.assertEqual(server_id, "notion")
+                return {
+                    "server_id": "notion",
+                    "cleared": True,
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            runtime_state.start_mcp_oauth_login = _fake_start  # type: ignore[method-assign]
+            runtime_state.mcp_oauth_login_status = _fake_status  # type: ignore[method-assign]
+            runtime_state.clear_mcp_oauth_login = _fake_clear  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                started = client.post(
+                    "/api/mcp/oauth/start",
+                    json={"server_id": "notion", "timeout_seconds": 45},
+                )
+                self.assertEqual(started.status_code, 200)
+                self.assertEqual(started.json()["flow_id"], "flow-1")
+
+                status = client.get("/api/mcp/oauth/flow-1")
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.json()["status"], "completed")
+
+                cleared = client.post("/api/mcp/oauth/clear", json={"server_id": "notion"})
+                self.assertEqual(cleared.status_code, 200)
+                self.assertTrue(cleared.json()["cleared"])
+
+    def test_mcp_env_auth_configure_endpoint_forwards_runtime_calls(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+
+            async def _fake_configure(server_id: str, values: dict[str, object]) -> dict[str, object]:
+                self.assertEqual(server_id, "github")
+                self.assertEqual(
+                    values,
+                    {"GITHUB_MCP_AUTHORIZATION": "Bearer token-demo"},
+                )
+                return {
+                    "server_id": "github",
+                    "updated_keys": ["GITHUB_MCP_AUTHORIZATION"],
+                    "snapshot": {"runtime": {"available_mcp_servers": []}},
+                }
+
+            runtime_state.configure_mcp_env_auth = _fake_configure  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                configured = client.post(
+                    "/api/mcp/env-auth/configure",
+                    json={
+                        "server_id": "github",
+                        "values": {"GITHUB_MCP_AUTHORIZATION": "Bearer token-demo"},
+                    },
+                )
+                self.assertEqual(configured.status_code, 200)
+                self.assertEqual(
+                    configured.json()["updated_keys"],
+                    ["GITHUB_MCP_AUTHORIZATION"],
+                )
+
+    def test_mcp_env_auth_configure_endpoint_rejects_non_object_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/mcp/env-auth/configure",
+                    json={"server_id": "github", "values": "invalid"},
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["detail"], "values must be an object.")
 
     def test_run_while_running_skips_launch_reconfigure(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -821,6 +1203,89 @@ keep_pinned_messages = 3
                 response = client.post("/api/resume", json={"session_id": "any", "instruction": "continue"})
                 self.assertIn(response.status_code, {404, 405})
 
+    def test_events_endpoint_supports_recent_activity_window_and_before_cursor(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-events-window"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            project_dir = app_dir / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=project_dir,
+                    task="events",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.INTERRUPTED,
+                )
+            )
+            orchestrator.storage.upsert_agent(
+                AgentNode(
+                    id="agent-root",
+                    session_id=session_id,
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="events",
+                    workspace_id="root",
+                    status=AgentStatus.PAUSED,
+                )
+            )
+            for timestamp, event_type, payload in [
+                ("2026-03-11T12:00:00Z", "session_started", {"task": "events"}),
+                ("2026-03-11T12:00:01Z", "llm_reasoning", {"token": "thinking"}),
+                ("2026-03-11T12:00:02Z", "agent_prompt", {"step_count": 1, "agent_name": "Root"}),
+                ("2026-03-11T12:00:03Z", "shell_stream", {"stream": "stdout", "chunk": "hi"}),
+                ("2026-03-11T12:00:04Z", "agent_completed", {"summary": "done"}),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session_id,
+                        agent_id="agent-root",
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="runtime",
+                        payload=payload,
+                        workspace_id="root",
+                        checkpoint_seq=0,
+                    )
+                )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                first = client.get(
+                    f"/api/session/{session_id}/events?limit=2&activity_only=true"
+                )
+                self.assertEqual(first.status_code, 200)
+                first_payload = first.json()
+                self.assertEqual(
+                    [item["event_type"] for item in first_payload["events"]],
+                    ["agent_prompt", "agent_completed"],
+                )
+                self.assertEqual(
+                    [item["id"] for item in first_payload["agents"]],
+                    ["agent-root"],
+                )
+                self.assertTrue(first_payload["has_more_before"])
+                self.assertTrue(first_payload["before_cursor"])
+
+                second = client.get(
+                    f"/api/session/{session_id}/events?limit=2&activity_only=true&include_agents=false&before={first_payload['before_cursor']}"
+                )
+                self.assertEqual(second.status_code, 200)
+                second_payload = second.json()
+                self.assertEqual(
+                    [item["event_type"] for item in second_payload["events"]],
+                    ["session_started"],
+                )
+                self.assertEqual(second_payload["agents"], [])
+                self.assertFalse(second_payload["has_more_before"])
+
     def test_tool_run_endpoints_return_rows_and_metrics(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)
@@ -935,6 +1400,83 @@ keep_pinned_messages = 3
                 self.assertEqual(run["status"], ToolRunStatus.RUNNING.value)
                 self.assertEqual(run["stdout"], "line-1\nline-2\n")
                 self.assertEqual(run["stderr"], "warn-1\n")
+                self.assertEqual(run["timeline"], [])
+
+    def test_tool_run_detail_endpoint_includes_timeline(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-tool-run-timeline"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id="toolrun-1",
+                    session_id=session_id,
+                    agent_id="agent-root",
+                    tool_name="shell",
+                    arguments={"type": "shell", "command": "pwd"},
+                    status=ToolRunStatus.COMPLETED,
+                    blocking=True,
+                    created_at="2026-03-14T12:00:00Z",
+                    started_at="2026-03-14T12:00:01Z",
+                    completed_at="2026-03-14T12:00:02Z",
+                    result={"stdout": "/tmp/demo\n"},
+                )
+            )
+            for timestamp, event_type, payload in [
+                (
+                    "2026-03-14T12:00:00Z",
+                    "tool_call_started",
+                    {
+                        "action": {
+                            "type": "shell",
+                            "command": "pwd",
+                            "_tool_call_id": "call-1",
+                            "tool_run_id": "toolrun-1",
+                        }
+                    },
+                ),
+                (
+                    "2026-03-14T12:00:01Z",
+                    "tool_run_submitted",
+                    {
+                        "tool_run_id": "toolrun-1",
+                        "tool_name": "shell",
+                        "action": {"_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-14T12:00:02Z",
+                    "tool_run_updated",
+                    {"tool_run_id": "toolrun-1", "status": ToolRunStatus.COMPLETED.value},
+                ),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session_id,
+                        agent_id="agent-root",
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="runtime",
+                        payload=payload,
+                        workspace_id="root",
+                        checkpoint_seq=0,
+                    )
+                )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                detail = client.get(f"/api/session/{session_id}/tool-runs/toolrun-1")
+                self.assertEqual(detail.status_code, 200)
+                timeline = detail.json()["tool_run"]["timeline"]
+                self.assertEqual(
+                    [item["event_type"] for item in timeline],
+                    ["tool_call_started", "tool_run_submitted", "tool_run_updated"],
+                )
 
     def test_steer_run_endpoints_submit_list_metrics_and_cancel(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1268,6 +1810,85 @@ keep_pinned_messages = 3
                     sorted({item["agent_id"] for item in filtered_payload["messages"]}),
                     ["agent-root"],
                 )
+
+    def test_messages_endpoint_supports_tail_and_before_cursor(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            session_id = "session-messages-before"
+            session_dir = app_dir / ".opencompany" / "sessions" / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            root_path = session_dir / "agent-root_messages.jsonl"
+            root_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:00Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 0,
+                                "role": "user",
+                                "message": {"role": "user", "content": "first"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:01Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 1,
+                                "role": "assistant",
+                                "message": {"role": "assistant", "content": "second"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-11T12:00:02Z",
+                                "session_id": session_id,
+                                "agent_id": "agent-root",
+                                "agent_name": "Root",
+                                "agent_role": "root",
+                                "message_index": 2,
+                                "role": "assistant",
+                                "message": {"role": "assistant", "content": "third"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            app = create_webui_app(app_dir=app_dir)
+            with TestClient(app) as client:
+                tail = client.get(f"/api/session/{session_id}/messages?limit=2&tail=2")
+                self.assertEqual(tail.status_code, 200)
+                tail_payload = tail.json()
+                self.assertEqual(
+                    [item["message"]["content"] for item in tail_payload["messages"]],
+                    ["second", "third"],
+                )
+                self.assertFalse(tail_payload["has_more"])
+                self.assertTrue(tail_payload["next_cursor"])
+                self.assertTrue(tail_payload["has_more_before"])
+                self.assertTrue(tail_payload["before_cursor"])
+
+                previous = client.get(
+                    f"/api/session/{session_id}/messages?limit=2&before={tail_payload['before_cursor']}"
+                )
+                self.assertEqual(previous.status_code, 200)
+                previous_payload = previous.json()
+                self.assertEqual(
+                    [item["message"]["content"] for item in previous_payload["messages"]],
+                    ["first"],
+                )
+                self.assertFalse(previous_payload["has_more_before"])
 
     def test_messages_endpoint_annotates_prompt_visibility_with_summary_window(self) -> None:
         with TemporaryDirectory() as temp_dir:

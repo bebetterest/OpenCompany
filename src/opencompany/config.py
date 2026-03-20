@@ -10,6 +10,12 @@ from opencompany.utils import detect_system_locale
 
 NETWORK_POLICIES = frozenset({"deny_all", "allow_all", "allowlist"})
 STEER_AGENT_SCOPES = frozenset({"session", "descendants"})
+MCP_TRANSPORTS = frozenset({"stdio", "streamable_http"})
+MCP_PROTOCOL_VERSIONS = (
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+)
 
 
 @dataclass(slots=True)
@@ -62,6 +68,10 @@ class ToolTimeoutsConfig:
         default_factory=lambda: {
             "compress_context": 180.0,
             "wait_time": 0.0,
+            "list_mcp_servers": 0.0,
+            "list_mcp_resources": 0.0,
+            "read_mcp_resource": 0.0,
+            "mcp_tool": 30.0,
             "list_agent_runs": 0.0,
             "get_agent_run": 0.0,
             "cancel_agent": 0.0,
@@ -150,6 +160,9 @@ class RuntimeToolsConfig:
             "shell",
             "compress_context",
             "wait_time",
+            "list_mcp_servers",
+            "list_mcp_resources",
+            "read_mcp_resource",
             "list_agent_runs",
             "get_agent_run",
             "spawn_agent",
@@ -167,6 +180,9 @@ class RuntimeToolsConfig:
             "shell",
             "compress_context",
             "wait_time",
+            "list_mcp_servers",
+            "list_mcp_resources",
+            "read_mcp_resource",
             "list_agent_runs",
             "get_agent_run",
             "spawn_agent",
@@ -259,11 +275,53 @@ class LlmConfig:
 
 
 @dataclass(slots=True)
+class McpServerConfig:
+    id: str = ""
+    transport: str = "stdio"
+    enabled: bool = True
+    title: str = ""
+    expose_roots: bool | None = None
+    timeout_seconds: float = 30.0
+    allowed_tools: list[str] = field(default_factory=list)
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    oauth_enabled: bool = False
+    oauth_scopes: list[str] = field(default_factory=list)
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_client_name: str = "OpenCompany MCP Client"
+    oauth_client_uri: str = ""
+    oauth_authorization_prompt: str = ""
+    oauth_use_resource_param: bool = True
+
+    def resolved_title(self) -> str:
+        return str(self.title or self.id).strip() or str(self.id or "").strip()
+
+
+@dataclass(slots=True)
+class McpConfig:
+    protocol_version: str = MCP_PROTOCOL_VERSIONS[0]
+    servers: dict[str, McpServerConfig] = field(default_factory=dict)
+
+    def enabled_server_ids(self) -> list[str]:
+        return [
+            server_id
+            for server_id, server in sorted(self.servers.items())
+            if server.enabled
+        ]
+
+
+@dataclass(slots=True)
 class OpenCompanyConfig:
     project: ProjectConfig = field(default_factory=ProjectConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     locale: LocaleConfig = field(default_factory=LocaleConfig)
 
@@ -520,6 +578,156 @@ class OpenCompanyConfig:
             timeout_seconds=int(
                 sandbox.get("timeout_seconds", self.sandbox.timeout_seconds)
             ),
+        )
+
+        mcp = data.get("mcp", {})
+        protocol_version = str(
+            mcp.get("protocol_version", self.mcp.protocol_version)
+        ).strip() or self.mcp.protocol_version
+        if protocol_version not in MCP_PROTOCOL_VERSIONS:
+            supported = ", ".join(MCP_PROTOCOL_VERSIONS)
+            raise ValueError(
+                f"[mcp].protocol_version '{protocol_version}' is invalid. Supported: {supported}."
+            )
+        raw_servers = mcp.get("servers", {})
+        normalized_servers: dict[str, McpServerConfig] = {}
+        if raw_servers:
+            if not isinstance(raw_servers, dict):
+                raise ValueError("[mcp].servers must be a table of named server configs.")
+            for raw_server_id, raw_server in raw_servers.items():
+                server_id = str(raw_server_id).strip()
+                if not server_id:
+                    continue
+                if not isinstance(raw_server, dict):
+                    raise ValueError(f"[mcp.servers.{server_id}] must be a table.")
+                transport = str(
+                    raw_server.get("transport", "stdio")
+                ).strip().lower() or "stdio"
+                if transport not in MCP_TRANSPORTS:
+                    supported = ", ".join(sorted(MCP_TRANSPORTS))
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}].transport '{transport}' is invalid. Supported: {supported}."
+                    )
+                args = raw_server.get("args", [])
+                if args is None:
+                    args = []
+                if not isinstance(args, (list, tuple)):
+                    raise ValueError(f"[mcp.servers.{server_id}].args must be a list.")
+                env_table = raw_server.get("env", {})
+                if env_table is None:
+                    env_table = {}
+                if not isinstance(env_table, dict):
+                    raise ValueError(f"[mcp.servers.{server_id}].env must be a table.")
+                headers_table = raw_server.get("headers", {})
+                if headers_table is None:
+                    headers_table = {}
+                if not isinstance(headers_table, dict):
+                    raise ValueError(f"[mcp.servers.{server_id}].headers must be a table.")
+                oauth_scopes = raw_server.get("oauth_scopes", [])
+                if oauth_scopes is None:
+                    oauth_scopes = []
+                if not isinstance(oauth_scopes, (list, tuple)):
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}].oauth_scopes must be a list."
+                    )
+                allowed_tools = raw_server.get("allowed_tools", [])
+                if allowed_tools is None:
+                    allowed_tools = []
+                if not isinstance(allowed_tools, (list, tuple)):
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}].allowed_tools must be a list."
+                    )
+                command = str(raw_server.get("command", "") or "").strip()
+                url = str(raw_server.get("url", "") or "").strip()
+                oauth_enabled = bool(raw_server.get("oauth_enabled", False))
+                oauth_client_id = str(raw_server.get("oauth_client_id", "") or "").strip()
+                oauth_client_secret = str(
+                    raw_server.get("oauth_client_secret", "") or ""
+                ).strip()
+                oauth_client_name = str(
+                    raw_server.get("oauth_client_name", "OpenCompany MCP Client") or ""
+                ).strip() or "OpenCompany MCP Client"
+                oauth_client_uri = str(
+                    raw_server.get("oauth_client_uri", "") or ""
+                ).strip()
+                oauth_authorization_prompt = str(
+                    raw_server.get("oauth_authorization_prompt", "") or ""
+                ).strip()
+                oauth_use_resource_param = bool(raw_server.get("oauth_use_resource_param", True))
+                if transport == "stdio":
+                    if not command:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] transport='stdio' requires non-empty command."
+                        )
+                    if url:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] transport='stdio' must not set url."
+                        )
+                    if oauth_enabled:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] OAuth is only supported with transport='streamable_http'."
+                        )
+                if transport == "streamable_http":
+                    if not url:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] transport='streamable_http' requires non-empty url."
+                        )
+                    if command:
+                        raise ValueError(
+                            f"[mcp.servers.{server_id}] transport='streamable_http' must not set command."
+                        )
+                if oauth_client_secret and not oauth_client_id:
+                    raise ValueError(
+                        f"[mcp.servers.{server_id}] oauth_client_secret requires oauth_client_id."
+                    )
+                normalized_servers[server_id] = McpServerConfig(
+                    id=server_id,
+                    transport=transport,
+                    enabled=bool(raw_server.get("enabled", True)),
+                    title=str(raw_server.get("title", "") or "").strip(),
+                    expose_roots=(
+                        None
+                        if raw_server.get("expose_roots") is None
+                        else bool(raw_server.get("expose_roots"))
+                    ),
+                    timeout_seconds=float(
+                        raw_server.get("timeout_seconds", 30.0)
+                    ),
+                    allowed_tools=[
+                        str(item).strip()
+                        for item in allowed_tools
+                        if str(item).strip()
+                    ],
+                    command=command,
+                    args=[str(item) for item in args],
+                    env={
+                        str(key).strip(): str(value)
+                        for key, value in env_table.items()
+                        if str(key).strip()
+                    },
+                    cwd=str(raw_server.get("cwd", "") or "").strip(),
+                    url=url,
+                    headers={
+                        str(key).strip(): str(value)
+                        for key, value in headers_table.items()
+                        if str(key).strip()
+                    },
+                    oauth_enabled=oauth_enabled,
+                    oauth_scopes=[
+                        str(item).strip()
+                        for item in oauth_scopes
+                        if str(item).strip()
+                    ],
+                    oauth_client_id=oauth_client_id,
+                    oauth_client_secret=oauth_client_secret,
+                    oauth_client_name=oauth_client_name,
+                    oauth_client_uri=oauth_client_uri,
+                    oauth_authorization_prompt=oauth_authorization_prompt,
+                    oauth_use_resource_param=oauth_use_resource_param,
+                )
+        self.mcp = McpConfig(
+            protocol_version=protocol_version,
+            servers=normalized_servers,
         )
 
         logging = data.get("logging", {})

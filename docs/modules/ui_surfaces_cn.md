@@ -17,6 +17,8 @@ OpenCompany 当前提供两套本地界面：
 
 - 启动配置：`/api/bootstrap`、`/api/launch-config`、`/api/sessions`
 - 执行控制：`/api/run`、`/api/interrupt`
+- skill discover：`/api/skills/discover`
+- MCP discover：`/api/mcp/servers`
 - sandbox 终端拉起：`/api/terminal/open`
 - 远程工作目录校验：`/api/remote/validate`
 - 可观测性：`/api/session/{id}/events|messages|tool-runs|tool-runs/metrics|tool-runs/{tool_run_id}|steers|steer-runs|steer-runs/metrics|steer-runs/{steer_run_id}/cancel`
@@ -28,16 +30,18 @@ OpenCompany 当前提供两套本地界面：
 
 - 当 launch config 提供 `project_dir` 时，`/api/run` 新建会话并运行。
 - 新建会话的 launch config 还会携带 `session_mode`（`direct` / `staged`），默认是 `direct`。
+- `/api/run` 接受 `enabled_skill_ids`；对于已加载 session，这会为新一轮 run 替换当前 skill 集；若省略则保留原集合。
+- `/api/run` 也接受 `enabled_mcp_server_ids`；对于已加载 session，这会为新一轮 run 替换当前启用的 MCP server 集；若省略则保留原集合。
 - 新建会话的 launch config 还可携带 `remote`（SSH 目标、远程目录、认证策略）以及仅请求态的 `remote_password`。
 - 远程工作目录仅在 `session_mode=direct` 时可用；`staged + remote` 会被拒绝。
 - 对 password auth 会话，请求态 `remote_password` 会用于 `/api/run`、`/api/terminal/open` 与 `/api/remote/validate`。
 - 当 launch config 提供 `session_id` 时，`/api/run` 会在已有会话内执行：先重新激活该会话，再为这次运行追加一个全新的 root agent。
-- 加载已有会话时，Web UI 会解析其持久化的 workspace mode，并以锁定只读方式展示；外部 mode 覆盖会被忽略。
+- 加载已有会话时，Web UI 会直接绑定原始 `session_id`，解析其持久化的 workspace mode，并以锁定只读方式展示；外部 mode 覆盖会被忽略。
 - 在 setup/reconfigure 加载已有远程会话时，若当前选择 backend 为 `anthropic`，Web UI 会先执行远程运行时校验；backend 为 `none` 时跳过该预校验。
 - 当会话已在运行中时再次提交 `/api/run`，runtime 会立刻在该 live session 里追加一个新的 root agent，并与当前活跃 agents 一起调度执行。
 - 对运行中会话追加 root 时，Web UI 会保留当前内存中的 agent 图并只消费 WebSocket 增量事件；不会全量重放 `/api/session/{id}/events`，以避免父子关系与 cancelled 状态被瞬时覆盖。
 - 对活跃会话，`/api/session/{id}/steers` 仍是正常排队语义；用户 steer 会带上用户来源 actor，并与 agent 工具 steer 共用同一条持久化 steer-run 流程。当目标会话非活跃且当前没有其他运行中会话时，Web UI 会自动继续该会话，并在进入调度前请求 runtime 重新激活被 steer 的 agent。
-- 在 setup/reconfigure 中选择 session 只导入上下文，不会自动运行。
+- 在 setup/reconfigure 中选择 session 时，只会加载持久化的 session 元数据（不会隐式 clone，也不会自动运行）。
 - 在 setup/reconfigure 中选择项目目录会切换到“新会话”模式，并清空易失运行视图（`Overview`/`Agents` 实时流、tool-run 时间线），避免继续显示上一个已加载 session 的旧数据。
 - 在 `direct` 模式下，`Diff` 会被禁用，`Apply` / `Undo` 也不可用，因为改动已经直接写入目标项目。
 
@@ -54,7 +58,28 @@ Web UI 特性：
   - 默认值来自 `opencompany.toml`（`[llm.openrouter].model`）
   - 每次运行/继续前可覆盖；提交值会透传到 runtime，并在该次执行中同时作用于 root/worker 的 LLM 调用
 - 控制栏提供可选 root-agent-name 输入框；非空时 `/api/run` 会透传该值，runtime 以它作为 root agent 命名基底（仍保留会话内去重）
+- skills 与 MCP 选择区都支持折叠/展开，并且首次加载时默认折叠
+- 控制栏也提供一套 skills 选择器：点击卡片选择 + `发现` / `全选` / `清空`
+  - skills 仍会作为 `enabled_skill_ids` 提交
+  - discover 会按当前本地或远程 launch context 读取项目源/全局源 skills
+  - skills 面板分为 `概览` → `当前启用 Skills` → `技能目录` → `Skill 告警` 四层
+  - 卡片默认采用精简视图（标题/状态/短描述），可按卡片展开详情查看结构、文档与来源元数据
+  - 折叠头摘要只保留关键计数，面板内移除重复的长状态行
+  - 已发现 skills 会以可切换卡片展示，并附带已选 chips 与告警卡片；Web UI 不再保留手动文本输入
+  - 已在当前 session 物化生效的 skills，即使还没重新 discover，也会继续显示在选择器里
+  - skills 概览区只展示关键计数（已选/目录/告警）与简短提示
+- 控制栏也提供一套 MCP server 选择器：点击卡片选择 + `发现` / `用默认项` / `全选` / `清空`
+  - 选择结果会作为 `enabled_mcp_server_ids` 提交
+  - 页面加载时会预加载 `opencompany.toml` 中配置的 MCP servers，`发现` 负责刷新目录
+  - `用默认项` 会把配置中 `enabled = true` 的 servers 同步为本次运行的选择；手动选择仍然只覆盖当前 run
+  - MCP 面板分为 `概览` → `当前启用 MCP Servers` → `MCP 目录` → `MCP 告警` 四层
+  - 对启用 OAuth 的 MCP 卡片，界面还会提供 `登录` / `继续登录` / `重新登录` 和 `清除登录`；登录处理中按钮仍可点击，用于重新打开授权页，而且不会额外启动第二条轮询；`清除登录` 会移除本地保存的 OAuth 记录，便于彻底重连
+  - MCP OAuth 启动是异步链路：`/api/mcp/oauth/start` 可能先返回 pending `flow_id`，授权 `authorization_url` 会稍后可用；前端会持续轮询 `/api/mcp/oauth/{flow_id}`，并在 URL 就绪后再自动打开授权页
+  - MCP 卡片默认采用精简视图，并可按卡片展开详情查看端点、roots、超时、allowed tools、认证字段、协议等配置/运行态信息
+  - 选择器仍展示每个 server 的配置态与运行态信息；概览区只保留已选/已连接/告警三项 KPI 以减少重复
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
+- session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
+- 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示
 - `Agents` 视图（Web/TUI）会显示每个 agent 的上下文压缩运行指标：
   - `compression_count`
   - `current_context_tokens/context_limit_tokens`
@@ -70,6 +95,7 @@ Web UI 特性：
   - agent 状态 KPI 现拆分 `cancelled` 与 `terminated`，不再保留 agent `waiting` 统计桶
 - `Tool Runs` 每行支持详情弹窗，可查看生命周期时间线（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）和 payload
   - 详情数据通过 `/api/session/{id}/tool-runs/{tool_run_id}` 拉取，弹窗打开时持续轮询；因此运行中的 `shell` 可实时查看累计 `stdout/stderr`
+  - 持久化详情时间线现在来自投影化的 tool-run detail API；旧 session 仅在首次打开详情时做一次懒回填，不会每次都重新扫描整段 session events
 - 实时 agent 卡片提供整行 `Steer` 按钮，并使用界面内引导弹框（不再使用系统 prompt/confirm；点击提交即确认），并新增 `Steer Runs` 面板（过滤/分组/统计/搜索）
 - `Steer Runs` 行与相关事件文本优先展示 steer 来源 actor（`from`），原始 source 通道作为次级信息（`via`）
 - `Steer Runs` 行改为多行卡片式展示：目标、来源、通道、创建时间与消息内容分开展示，成功送达的 run 会明确显示插入到哪个步骤
@@ -107,12 +133,13 @@ TUI 提供 run/interrupt、基于 setup 的会话加载、project sync 操作和
 新建会话在 setup 中默认使用 `direct` 模式；在选择项目目录前可切换为 `staged`。
 在 `direct` 模式 setup 中可选择本地目录或远程 SSH 工作目录（target/dir/auth/known-hosts）；`staged` 会禁用远程选择。
 远程 SSH setup 下点击“校验连接并创建”会执行远程校验（SSH 目标/目录/依赖检查），校验通过后立即创建启动配置。
-已加载会话会保留并锁定原始 workspace mode。
+已加载会话会保留原始 `session_id`，并锁定原始 workspace mode。
 当在已有（非活跃）会话上点击 `运行` 时，runtime 会为本次执行追加一个全新的 root agent，而不是复用旧 root，并将该会话切回活跃态。
 当同一会话仍在运行时再次点击 `运行`，runtime 会立刻追加新的 root agent，并与当前活跃 agents 一起调度执行。
 同时在控制栏提供 `终端` 动作，直接拉起系统终端窗口，复用与 agent `shell` 调用一致的 sandbox backend/config，且工作目录固定到当前活动 session workspace。终端改动与 agent 改动一样会被 workspace diff/project sync 跟踪。
 控制栏采用三行布局：第一行是模型输入 + root-agent-name 输入 + 语言切换按钮（`EN` / `中文`），第二行是带明确 `任务` 标签的多行 `TextArea` 输入（按内容自动增高，最小 3 行、最大 9 行），第三行是运行控制按钮（`运行`、`终端`、`重新配置`、`中断`）。
 模型输入默认读取配置，并可按每次运行/继续自由覆盖。
+Web UI 已不再提供 skills/MCP 的自由文本输入；选择通过卡片完成，而 CLI/TUI 仍可用显式 `--mcp-server` 参数。
 Agent 卡片/状态区域会显示各 agent 的模型，来源于持久化 metadata。
 Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`、上下文 token 使用、使用率、最近压缩范围）。
 在 `direct` 模式下，TUI 会禁用 `Diff` 标签页以及 `Apply` / `Undo` 控件。
@@ -120,6 +147,9 @@ Agent 卡片/状态区域也会显示上下文压缩指标（`compression_count`
 CLI 同时提供 `opencompany terminal <session_id>` 与 `opencompany terminal <session_id> --self-check`。
 `--self-check` 会同时校验与 agent `shell` 的策略一致性，以及按 backend 的运行时语义（workspace 内可写；`anthropic` 期望 workspace 外被阻止，`none` 期望 workspace 外可写）。
 交互式 CLI 的 run/resume 状态面板现包含每个 agent 的 `model` 字段。
+CLI 还提供 `opencompany mcp-login --mcp-server <id>`，用于给受 OAuth 保护的 hosted MCP server 完成登录。
+CLI 还提供 `opencompany mcp-servers`，用于校验配置并打印 MCP servers 的 capabilities/tools/resources。
+CLI 的 `run` / `resume` / `mcp-servers` 都支持重复传入 `--mcp-server <id>`。
 CLI 的 `run`/`tui`/`ui` 在新建会话时支持远程参数：
 - `--remote-target user@host[:port]`
 - `--remote-dir /abs/linux/path`
@@ -132,7 +162,7 @@ TUI `Tool Runs` 现支持：
 - 分组列表展示，并可在列表内选中 run（`上一条` / `下一条`）
 - 对当前选中 run 打开 `详情` 弹窗
 - 详情字段：概览、arguments、result、error、生命周期时间线
-- 生命周期时间线基于 runtime 事件增量构建（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
+- 持久化详情时间线由投影化的 tool-run detail 读取提供；实时更新仍会按 runtime 事件增量追加（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）
 - 详情弹窗打开期间，相关 run 新事件到达会自动刷新详情
 
 TUI `Steer Runs` 现支持：

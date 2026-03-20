@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from opencompany.config import OpenCompanyConfig
+from opencompany.mcp import render_mcp_prompt
 from opencompany.models import AgentNode
 from opencompany.orchestration.messages import tool_result_message
 from opencompany.prompts import PromptLibrary
-from opencompany.tools import tool_definitions_for_role
+from opencompany.skills import render_skills_prompt
+from opencompany.tools.catalog import tool_definitions_for_agent
 
 
 PersistAgentFn = Callable[[AgentNode], None]
@@ -55,12 +57,28 @@ class ContextAssembler:
         self.prompt_library = prompt_library
 
     def system_prompt(self, agent: AgentNode) -> str:
-        return self.prompt_library.load(agent.role.value, self.locale)
+        prompt = self.prompt_library.load(agent.role.value, self.locale)
+        metadata = agent.metadata if isinstance(agent.metadata, dict) else {}
+        skills_catalog = metadata.get("skills_catalog")
+        sections = [prompt.rstrip()]
+        if isinstance(skills_catalog, dict):
+            skills_prompt = render_skills_prompt(
+                locale=self.locale,
+                bundle_root=str(skills_catalog.get("bundle_root", "") or ""),
+                manifest_path=str(skills_catalog.get("manifest_path", "") or ""),
+                skills_state=skills_catalog,
+            )
+            if skills_prompt:
+                sections.append(skills_prompt)
+        mcp_prompt = render_mcp_prompt(self.locale, metadata.get("mcp"))
+        if mcp_prompt:
+            sections.append(mcp_prompt)
+        return "\n\n".join(section for section in sections if section)
 
     def tools(self, agent: AgentNode) -> list[dict[str, object]]:
-        return tool_definitions_for_role(
-            agent.role,
-            self.locale,
+        return tool_definitions_for_agent(
+            agent,
+            locale=self.locale,
             config=self.config,
             prompt_library=self.prompt_library,
         )
@@ -155,9 +173,8 @@ def _context_metadata(agent: AgentNode) -> dict[str, Any]:
     return agent.metadata
 
 
-def _internal_message_indices(agent: AgentNode) -> set[int]:
-    metadata = _context_metadata(agent)
-    raw_indices = metadata.get("internal_message_indices")
+def _metadata_message_indices(metadata: dict[str, Any], key: str) -> set[int]:
+    raw_indices = metadata.get(key)
     if not isinstance(raw_indices, list):
         return set()
     normalized: set[int] = set()
@@ -169,22 +186,17 @@ def _internal_message_indices(agent: AgentNode) -> set[int]:
         if index >= 0:
             normalized.add(index)
     return normalized
+
+
+def _internal_message_indices(agent: AgentNode) -> set[int]:
+    return _metadata_message_indices(_context_metadata(agent), "internal_message_indices")
 
 
 def _compression_excluded_message_indices(agent: AgentNode) -> set[int]:
-    metadata = _context_metadata(agent)
-    raw_indices = metadata.get("compression_excluded_message_indices")
-    if not isinstance(raw_indices, list):
-        return set()
-    normalized: set[int] = set()
-    for value in raw_indices:
-        try:
-            index = int(value)
-        except (TypeError, ValueError):
-            continue
-        if index >= 0:
-            normalized.add(index)
-    return normalized
+    return _metadata_message_indices(
+        _context_metadata(agent),
+        "compression_excluded_message_indices",
+    )
 
 
 def _conversation_without_internal_messages(agent: AgentNode) -> list[dict[str, Any]]:
@@ -199,20 +211,23 @@ def _conversation_without_internal_messages(agent: AgentNode) -> list[dict[str, 
     return filtered
 
 
-def prompt_window_projection(
-    agent: AgentNode,
+def prompt_window_projection_from_metadata(
     *,
+    message_count: int,
+    metadata: dict[str, Any] | None,
     keep_pinned_messages: int,
 ) -> PromptWindowProjection:
-    metadata = _context_metadata(agent)
-    internal_indices = _internal_message_indices(agent)
+    normalized_metadata = metadata if isinstance(metadata, dict) else {}
+    normalized_message_count = max(0, int(message_count))
+    internal_indices = _metadata_message_indices(
+        normalized_metadata,
+        "internal_message_indices",
+    )
     ordered_visible_indices = [
-        index
-        for index, _message in enumerate(agent.conversation)
-        if index not in internal_indices
+        index for index in range(normalized_message_count) if index not in internal_indices
     ]
-    summary = str(metadata.get("context_summary", "")).strip()
-    raw_summary_version = _safe_int(metadata.get("summary_version"), default=0)
+    summary = str(normalized_metadata.get("context_summary", "")).strip()
+    raw_summary_version = _safe_int(normalized_metadata.get("summary_version"), default=0)
     if not summary:
         return PromptWindowProjection(
             summary="",
@@ -227,7 +242,7 @@ def prompt_window_projection(
     pinned_indices = ordered_visible_indices[:keep_count] if keep_count > 0 else []
     pinned_index_set = set(pinned_indices)
     summarized_until = _safe_int(
-        metadata.get("summarized_until_message_index"),
+        normalized_metadata.get("summarized_until_message_index"),
         default=-1,
     )
     tail_indices = [
@@ -248,6 +263,18 @@ def prompt_window_projection(
         tail_message_indices=tuple(tail_indices),
         hidden_message_indices=tuple(hidden_indices),
         internal_message_indices=tuple(sorted(internal_indices)),
+    )
+
+
+def prompt_window_projection(
+    agent: AgentNode,
+    *,
+    keep_pinned_messages: int,
+) -> PromptWindowProjection:
+    return prompt_window_projection_from_metadata(
+        message_count=len(agent.conversation),
+        metadata=_context_metadata(agent),
+        keep_pinned_messages=keep_pinned_messages,
     )
 
 

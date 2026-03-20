@@ -1,0 +1,7 @@
+[skill]
+id = "hf-cli"
+name = "HF CLI"
+name_cn = "HF 命令行"
+description = "Use Hugging Face Hub CLI (`hf`) to authenticate, inspect, download, and publish models, datasets, and Spaces."
+description_cn = "使用 Hugging Face Hub CLI（`hf`）进行认证、查询、下载与发布 models、datasets、Spaces。"
+tags = ["huggingface", "cli", "hub", "models", "datasets", "spaces"]

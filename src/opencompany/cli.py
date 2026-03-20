@@ -17,6 +17,7 @@ import shutil
 import sys
 from textwrap import shorten
 import unicodedata
+import uuid
 
 try:
     import termios
@@ -27,6 +28,7 @@ except Exception:  # pragma: no cover - non-POSIX environments
 
 from opencompany.config import OpenCompanyConfig
 from opencompany.logging import DiagnosticLogger, diagnostics_path_for_app
+from opencompany.mcp.oauth import McpOAuthError, complete_mcp_oauth_login
 from opencompany.models import RemoteSessionConfig, WorkspaceMode
 from opencompany.orchestrator import Orchestrator, default_app_dir
 from opencompany.paths import RuntimePaths
@@ -131,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
             help="Host key verification policy for remote SSH.",
         )
 
+    def add_mcp_server_options(target_parser: argparse.ArgumentParser, *, help_text: str) -> None:
+        target_parser.add_argument(
+            "--mcp-server",
+            action="append",
+            dest="mcp_servers",
+            default=None,
+            help=help_text,
+        )
+
     run_parser = subparsers.add_parser(
         "run",
         help="Run a task and persist runtime events/messages for the session",
@@ -158,6 +169,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional custom display name for the root coordinator in this run.",
     )
     run_parser.add_argument(
+        "--skill",
+        action="append",
+        dest="skills",
+        default=None,
+        help="Enable a skill id for this run. Repeat to select multiple skills.",
+    )
+    add_mcp_server_options(
+        run_parser,
+        help_text="Enable an MCP server id for this run. Repeat to select multiple servers.",
+    )
+    run_parser.add_argument(
         "--preview-chars",
         type=int,
         default=_RUN_PREVIEW_CHARS_DEFAULT,
@@ -169,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(run_parser)
 
@@ -189,6 +211,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     resume_parser.add_argument("--model", default=None, help="Override model for this resume")
     resume_parser.add_argument(
+        "--skill",
+        action="append",
+        dest="skills",
+        default=None,
+        help="Replace the enabled skill set for this resume. Repeat to select multiple skills.",
+    )
+    add_mcp_server_options(
+        resume_parser,
+        help_text="Replace the enabled MCP server set for this resume. Repeat to select multiple servers.",
+    )
+    resume_parser.add_argument(
         "--preview-chars",
         type=int,
         default=_RUN_PREVIEW_CHARS_DEFAULT,
@@ -200,7 +233,82 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
+    )
+
+    clone_parser = subparsers.add_parser(
+        "clone",
+        help="Clone an existing non-running session into a new branch session",
+    )
+    clone_parser.add_argument("session_id", help="Source session ID")
+    clone_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    clone_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    clone_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
+    )
+
+    skills_parser = subparsers.add_parser(
+        "skills",
+        help="Discover available skills from project and global sources",
+    )
+    skills_parser.add_argument("--project-dir", default=".", help="Target project directory")
+    skills_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    skills_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    skills_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
+    )
+    add_remote_options(skills_parser)
+
+    mcp_parser = subparsers.add_parser(
+        "mcp-servers",
+        help="Inspect configured MCP servers and print discovered tools/resources",
+    )
+    mcp_parser.add_argument("--project-dir", default=".", help="Target project directory")
+    mcp_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    mcp_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    mcp_parser.add_argument(
+        "--sandbox-backend",
+        choices=sandbox_backend_choices,
+        default=None,
+        help="Override sandbox backend for this inspection only (defaults to [sandbox].backend).",
+    )
+    add_mcp_server_options(
+        mcp_parser,
+        help_text="Inspect only the specified MCP server ids. Repeat to select multiple servers.",
+    )
+    mcp_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
+    )
+    add_remote_options(mcp_parser)
+
+    mcp_login_parser = subparsers.add_parser(
+        "mcp-login",
+        help="Authenticate an OAuth-protected MCP server and persist tokens locally",
+    )
+    mcp_login_parser.add_argument(
+        "--mcp-server",
+        required=True,
+        dest="mcp_server",
+        help="MCP server id to authenticate.",
+    )
+    mcp_login_parser.add_argument("--app-dir", default=None, help="OpenCompany app directory")
+    mcp_login_parser.add_argument("--locale", default=None, help="Locale: en or zh")
+    mcp_login_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300.0,
+        help="OAuth callback wait timeout in seconds (default: 300).",
+    )
+    mcp_login_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the authorization URL without attempting to open a browser automatically.",
     )
 
     export_parser = subparsers.add_parser(
@@ -330,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(tui_parser)
 
@@ -348,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument(
         "--debug",
         action="store_true",
-        help="Write API request/response debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module).",
+        help="Write API request/response and stage timing debug logs to .opencompany/sessions/<session_id>/debug/ (split by agent+module and timings.jsonl).",
     )
     add_remote_options(ui_parser)
     ui_parser.add_argument("--host", default="127.0.0.1", help="Host for the UI HTTP server")
@@ -935,11 +1043,12 @@ class _RunStatusPanel:
                 if session_status_raw:
                     session_status = session_status_raw
                     self._session_status = session_status_raw
-            agent_rows = [
-                row
-                for row in orchestrator.storage.load_agents(session_id)
-                if isinstance(row, dict)
-            ]
+            load_agents = getattr(orchestrator, "load_session_agents", None)
+            if callable(load_agents):
+                raw_agent_rows = load_agents(session_id)
+            else:
+                raw_agent_rows = orchestrator.storage.load_agents(session_id)
+            agent_rows = [row for row in raw_agent_rows if isinstance(row, dict)]
             agent_ids = [
                 str(row.get("id", "")).strip()
                 for row in agent_rows
@@ -982,9 +1091,17 @@ class _RunStatusPanel:
         role = str(row.get("role", "")).strip().lower()
         status_raw = str(row.get("status", "")).strip().lower()
         status = status_raw
-        children = self._decode_children(row.get("children_json"))
+        children = self._decode_children(
+            row.get("children_json")
+            if "children_json" in row
+            else row.get("children")
+        )
         metadata = self._decode_metadata(row.get("metadata_json"))
-        model = str(metadata.get("model", "")).strip() or self.labels["none"]
+        model = (
+            str(row.get("model", "")).strip()
+            or str(metadata.get("model", "")).strip()
+            or self.labels["none"]
+        )
         summary = str(row.get("summary") or "").strip() or self.labels["none"]
         try:
             step_count = max(0, int(row.get("step_count") or 0))
@@ -1035,6 +1152,8 @@ class _RunStatusPanel:
 
     @staticmethod
     def _decode_children(raw_children: Any) -> list[str]:
+        if isinstance(raw_children, list):
+            return [str(item).strip() for item in raw_children if str(item).strip()]
         if not isinstance(raw_children, str):
             return []
         try:
@@ -1047,6 +1166,8 @@ class _RunStatusPanel:
 
     @staticmethod
     def _decode_metadata(raw_metadata: Any) -> dict[str, Any]:
+        if isinstance(raw_metadata, dict):
+            return raw_metadata
         if not isinstance(raw_metadata, str):
             return {}
         try:
@@ -1774,6 +1895,8 @@ async def _run_task(
     remote_password: str | None = None,
     model: str | None = None,
     root_agent_name: str | None = None,
+    enabled_skill_ids: list[str] | None = None,
+    enabled_mcp_server_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1800,6 +1923,8 @@ async def _run_task(
             "sandbox_backend": resolved_sandbox_backend,
             "model": resolved_model,
             "root_agent_name": resolved_root_agent_name,
+            "enabled_skill_ids": list(enabled_skill_ids or []),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
         },
     )
     session = None
@@ -1811,6 +1936,10 @@ async def _run_task(
             run_kwargs["root_agent_name"] = resolved_root_agent_name
         if workspace_mode:
             run_kwargs["workspace_mode"] = workspace_mode
+        if enabled_skill_ids is not None:
+            run_kwargs["enabled_skill_ids"] = enabled_skill_ids
+        if enabled_mcp_server_ids is not None:
+            run_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
         if remote_config is not None:
             run_kwargs["remote_config"] = remote_config
             if remote_password:
@@ -1845,6 +1974,8 @@ async def _resume(
     instruction: str,
     debug: bool,
     model: str | None = None,
+    enabled_skill_ids: list[str] | None = None,
+    enabled_mcp_server_ids: list[str] | None = None,
     sandbox_backend: str | None = None,
     preview_chars: int = _RUN_PREVIEW_CHARS_DEFAULT,
 ) -> None:
@@ -1852,8 +1983,7 @@ async def _resume(
     orchestrator = Orchestrator(Path("."), locale=locale, app_dir=app_dir, debug=debug)
     resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
     resolved_model = str(model or "").strip() or None
-    resumed_from = orchestrator.load_session_context(normalized_session_id)
-    resumed_session_id = resumed_from.id
+    resumed_session_id = normalized_session_id
     panel: _RunStatusPanel | None = None
     if _run_status_panel_enabled():
         panel = _RunStatusPanel(
@@ -1875,6 +2005,8 @@ async def _resume(
             "source_session_id": normalized_session_id,
             "sandbox_backend": resolved_sandbox_backend,
             "model": resolved_model,
+            "enabled_skill_ids": list(enabled_skill_ids or []),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
         },
     )
     session = None
@@ -1886,6 +2018,10 @@ async def _resume(
         resume_kwargs: dict[str, Any] = {}
         if resolved_model:
             resume_kwargs["model"] = resolved_model
+        if enabled_skill_ids is not None:
+            resume_kwargs["enabled_skill_ids"] = enabled_skill_ids
+        if enabled_mcp_server_ids is not None:
+            resume_kwargs["enabled_mcp_server_ids"] = enabled_mcp_server_ids
         if remote_password:
             resume_kwargs["remote_password"] = remote_password
         session = await orchestrator.resume(
@@ -1913,6 +2049,215 @@ async def _resume(
     print(f"session_status={session.status.value}")
     print(f"completion_state={session.completion_state}")
     _maybe_apply_staged_changes(orchestrator, session.id)
+
+
+async def _skills(
+    project_dir: Path,
+    app_dir: Path | None,
+    locale: str | None,
+    debug: bool,
+    *,
+    remote_config: RemoteSessionConfig | None = None,
+    remote_password: str | None = None,
+) -> None:
+    orchestrator = Orchestrator(project_dir, locale=locale, app_dir=app_dir, debug=debug)
+    skills = await orchestrator.discover_skills(
+        project_dir=None if remote_config is not None else project_dir,
+        remote_config=remote_config,
+        remote_password=remote_password,
+    )
+    print(json.dumps(skills, ensure_ascii=False, indent=2))
+
+
+async def _mcp_servers(
+    project_dir: Path,
+    app_dir: Path | None,
+    locale: str | None,
+    debug: bool,
+    *,
+    enabled_mcp_server_ids: list[str] | None = None,
+    sandbox_backend: str | None = None,
+    remote_config: RemoteSessionConfig | None = None,
+    remote_password: str | None = None,
+) -> None:
+    orchestrator = Orchestrator(project_dir, locale=locale, app_dir=app_dir, debug=debug)
+    resolved_sandbox_backend = _apply_sandbox_backend(orchestrator, sandbox_backend)
+    inspection_session_id = f"mcp-inspect-{uuid.uuid4().hex[:12]}"
+    workspace_path = (
+        Path(remote_config.remote_dir).expanduser()
+        if remote_config is not None
+        else project_dir.resolve()
+    )
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="mcp_servers_command_started",
+        session_id=inspection_session_id,
+        payload={
+            "project_dir": str(project_dir),
+            "workspace_path": str(workspace_path),
+            "sandbox_backend": resolved_sandbox_backend,
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
+            "remote": remote_config is not None,
+        },
+    )
+    try:
+        if remote_config is not None:
+            orchestrator._apply_session_remote_runtime(
+                session_id=inspection_session_id,
+                remote_config=remote_config,
+                remote_password=remote_password,
+                require_password=True,
+            )
+        rows = await orchestrator.mcp_manager.inspect_servers(
+            enabled_server_ids=enabled_mcp_server_ids,
+            workspace_path=workspace_path,
+            workspace_is_remote=remote_config is not None,
+            tool_executor=orchestrator.tool_executor,
+            session_id=inspection_session_id,
+        )
+    finally:
+        await orchestrator.mcp_manager.close_session(inspection_session_id)
+        orchestrator.tool_executor.cleanup_session_remote_runtime(inspection_session_id)
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="mcp_servers_command_finished",
+        session_id=inspection_session_id,
+        payload={
+            "server_count": len(rows),
+            "enabled_mcp_server_ids": list(enabled_mcp_server_ids or []),
+        },
+    )
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+async def _mcp_login(
+    app_dir: Path | None,
+    locale: str | None,
+    *,
+    mcp_server_id: str,
+    timeout_seconds: float,
+    open_browser: bool,
+) -> None:
+    del locale
+    resolved_app_dir = (app_dir or default_app_dir()).resolve()
+    config = OpenCompanyConfig.load(resolved_app_dir)
+    paths = RuntimePaths.create(resolved_app_dir, config)
+    diagnostics = DiagnosticLogger(diagnostics_path_for_app(resolved_app_dir))
+    server_id = str(mcp_server_id or "").strip()
+    if not server_id:
+        raise SystemExit("--mcp-server is required.")
+    server = config.mcp.servers.get(server_id)
+    if server is None:
+        raise SystemExit(f"MCP server '{server_id}' is not defined in opencompany.toml.")
+    diagnostics.log(
+        component="cli",
+        event_type="mcp_login_started",
+        payload={
+            "server_id": server_id,
+            "app_dir": str(resolved_app_dir),
+            "open_browser": bool(open_browser),
+        },
+    )
+    authorization_url_announced = False
+
+    def _announce_authorization_url(url: str) -> None:
+        nonlocal authorization_url_announced
+        if open_browser or authorization_url_announced:
+            return
+        normalized_url = str(url or "").strip()
+        if not normalized_url:
+            return
+        authorization_url_announced = True
+        print("Open this URL to continue MCP OAuth login:", flush=True)
+        print(normalized_url, flush=True)
+        print("", flush=True)
+
+    try:
+        result = await complete_mcp_oauth_login(
+            server=server,
+            store_path=paths.mcp_oauth_tokens_path,
+            timeout_seconds=max(1.0, float(timeout_seconds)),
+            open_browser=open_browser,
+            authorization_url_callback=_announce_authorization_url,
+        )
+    except McpOAuthError as exc:
+        diagnostics.log(
+            component="cli",
+            event_type="mcp_login_failed",
+            level="error",
+            payload={"server_id": server_id},
+            error=exc,
+        )
+        raise SystemExit(str(exc)) from exc
+    diagnostics.log(
+        component="cli",
+        event_type="mcp_login_finished",
+        payload={
+            "server_id": server_id,
+            "authorization_server": result.record.authorization_server,
+            "browser_opened": result.browser_opened,
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "server_id": result.record.server_id,
+                "server_title": server.resolved_title(),
+                "authorized": True,
+                "browser_opened": result.browser_opened,
+                "authorization_url": result.authorization_url,
+                "authorization_server": result.record.authorization_server,
+                "resource": result.record.resource,
+                "scope": result.record.scope,
+                "expires_at": result.record.expires_at,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _clone_session(
+    app_dir: Path | None,
+    locale: str | None,
+    session_id: str,
+    debug: bool,
+) -> None:
+    normalized_session_id = _normalize_session_id_or_exit(session_id)
+    orchestrator = Orchestrator(Path("."), locale=locale, app_dir=app_dir, debug=debug)
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="clone_command_started",
+        session_id=normalized_session_id,
+        payload={
+            "locale": locale,
+            "source_session_id": normalized_session_id,
+        },
+    )
+    try:
+        cloned = orchestrator.clone_session(normalized_session_id)
+    except Exception as exc:
+        orchestrator.diagnostics.log(
+            component="cli",
+            event_type="clone_command_failed",
+            level="error",
+            session_id=normalized_session_id,
+            payload={"source_session_id": normalized_session_id},
+            error=exc,
+        )
+        raise
+    orchestrator.diagnostics.log(
+        component="cli",
+        event_type="clone_command_finished",
+        session_id=cloned.id,
+        payload={
+            "source_session_id": normalized_session_id,
+            "session_status": cloned.status.value,
+        },
+    )
+    print(f"source_session_id={normalized_session_id}")
+    print(f"session_id={cloned.id}")
+    print(f"session_status={cloned.status.value}")
 
 
 def _export(
@@ -2502,6 +2847,8 @@ def main() -> None:
                     remote_password=remote_password,
                     model=getattr(args, "model", None),
                     root_agent_name=getattr(args, "root_agent_name", None),
+                    enabled_skill_ids=getattr(args, "skills", None),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)),
                 )
@@ -2515,11 +2862,62 @@ def main() -> None:
                     args.instruction,
                     bool(args.debug),
                     model=getattr(args, "model", None),
+                    enabled_skill_ids=getattr(args, "skills", None),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
                     sandbox_backend=getattr(args, "sandbox_backend", None),
                     preview_chars=int(
                         getattr(args, "preview_chars", _RUN_PREVIEW_CHARS_DEFAULT)
                     ),
                 )
+            )
+        elif args.command == "skills":
+            remote_config, remote_password = _remote_cli_config_from_args(
+                args,
+                command_name="skills",
+            )
+            asyncio.run(
+                _skills(
+                    project_dir or Path(".").resolve(),
+                    app_dir,
+                    args.locale,
+                    bool(args.debug),
+                    remote_config=remote_config,
+                    remote_password=remote_password,
+                )
+            )
+        elif args.command == "mcp-servers":
+            remote_config, remote_password = _remote_cli_config_from_args(
+                args,
+                command_name="mcp-servers",
+            )
+            asyncio.run(
+                _mcp_servers(
+                    project_dir or Path(".").resolve(),
+                    app_dir,
+                    args.locale,
+                    bool(args.debug),
+                    enabled_mcp_server_ids=getattr(args, "mcp_servers", None),
+                    sandbox_backend=getattr(args, "sandbox_backend", None),
+                    remote_config=remote_config,
+                    remote_password=remote_password,
+                )
+            )
+        elif args.command == "mcp-login":
+            asyncio.run(
+                _mcp_login(
+                    app_dir,
+                    args.locale,
+                    mcp_server_id=getattr(args, "mcp_server", ""),
+                    timeout_seconds=float(getattr(args, "timeout_seconds", 300.0)),
+                    open_browser=not bool(getattr(args, "no_browser", False)),
+                )
+            )
+        elif args.command == "clone":
+            _clone_session(
+                app_dir,
+                args.locale,
+                args.session_id,
+                bool(args.debug),
             )
         elif args.command == "export-logs":
             _export(

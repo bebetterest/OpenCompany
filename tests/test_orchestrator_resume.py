@@ -14,6 +14,7 @@ from opencompany.models import (
     AgentStatus,
     CheckpointState,
     EventRecord,
+    RemoteSessionConfig,
     RunSession,
     ShellCommandResult,
     SessionStatus,
@@ -22,6 +23,7 @@ from opencompany.models import (
     WorkspaceMode,
 )
 from opencompany.orchestrator import Orchestrator
+from opencompany.remote import load_remote_session_config, save_remote_session_config
 from opencompany.storage import Storage
 from opencompany.utils import utc_now
 from opencompany.workspace import WorkspaceManager
@@ -187,7 +189,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             agents = {root.id: root}
             orchestrator._live_session_contexts[session.id] = (session, agents, workspace_manager)
 
-            submitted = orchestrator.submit_run_in_active_session(
+            submitted = await orchestrator.submit_run_in_active_session(
                 session_id,
                 "new live root task",
                 model="openai/gpt-4.1",
@@ -250,7 +252,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             agents = {root.id: root}
             orchestrator._live_session_contexts[session.id] = (session, agents, workspace_manager)
 
-            submitted = orchestrator.submit_run_in_active_session(
+            submitted = await orchestrator.submit_run_in_active_session(
                 session_id,
                 "new live root task",
                 model="openai/gpt-4.1",
@@ -785,7 +787,267 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
                 [running_worker.id],
             )
 
-    async def test_load_session_context_pauses_active_agents_and_cancels_pending_runs(self) -> None:
+    async def test_load_session_context_returns_same_session_without_clone_side_effects(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "opencompany-app"
+            project_dir = root / "target-project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_project(app_dir)
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            session_id = "session-context-readonly"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root_agent = AgentNode(
+                id="agent-root-readonly",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="Inspect without cloning",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.RUNNING,
+                conversation=[{"role": "user", "content": "inspect"}],
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="Read only load",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.RUNNING,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+            orchestrator._sync_agent_messages(root_agent)
+            checkpoint_state = CheckpointState(
+                session=orchestrator._session_state(session),
+                agents={root_agent.id: orchestrator._agent_state(root_agent)},
+                workspaces=workspace_manager.serialize(),
+                pending_agent_ids=[root_agent.id],
+                pending_tool_run_ids=[],
+                root_loop=1,
+            )
+            orchestrator.storage.save_checkpoint(session_id, now, checkpoint_state)
+
+            session_dirs_before = sorted(
+                path.name for path in orchestrator.paths.sessions_dir.iterdir() if path.is_dir()
+            )
+            session_rows_before = [row["id"] for row in orchestrator.storage.list_sessions()]
+
+            loaded = orchestrator.load_session_context(session_id)
+
+            session_dirs_after = sorted(
+                path.name for path in orchestrator.paths.sessions_dir.iterdir() if path.is_dir()
+            )
+            session_rows_after = [row["id"] for row in orchestrator.storage.list_sessions()]
+            self.assertEqual(loaded.id, session_id)
+            self.assertEqual(loaded.status, SessionStatus.RUNNING)
+            self.assertEqual(session_dirs_after, session_dirs_before)
+            self.assertEqual(session_rows_after, session_rows_before)
+            stored_agents = orchestrator.storage.load_agents(session_id)
+            self.assertEqual(len(stored_agents), 1)
+            self.assertEqual(str(stored_agents[0].get("status")), AgentStatus.RUNNING.value)
+            messages = orchestrator.list_session_messages(session_id, agent_id=root_agent.id, tail=20)
+            self.assertTrue(messages["messages"])
+            self.assertTrue(
+                all(str(row.get("session_id", "")).strip() == session_id for row in messages["messages"])
+            )
+
+    async def test_load_session_context_defaults_storage_only_workspace_mode_to_staged(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-storage-only-legacy-mode"
+            legacy_row = {
+                "id": session_id,
+                "project_dir": str(project_dir),
+                "task": "Legacy row only",
+                "locale": "en",
+                "root_agent_id": "agent-root-legacy-mode",
+                "status": SessionStatus.INTERRUPTED.value,
+                "status_reason": None,
+                "created_at": "2026-03-18T10:00:00Z",
+                "updated_at": "2026-03-18T10:00:00Z",
+                "loop_index": 0,
+                "final_summary": None,
+                "completion_state": None,
+                "follow_up_needed": 0,
+            }
+            with (
+                mock.patch.object(orchestrator.storage, "load_session", return_value=legacy_row),
+                mock.patch.object(orchestrator.storage, "latest_checkpoint", return_value=None),
+            ):
+                loaded = orchestrator.load_session_context(session_id)
+
+            self.assertEqual(loaded.id, session_id)
+            self.assertEqual(loaded.workspace_mode, WorkspaceMode.STAGED)
+
+    async def test_list_session_messages_annotates_prompt_visibility_without_full_reload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-message-projection-fast-path"
+            orchestrator.paths.session_dir(session_id)
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=project_dir,
+                    task="message projection",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.RUNNING,
+                )
+            )
+            agent = AgentNode(
+                id="agent-root",
+                session_id=session_id,
+                name="Root",
+                role=AgentRole.ROOT,
+                instruction="demo",
+                workspace_id="root",
+                status=AgentStatus.PAUSED,
+                metadata={
+                    "context_summary": "## Current context summary\n- completed setup",
+                    "summary_version": 2,
+                    "summarized_until_message_index": 2,
+                },
+            )
+            agent.step_count = 1
+            orchestrator._append_agent_message(agent, {"role": "user", "content": "head pinned"})
+            agent.step_count = 1
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "assistant", "content": "same step but summarized"},
+            )
+            agent.step_count = 2
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "older summarized step"},
+            )
+            agent.step_count = 3
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "context pressure reminder"},
+                None,
+                {"exclude_from_context_compression": True},
+            )
+            agent.step_count = 3
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "assistant", "content": "latest assistant reply"},
+            )
+
+            logger = orchestrator._get_message_logger(session_id)
+
+            def _unexpected_read(_agent_id: str) -> list[dict[str, object]]:
+                raise AssertionError("prompt visibility should not require full message reload")
+
+            logger.read = _unexpected_read  # type: ignore[method-assign]
+
+            page = orchestrator.list_session_messages(
+                session_id,
+                agent_id=agent.id,
+                limit=20,
+            )
+            by_index = {
+                int(record["message_index"]): record
+                for record in page["messages"]
+                if "message_index" in record
+            }
+            self.assertEqual(by_index[0]["prompt_bucket"], "pinned")
+            self.assertTrue(bool(by_index[0]["prompt_visible"]))
+            self.assertEqual(by_index[1]["prompt_bucket"], "hidden_middle")
+            self.assertFalse(bool(by_index[1]["prompt_visible"]))
+            self.assertEqual(by_index[2]["prompt_bucket"], "hidden_middle")
+            self.assertFalse(bool(by_index[2]["prompt_visible"]))
+            self.assertEqual(by_index[3]["prompt_bucket"], "tail")
+            self.assertTrue(bool(by_index[3]["prompt_visible"]))
+            self.assertEqual(by_index[4]["prompt_bucket"], "tail")
+            self.assertTrue(bool(by_index[4]["prompt_visible"]))
+
+    async def test_list_session_messages_skips_checkpoint_sync_when_logs_exist(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-message-fast-path"
+            orchestrator.paths.session_dir(session_id)
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=project_dir,
+                    task="message fast path",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.RUNNING,
+                )
+            )
+            agent = AgentNode(
+                id="agent-root",
+                session_id=session_id,
+                name="Root",
+                role=AgentRole.ROOT,
+                instruction="demo",
+                workspace_id="root",
+                status=AgentStatus.PAUSED,
+            )
+            orchestrator._append_agent_message(
+                agent,
+                {"role": "user", "content": "hello"},
+            )
+
+            def _unexpected_latest_checkpoint(_session_id: str) -> dict[str, object] | None:
+                raise AssertionError("message pagination should not rescan checkpoint when logs already exist")
+
+            orchestrator.storage.latest_checkpoint = _unexpected_latest_checkpoint  # type: ignore[method-assign]
+            page = orchestrator.list_session_messages(session_id, agent_id=agent.id, limit=20)
+            self.assertEqual(len(page["messages"]), 1)
+            self.assertEqual(page["messages"][0]["message"]["content"], "hello")
+
+    async def test_load_session_agents_skips_checkpoint_when_storage_rows_exist(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-agent-fast-path"
+            orchestrator.storage.upsert_session(
+                RunSession(
+                    id=session_id,
+                    project_dir=project_dir,
+                    task="agent fast path",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    status=SessionStatus.INTERRUPTED,
+                )
+            )
+            orchestrator.storage.upsert_agent(
+                AgentNode(
+                    id="agent-root",
+                    session_id=session_id,
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="demo",
+                    workspace_id="root",
+                    status=AgentStatus.PAUSED,
+                )
+            )
+
+            def _unexpected_latest_checkpoint(_session_id: str) -> dict[str, object] | None:
+                raise AssertionError("agent snapshot should not rescan checkpoint when rows already exist")
+
+            orchestrator.storage.latest_checkpoint = _unexpected_latest_checkpoint  # type: ignore[method-assign]
+            agents = orchestrator.load_session_agents(session_id)
+            self.assertEqual(len(agents), 1)
+            self.assertEqual(agents[0]["id"], "agent-root")
+
+    async def test_clone_session_copies_agents_runs_and_checkpoints_without_importing(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             app_dir = root / "opencompany-app"
@@ -863,7 +1125,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
                 task="Import context",
                 locale="en",
                 root_agent_id=root_agent.id,
-                status=SessionStatus.RUNNING,
+                status=SessionStatus.INTERRUPTED,
                 created_at=now,
                 updated_at=now,
                 loop_index=2,
@@ -917,28 +1179,58 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             )
             orchestrator.storage.save_checkpoint(session_id, utc_now(), checkpoint_state)
 
-            loaded = orchestrator.load_session_context(session_id)
+            loaded = orchestrator.clone_session(session_id)
             self.assertNotEqual(loaded.id, session_id)
             self.assertEqual(loaded.status, SessionStatus.INTERRUPTED)
             self.assertEqual(
                 str(loaded.config_snapshot.get("continued_from_session_id", "")),
                 session_id,
             )
-            stored_agents = {
-                str(row.get("id")): str(row.get("status"))
-                for row in orchestrator.storage.load_agents(loaded.id)
-            }
-            self.assertEqual(stored_agents[root_agent.id], AgentStatus.PAUSED.value)
-            self.assertEqual(stored_agents[waiting_worker.id], AgentStatus.PAUSED.value)
-            self.assertEqual(stored_agents[pending_worker.id], AgentStatus.PAUSED.value)
-            self.assertEqual(stored_agents[completed_worker.id], AgentStatus.COMPLETED.value)
-
-            cloned_cancelled_runs = orchestrator.list_tool_runs(
-                loaded.id,
-                status=ToolRunStatus.CANCELLED.value,
-                limit=20,
+            self.assertEqual(
+                int(loaded.config_snapshot.get("continued_from_checkpoint_seq", -1)),
+                1,
             )
-            self.assertEqual(len(cloned_cancelled_runs), 2)
+            source_agent_rows = {
+                str(row.get("id")): str(row.get("session_id"))
+                for row in orchestrator.storage.load_agents(session_id)
+            }
+            self.assertEqual(source_agent_rows[root_agent.id], session_id)
+            self.assertEqual(source_agent_rows[waiting_worker.id], session_id)
+            self.assertEqual(source_agent_rows[pending_worker.id], session_id)
+            self.assertEqual(source_agent_rows[completed_worker.id], session_id)
+            self.assertEqual(orchestrator.storage.load_agents(loaded.id), [])
+
+            loaded_agents = {
+                str(row.get("id")): row
+                for row in orchestrator.load_session_agents(loaded.id)
+            }
+            self.assertEqual(
+                str(loaded_agents[root_agent.id].get("session_id", "")),
+                loaded.id,
+            )
+            self.assertEqual(
+                str(loaded_agents[root_agent.id].get("status", "")),
+                AgentStatus.RUNNING.value,
+            )
+            self.assertEqual(
+                str(loaded_agents[waiting_worker.id].get("status", "")),
+                AgentStatus.RUNNING.value,
+            )
+            self.assertEqual(
+                str(loaded_agents[pending_worker.id].get("status", "")),
+                AgentStatus.PENDING.value,
+            )
+            self.assertEqual(
+                str(loaded_agents[completed_worker.id].get("status", "")),
+                AgentStatus.COMPLETED.value,
+            )
+
+            cloned_runs = orchestrator.list_tool_runs(loaded.id, limit=20)
+            self.assertEqual(len(cloned_runs), 2)
+            self.assertEqual(
+                sorted(str(run.get("status", "")) for run in cloned_runs),
+                [ToolRunStatus.QUEUED.value, ToolRunStatus.RUNNING.value],
+            )
             source_queued = orchestrator.storage.load_tool_run(queued_run.id)
             source_running = orchestrator.storage.load_tool_run(running_run.id)
             assert source_queued is not None
@@ -951,7 +1243,15 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             assert latest_checkpoint is not None
             self.assertEqual(
                 latest_checkpoint["state"]["agents"][root_agent.id]["status"],
-                AgentStatus.PAUSED.value,
+                AgentStatus.RUNNING.value,
+            )
+            self.assertEqual(
+                latest_checkpoint["state"]["session"]["config_snapshot"]["continued_from_session_id"],
+                session_id,
+            )
+            self.assertEqual(
+                latest_checkpoint["state"]["session"]["config_snapshot"]["continued_from_checkpoint_seq"],
+                1,
             )
             workspace_payload = latest_checkpoint["state"]["workspaces"][root_workspace.id]
             cloned_workspace_path = Path(str(workspace_payload["path"]))
@@ -1139,7 +1439,423 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
                 project_dir.resolve(),
             )
 
-    async def test_loaded_session_remains_usable_after_source_session_deleted(self) -> None:
+    async def test_clone_session_rejects_running_source_session(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "opencompany-app"
+            project_dir = root / "target-project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_project(app_dir)
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            session_id = "session-running-clone-blocked"
+            now = utc_now()
+            root_workspace = WorkspaceManager(orchestrator.paths.session_dir(session_id)).create_root_workspace(
+                project_dir
+            )
+            root_agent = AgentNode(
+                id="agent-root-running",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="still running",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.RUNNING,
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="running",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.RUNNING,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+
+            with self.assertRaisesRegex(ValueError, "Cannot clone running session"):
+                orchestrator.clone_session(session_id)
+
+    async def test_clone_session_copies_remote_password_ref_to_new_session(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "opencompany-app"
+            project_dir = root / "target-project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_project(app_dir)
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            session_id = "session-remote-clone"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root_agent = AgentNode(
+                id="agent-root-remote-clone",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="clone remote",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.PAUSED,
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="Clone remote session",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.INTERRUPTED,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+            orchestrator.storage.save_checkpoint(
+                session_id,
+                now,
+                CheckpointState(
+                    session=orchestrator._session_state(session),
+                    agents={root_agent.id: orchestrator._agent_state(root_agent)},
+                    workspaces=workspace_manager.serialize(),
+                    pending_agent_ids=[],
+                    pending_tool_run_ids=[],
+                    root_loop=0,
+                ),
+            )
+            save_remote_session_config(
+                orchestrator.paths.session_dir(session_id),
+                RemoteSessionConfig(
+                    kind="remote_ssh",
+                    ssh_target="demo@example.com:22",
+                    remote_dir="/home/demo/workspace",
+                    auth_mode="password",
+                    known_hosts_policy="accept_new",
+                    remote_os="linux",
+                    password_ref="ref-source-session",
+                ),
+            )
+
+            with (
+                mock.patch(
+                    "opencompany.orchestrator.load_remote_session_password",
+                    return_value="secret-pass",
+                ) as load_password,
+                mock.patch(
+                    "opencompany.orchestrator.build_remote_password_ref",
+                    return_value="ref-cloned-session",
+                ) as build_password_ref,
+                mock.patch("opencompany.orchestrator.save_remote_session_password") as save_password,
+            ):
+                cloned = orchestrator.clone_session(session_id)
+
+            load_password.assert_called_once_with("ref-source-session")
+            build_password_ref.assert_called_once()
+            save_password.assert_called_once_with("ref-cloned-session", "secret-pass")
+
+            source_remote = load_remote_session_config(orchestrator.paths.session_dir(session_id))
+            cloned_remote = load_remote_session_config(orchestrator.paths.session_dir(cloned.id))
+            self.assertIsNotNone(source_remote)
+            self.assertIsNotNone(cloned_remote)
+            assert source_remote is not None
+            assert cloned_remote is not None
+            self.assertEqual(source_remote.password_ref, "ref-source-session")
+            self.assertEqual(cloned_remote.password_ref, "ref-cloned-session")
+
+    async def test_clone_session_clears_remote_password_ref_when_source_password_unavailable(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "opencompany-app"
+            project_dir = root / "target-project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_project(app_dir)
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            session_id = "session-remote-clone-missing-password"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root_agent = AgentNode(
+                id="agent-root-remote-clone-missing-password",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="clone remote without password",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.PAUSED,
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="Clone remote session without stored password",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.INTERRUPTED,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+            orchestrator.storage.save_checkpoint(
+                session_id,
+                now,
+                CheckpointState(
+                    session=orchestrator._session_state(session),
+                    agents={root_agent.id: orchestrator._agent_state(root_agent)},
+                    workspaces=workspace_manager.serialize(),
+                    pending_agent_ids=[],
+                    pending_tool_run_ids=[],
+                    root_loop=0,
+                ),
+            )
+            save_remote_session_config(
+                orchestrator.paths.session_dir(session_id),
+                RemoteSessionConfig(
+                    kind="remote_ssh",
+                    ssh_target="demo@example.com:22",
+                    remote_dir="/home/demo/workspace",
+                    auth_mode="password",
+                    known_hosts_policy="accept_new",
+                    remote_os="linux",
+                    password_ref="ref-source-session",
+                ),
+            )
+
+            with mock.patch(
+                "opencompany.orchestrator.load_remote_session_password",
+                return_value=None,
+            ):
+                cloned = orchestrator.clone_session(session_id)
+
+            source_remote = load_remote_session_config(orchestrator.paths.session_dir(session_id))
+            cloned_remote = load_remote_session_config(orchestrator.paths.session_dir(cloned.id))
+            self.assertIsNotNone(source_remote)
+            self.assertIsNotNone(cloned_remote)
+            assert source_remote is not None
+            assert cloned_remote is not None
+            self.assertEqual(source_remote.password_ref, "ref-source-session")
+            self.assertEqual(cloned_remote.password_ref, "")
+
+    async def test_clone_session_rebuilds_tool_run_timeline_projection_from_cloned_events(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "opencompany-app"
+            project_dir = root / "target-project"
+            app_dir.mkdir()
+            project_dir.mkdir()
+            build_test_project(app_dir)
+
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=app_dir)
+            session_id = "session-clone-timeline"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root_agent = AgentNode(
+                id="agent-root-clone-timeline",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="clone timeline",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.PAUSED,
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="Clone timeline projection",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.INTERRUPTED,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id="toolrun-source-timeline",
+                    session_id=session_id,
+                    agent_id=root_agent.id,
+                    tool_name="list_agent_runs",
+                    arguments={"type": "list_agent_runs"},
+                    status=ToolRunStatus.COMPLETED,
+                    blocking=True,
+                    created_at=now,
+                    started_at=now,
+                    completed_at=now,
+                    result={"ok": True},
+                )
+            )
+            for timestamp, event_type, payload in [
+                (
+                    "2026-03-18T10:00:00Z",
+                    "tool_call_started",
+                    {"action": {"type": "list_agent_runs", "_tool_call_id": "call-1"}},
+                ),
+                (
+                    "2026-03-18T10:00:01Z",
+                    "tool_run_submitted",
+                    {
+                        "tool_run_id": "toolrun-source-timeline",
+                        "tool_name": "list_agent_runs",
+                        "action": {"_tool_call_id": "call-1"},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:02Z",
+                    "tool_call",
+                    {
+                        "action": {"type": "list_agent_runs", "_tool_call_id": "call-1"},
+                        "result": {"ok": True},
+                    },
+                ),
+                (
+                    "2026-03-18T10:00:03Z",
+                    "tool_run_updated",
+                    {
+                        "tool_run_id": "toolrun-source-timeline",
+                        "tool_name": "list_agent_runs",
+                        "status": ToolRunStatus.COMPLETED.value,
+                    },
+                ),
+            ]:
+                orchestrator.storage.append_event(
+                    EventRecord(
+                        timestamp=timestamp,
+                        session_id=session_id,
+                        agent_id=root_agent.id,
+                        parent_agent_id=None,
+                        event_type=event_type,
+                        phase="tool",
+                        payload=payload,
+                        workspace_id=root_workspace.id,
+                        checkpoint_seq=0,
+                    )
+                )
+            orchestrator.storage.save_checkpoint(
+                session_id,
+                now,
+                CheckpointState(
+                    session=orchestrator._session_state(session),
+                    agents={root_agent.id: orchestrator._agent_state(root_agent)},
+                    workspaces=workspace_manager.serialize(),
+                    pending_agent_ids=[],
+                    pending_tool_run_ids=[],
+                    root_loop=0,
+                ),
+            )
+            source_events_path = orchestrator.paths.session_logs_path(
+                session_id,
+                orchestrator.config.logging.jsonl_filename,
+            )
+            source_events_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-18T10:00:00Z",
+                                "session_id": session_id,
+                                "agent_id": root_agent.id,
+                                "parent_agent_id": None,
+                                "event_type": "tool_call_started",
+                                "phase": "tool",
+                                "payload": {
+                                    "tool_run_id": "toolrun-source-timeline",
+                                    "action": {
+                                        "type": "list_agent_runs",
+                                        "_tool_call_id": "call-1",
+                                        "tool_run_id": "toolrun-source-timeline",
+                                    },
+                                },
+                                "workspace_id": root_workspace.id,
+                                "checkpoint_seq": 0,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": "2026-03-18T10:00:01Z",
+                                "session_id": session_id,
+                                "agent_id": root_agent.id,
+                                "parent_agent_id": None,
+                                "event_type": "tool_run_submitted",
+                                "phase": "tool",
+                                "payload": {
+                                    "tool_run_id": "toolrun-source-timeline",
+                                    "tool_name": "list_agent_runs",
+                                    "action": {
+                                        "_tool_call_id": "call-1",
+                                        "tool_run_id": "toolrun-source-timeline",
+                                    },
+                                },
+                                "workspace_id": root_workspace.id,
+                                "checkpoint_seq": 0,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cloned = orchestrator.clone_session(session_id)
+            cloned_runs = orchestrator.list_tool_runs(cloned.id, limit=10)
+            self.assertEqual(len(cloned_runs), 1)
+            cloned_run_id = str(cloned_runs[0]["id"])
+            self.assertNotEqual(cloned_run_id, "toolrun-source-timeline")
+            self.assertTrue(orchestrator.storage.has_tool_run_timeline_backfill(cloned.id))
+
+            def _unexpected_load_events(*args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                raise AssertionError("cloned sessions should reuse replayed timeline projection")
+
+            orchestrator.storage.load_events = _unexpected_load_events  # type: ignore[method-assign]
+            detail = orchestrator.get_tool_run_detail(cloned.id, cloned_run_id)
+            self.assertEqual(
+                [entry["event_type"] for entry in detail["timeline"]],
+                ["tool_call_started", "tool_run_submitted", "tool_call", "tool_run_updated"],
+            )
+            self.assertTrue(
+                all(
+                    str(entry.get("payload", {}).get("tool_run_id", "")) == cloned_run_id
+                    for entry in detail["timeline"]
+                )
+            )
+            cloned_events_path = orchestrator.paths.session_logs_path(
+                cloned.id,
+                orchestrator.config.logging.jsonl_filename,
+            )
+            cloned_event_records = [
+                json.loads(line)
+                for line in cloned_events_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(cloned_event_records)
+            self.assertTrue(
+                all(str(record.get("session_id", "")).strip() == cloned.id for record in cloned_event_records)
+            )
+            self.assertTrue(
+                all(
+                    str(record.get("payload", {}).get("tool_run_id", "")).strip() == cloned_run_id
+                    for record in cloned_event_records
+                )
+            )
+            self.assertTrue(
+                all(
+                    str(
+                        record.get("payload", {})
+                        .get("action", {})
+                        .get("tool_run_id", "")
+                    ).strip()
+                    == cloned_run_id
+                    for record in cloned_event_records
+                )
+            )
+
+    async def test_cloned_session_remains_usable_after_source_session_deleted(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             app_dir = root / "opencompany-app"
@@ -1187,7 +1903,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
                 task="Import and detach",
                 locale="en",
                 root_agent_id=root_agent.id,
-                status=SessionStatus.RUNNING,
+                status=SessionStatus.INTERRUPTED,
                 created_at=now,
                 updated_at=now,
                 loop_index=1,
@@ -1238,7 +1954,7 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             )
             orchestrator.storage.save_checkpoint(source_session_id, now, source_checkpoint_state)
 
-            loaded = orchestrator.load_session_context(source_session_id)
+            loaded = orchestrator.clone_session(source_session_id)
             loaded_session_id = loaded.id
             self.assertNotEqual(loaded_session_id, source_session_id)
             loaded_session_dir = orchestrator.paths.session_dir(loaded_session_id)

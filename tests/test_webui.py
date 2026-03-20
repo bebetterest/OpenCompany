@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from opencompany.models import (
@@ -17,6 +19,7 @@ from opencompany.models import (
     ShellCommandResult,
     WorkspaceMode,
 )
+from opencompany.mcp.oauth import McpOAuthLoginResult, McpOAuthSessionRecord, McpOAuthStore
 from opencompany.orchestrator import Orchestrator
 from opencompany.remote import save_remote_session_config
 from opencompany.webui import state as webui_state
@@ -126,23 +129,476 @@ class WebUIStateTests(unittest.TestCase):
                 def load_session_context(self, session_id: str) -> RunSession:
                     del session_id
                     return RunSession(
-                        id="session-copy-1",
+                        id="session-1",
                         project_dir=project_dir,
                         task="loaded task",
                         locale="en",
                         root_agent_id="agent-root",
                         workspace_mode=WorkspaceMode.DIRECT,
                         status=SessionStatus.INTERRUPTED,
+                        enabled_mcp_server_ids=["filesystem"],
+                        mcp_state={
+                            "enabled_server_ids": ["filesystem"],
+                            "entries": [{"id": "filesystem", "connected": True}],
+                            "warnings": [{"server_id": "docs", "message": "offline"}],
+                        },
                     )
 
             state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
             state.set_launch_config(project_dir=None, session_id="session-1")
-            self.assertEqual(state.configured_resume_session_id, "session-copy-1")
-            self.assertEqual(state.current_session_id, "session-copy-1")
+            self.assertEqual(state.configured_resume_session_id, "session-1")
+            self.assertEqual(state.current_session_id, "session-1")
             self.assertEqual(state.project_dir, project_dir.resolve())
             self.assertTrue(state.launch_config().can_resume())
             self.assertEqual(state.launch_config().session_mode, WorkspaceMode.DIRECT)
             self.assertTrue(state.launch_config().session_mode_locked)
+            self.assertEqual(state.selected_mcp_server_ids, ["filesystem"])
+            self.assertEqual(
+                state.mcp_state["warnings"][0]["message"],
+                "offline",
+            )
+
+    def test_discover_skills_and_mcp_servers_update_runtime_caches(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = SimpleNamespace(
+                            available_servers=lambda: [
+                                {"id": "filesystem"},
+                                {"id": "notion", "oauth_enabled": True},
+                            ]
+                        )
+
+                    async def discover_skills(self, **kwargs):  # type: ignore[no-untyped-def]
+                        self.skill_kwargs = kwargs
+                        return [{"id": "skill-a"}]
+
+                fake = _FakeOrchestrator()
+                state._read_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+                McpOAuthStore(state._mcp_oauth_store_path()).save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.notion.com/mcp",
+                        resource="https://mcp.notion.com/mcp",
+                        resource_metadata_url=(
+                            "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://auth.notion.com",
+                        issuer="https://auth.notion.com",
+                        authorization_endpoint="https://auth.notion.com/authorize",
+                        token_endpoint="https://auth.notion.com/token",
+                        client_id="client-1",
+                        access_token="access-1",
+                    )
+                )
+
+                skills_result = await state.discover_skills(project_dir=str(project_dir))
+                mcp_result = await state.discover_mcp_servers()
+
+                self.assertEqual(skills_result["skills"], [{"id": "skill-a"}])
+                self.assertEqual(state.available_skills, [{"id": "skill-a"}])
+                self.assertEqual(fake.skill_kwargs["project_dir"], project_dir.resolve())
+                self.assertEqual(mcp_result["mcp_servers"][0]["id"], "filesystem")
+                self.assertEqual(mcp_result["mcp_servers"][1]["id"], "notion")
+                self.assertTrue(mcp_result["mcp_servers"][1]["oauth_authorized"])
+                self.assertTrue(state.available_mcp_servers[1]["oauth_authorized"])
+
+        asyncio.run(run())
+
+    def test_discover_mcp_servers_merges_inspection_counts_into_catalog(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeToolExecutor:
+                    def cleanup_session_remote_runtime(self, session_id: str) -> None:
+                        del session_id
+
+                class _FakeMcpManager:
+                    def available_servers(self) -> list[dict[str, object]]:
+                        return [{"id": "filesystem", "transport": "stdio"}]
+
+                    async def inspect_servers(self, **kwargs):  # type: ignore[no-untyped-def]
+                        del kwargs
+                        return [
+                            {
+                                "id": "filesystem",
+                                "connected": True,
+                                "tool_count": 2,
+                                "resource_count": 1,
+                                "tools": [
+                                    {"tool_name": "read_file", "description": "Read a file"},
+                                    {"tool_name": "list_dir", "description": "List entries"},
+                                ],
+                                "resources": [
+                                    {"uri": "file:///tmp/demo.txt", "name": "demo.txt"},
+                                ],
+                            }
+                        ]
+
+                    async def close_session(self, session_id: str) -> None:
+                        del session_id
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = _FakeMcpManager()
+                        self.tool_executor = _FakeToolExecutor()
+
+                fake = _FakeOrchestrator()
+                state._read_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+
+                discovered = await state.discover_mcp_servers()
+                row = discovered["mcp_servers"][0]
+                self.assertEqual(row["id"], "filesystem")
+                self.assertEqual(row["tool_count"], 2)
+                self.assertEqual(row["resource_count"], 1)
+                self.assertTrue(row["materialized"])
+                self.assertEqual(len(row["tool_items"]), 2)
+                self.assertEqual(len(row["resource_items"]), 1)
+                self.assertTrue(row["connected"])
+
+                refreshed = state._refresh_available_mcp_servers()
+                refreshed_row = refreshed[0]
+                self.assertEqual(refreshed_row["tool_count"], 2)
+                self.assertEqual(refreshed_row["resource_count"], 1)
+                self.assertTrue(refreshed_row["materialized"])
+
+        asyncio.run(run())
+
+    def test_discover_mcp_servers_omits_disabled_configured_servers(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeMcpManager:
+                    def available_servers(self) -> list[dict[str, object]]:
+                        return [
+                            {"id": "filesystem", "enabled": True},
+                            {"id": "docs", "enabled": False},
+                        ]
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = _FakeMcpManager()
+
+                fake = _FakeOrchestrator()
+                state._read_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+
+                discovered = await state.discover_mcp_servers()
+                ids = [str(item.get("id", "")) for item in discovered["mcp_servers"]]
+                self.assertIn("filesystem", ids)
+                self.assertNotIn("docs", ids)
+                self.assertEqual(ids, ["filesystem"])
+
+        asyncio.run(run())
+
+    def test_start_mcp_oauth_login_reuses_pending_flow_and_tracks_completion(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                    encoding="utf-8",
+                )
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = SimpleNamespace(
+                            available_servers=lambda: [{"id": "notion", "oauth_enabled": True}]
+                        )
+
+                state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
+
+                login_released = asyncio.Event()
+                login_calls = 0
+
+                async def _fake_complete_mcp_oauth_login(
+                    *,
+                    server,
+                    store_path,
+                    timeout_seconds=300.0,
+                    open_browser=True,
+                    browser_opener=None,
+                    callback_server_factory=None,
+                ):  # type: ignore[no-untyped-def]
+                    nonlocal login_calls
+                    del timeout_seconds, open_browser, callback_server_factory
+                    login_calls += 1
+                    assert browser_opener is not None
+                    browser_opener("https://auth.example.com/authorize")
+                    await login_released.wait()
+                    McpOAuthStore(store_path).save_record(
+                        McpOAuthSessionRecord(
+                            server_id=server.id,
+                            server_url=server.url,
+                            resource=server.url,
+                            resource_metadata_url=f"{server.url}/.well-known/oauth-protected-resource",
+                            authorization_server="https://auth.example.com",
+                            issuer="https://auth.example.com",
+                            authorization_endpoint="https://auth.example.com/authorize",
+                            token_endpoint="https://auth.example.com/token",
+                            client_id="client-1",
+                            access_token="access-1",
+                            refresh_token="refresh-1",
+                        )
+                    )
+                    record = McpOAuthStore(store_path).load_record(server.id)
+                    assert record is not None
+                    return McpOAuthLoginResult(
+                        record=record,
+                        authorization_url="https://auth.example.com/authorize",
+                        browser_opened=True,
+                    )
+
+                with patch.object(
+                    webui_state,
+                    "complete_mcp_oauth_login",
+                    _fake_complete_mcp_oauth_login,
+                ):
+                    started = await state.start_mcp_oauth_login("notion", timeout_seconds=30.0)
+                    self.assertEqual(started["status"], "pending")
+                    flow_id = str(started["flow_id"])
+                    self.assertEqual(started["authorization_url"], "")
+
+                    repeated = await state.start_mcp_oauth_login("notion", timeout_seconds=30.0)
+                    self.assertEqual(repeated["status"], "pending")
+                    self.assertEqual(repeated["flow_id"], flow_id)
+                    self.assertIn(login_calls, {0, 1})
+                    self.assertFalse(state.available_mcp_servers[0]["oauth_authorized"])
+                    await asyncio.sleep(0)
+                    self.assertEqual(login_calls, 1)
+                    pending = await state.mcp_oauth_login_status(flow_id)
+                    self.assertEqual(pending["status"], "pending")
+                    self.assertEqual(
+                        pending["authorization_url"],
+                        "https://auth.example.com/authorize",
+                    )
+
+                    login_released.set()
+                    await asyncio.sleep(0)
+                    completed = await state.mcp_oauth_login_status(flow_id)
+                    self.assertEqual(completed["status"], "completed")
+                    self.assertTrue(state.available_mcp_servers[0]["oauth_authorized"])
+
+        asyncio.run(run())
+
+    def test_clear_mcp_oauth_login_removes_saved_record_and_pending_flow(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.notion]
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+oauth_enabled = true
+""".strip(),
+                    encoding="utf-8",
+                )
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = SimpleNamespace(
+                            available_servers=lambda: [{"id": "notion", "oauth_enabled": True}]
+                        )
+
+                state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
+                store = McpOAuthStore(state._mcp_oauth_store_path())
+                store.save_record(
+                    McpOAuthSessionRecord(
+                        server_id="notion",
+                        server_url="https://mcp.notion.com/mcp",
+                        resource="https://mcp.notion.com/mcp",
+                        resource_metadata_url=(
+                            "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource"
+                        ),
+                        authorization_server="https://mcp.notion.com",
+                        issuer="https://mcp.notion.com",
+                        authorization_endpoint="https://mcp.notion.com/authorize",
+                        token_endpoint="https://mcp.notion.com/token",
+                        client_id="client-1",
+                        access_token="access-1",
+                        refresh_token="refresh-1",
+                    )
+                )
+                pending_task = asyncio.create_task(asyncio.sleep(30))
+                state._mcp_oauth_flows["flow-1"] = webui_state.McpOAuthLoginFlow(
+                    id="flow-1",
+                    server_id="notion",
+                    task=pending_task,
+                    authorization_url="https://auth.example.com/authorize",
+                )
+
+                cleared = await state.clear_mcp_oauth_login("notion")
+
+                self.assertTrue(cleared["cleared"])
+                self.assertNotIn("flow-1", state._mcp_oauth_flows)
+                self.assertTrue(pending_task.cancelled() or pending_task.done())
+                self.assertIsNone(store.load_record("notion"))
+                self.assertFalse(state.available_mcp_servers[0]["oauth_authorized"])
+
+        asyncio.run(run())
+
+    def test_configure_mcp_env_auth_updates_dotenv_and_runtime_state(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.github]
+transport = "streamable_http"
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
+""".strip(),
+                    encoding="utf-8",
+                )
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.mcp_manager = SimpleNamespace(
+                            available_servers=lambda: [{"id": "github"}]
+                        )
+
+                state._read_orchestrator = lambda _project_dir: _FakeOrchestrator()  # type: ignore[method-assign]
+                with patch.dict("os.environ", {}, clear=True):
+                    discovered = await state.discover_mcp_servers()
+                    self.assertTrue(discovered["mcp_servers"][0]["env_auth_required"])
+                    self.assertFalse(discovered["mcp_servers"][0]["env_auth_configured"])
+
+                    configured = await state.configure_mcp_env_auth(
+                        "github",
+                        {"GITHUB_MCP_AUTHORIZATION": "Bearer token-demo"},
+                    )
+                    self.assertEqual(configured["updated_keys"], ["GITHUB_MCP_AUTHORIZATION"])
+                    self.assertEqual(
+                        (app_dir / ".env").read_text(encoding="utf-8").strip(),
+                        "GITHUB_MCP_AUTHORIZATION=Bearer token-demo",
+                    )
+                    self.assertEqual(
+                        os.environ.get("GITHUB_MCP_AUTHORIZATION"),
+                        "Bearer token-demo",
+                    )
+                    self.assertTrue(state.available_mcp_servers[0]["env_auth_configured"])
+
+        asyncio.run(run())
+
+    def test_runtime_events_update_skills_and_mcp_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            state = WebUIRuntimeState(
+                project_dir=None,
+                session_id=None,
+                app_dir=app_dir,
+                locale="en",
+                debug=False,
+            )
+
+            state._consume_runtime_update(
+                {
+                    "session_id": "session-1",
+                    "event_type": "session_skills_materialized",
+                    "payload": {
+                        "enabled_skill_ids": ["skill-a", "skill-b"],
+                        "skill_bundle_root": ".opencompany_skills/session-1",
+                        "manifest_path": ".opencompany_skills/session-1/manifest.json",
+                        "warnings": [{"type": "missing_source", "skill_id": "missing"}],
+                    },
+                }
+            )
+            state._consume_runtime_update(
+                {
+                    "session_id": "session-1",
+                    "event_type": "session_mcp_refreshed",
+                    "payload": {
+                        "enabled_mcp_server_ids": ["filesystem"],
+                        "mcp_state": {"entries": [{"id": "filesystem", "connected": True}]},
+                    },
+                }
+            )
+
+            self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
+            self.assertEqual(
+                state.skills_state["bundle_root"],
+                ".opencompany_skills/session-1",
+            )
+            self.assertEqual(
+                state.skills_state["warnings"][0]["skill_id"],
+                "missing",
+            )
+            self.assertEqual(state.selected_mcp_server_ids, ["filesystem"])
+            self.assertTrue(state.mcp_state["entries"][0]["connected"])
 
     def test_sandbox_backend_defaults_to_config_and_can_be_overridden_per_launch(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -200,6 +656,13 @@ backend = "none"
                 remote_password="secret-pass",
             )
             self.assertEqual(state.remote_password, "secret-pass")
+            snapshot = state.snapshot()
+            self.assertIsNone(snapshot["launch_config"]["project_dir"])
+            self.assertEqual(
+                snapshot["launch_config"]["project_dir_display"],
+                "/home/demo/workspace",
+            )
+            self.assertTrue(snapshot["launch_config"]["project_dir_is_remote"])
 
             state.set_launch_config(
                 project_dir=None,
@@ -847,6 +1310,70 @@ model = "openai/gpt-4o-mini"
 
         asyncio.run(run())
 
+    def test_start_run_remote_keeps_project_dir_none_after_completion(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=None,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+                state.set_launch_config(
+                    project_dir=None,
+                    session_id=None,
+                    session_mode="direct",
+                    remote={
+                        "kind": "remote_ssh",
+                        "ssh_target": "demo@example.com:2222",
+                        "remote_dir": "/home/demo/workspace",
+                        "auth_mode": "key",
+                        "identity_file": "~/.ssh/id_ed25519",
+                        "known_hosts_policy": "accept_new",
+                        "remote_os": "linux",
+                    },
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+
+                    def subscribe(self, callback) -> None:  # type: ignore[no-untyped-def]
+                        self.callback = callback
+
+                    async def run_task(
+                        self,
+                        task: str,
+                        model: str | None = None,
+                        root_agent_name: str | None = None,
+                        remote_config: RemoteSessionConfig | None = None,
+                        remote_password: str | None = None,
+                    ) -> RunSession:
+                        del task, model, root_agent_name, remote_config, remote_password
+                        return RunSession(
+                            id="session-remote-1",
+                            project_dir=Path("/home/demo/workspace"),
+                            task="demo task",
+                            locale="en",
+                            root_agent_id="agent-root",
+                            status=SessionStatus.COMPLETED,
+                        )
+
+                fake = _FakeOrchestrator()
+                state._create_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+                await state.start_run("demo task")
+                assert state.session_task is not None
+                await state.session_task
+                self.assertIsNone(state.project_dir)
+                self.assertIsNotNone(state.remote_config)
+                assert state.remote_config is not None
+                self.assertEqual(state.remote_config.remote_dir, "/home/demo/workspace")
+
+        asyncio.run(run())
+
     def test_start_run_with_configured_session_uses_run_task_in_session(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -931,6 +1458,77 @@ model = "openai/gpt-4o-mini"
 
         asyncio.run(run())
 
+    def test_continue_task_remote_keeps_project_dir_none_after_resume(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=None,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+                state.set_launch_config(
+                    project_dir=None,
+                    session_id=None,
+                    session_mode="direct",
+                    remote={
+                        "kind": "remote_ssh",
+                        "ssh_target": "demo@example.com:2222",
+                        "remote_dir": "/home/demo/workspace",
+                        "auth_mode": "key",
+                        "identity_file": "~/.ssh/id_ed25519",
+                        "known_hosts_policy": "accept_new",
+                        "remote_os": "linux",
+                    },
+                )
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+
+                    async def resume(
+                        self,
+                        session_id: str,
+                        instruction: str,
+                        model: str | None = None,
+                        reactivate_agent_id: str | None = None,
+                        run_root_agent: bool = True,
+                        remote_password: str | None = None,
+                        enabled_skill_ids: list[str] | None = None,
+                    ) -> RunSession:
+                        del (
+                            session_id,
+                            instruction,
+                            model,
+                            reactivate_agent_id,
+                            run_root_agent,
+                            remote_password,
+                            enabled_skill_ids,
+                        )
+                        return RunSession(
+                            id="session-remote-2",
+                            project_dir=Path("/home/demo/workspace"),
+                            task="resume task",
+                            locale="en",
+                            root_agent_id="agent-root",
+                            status=SessionStatus.COMPLETED,
+                        )
+
+                state.orchestrator = _FakeOrchestrator()  # type: ignore[assignment]
+                await state._continue_task(
+                    "session-remote-2",
+                    "resume task",
+                    "openai/gpt-4.1",
+                )
+                self.assertIsNone(state.project_dir)
+                self.assertEqual(state.current_session_id, "session-remote-2")
+                self.assertEqual(state.current_session_status, "completed")
+
+        asyncio.run(run())
+
     def test_start_run_while_running_submits_live_root_run(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -953,18 +1551,26 @@ model = "openai/gpt-4o-mini"
                         self.app_dir = app_dir
                         self.calls: list[tuple[str, str, str, str]] = []
                         self.root_agent_names: list[str | None] = []
+                        self.enabled_skill_ids: list[list[str] | None] = []
+                        self.enabled_mcp_server_ids: list[list[str] | None] = []
 
-                    def submit_run_in_active_session(
+                    async def submit_run_in_active_session(
                         self,
                         session_id: str,
                         task: str,
                         *,
                         model: str | None = None,
                         root_agent_name: str | None = None,
+                        enabled_skill_ids: list[str] | None = None,
+                        enabled_mcp_server_ids: list[str] | None = None,
+                        remote_password: str | None = None,
                         source: str = "webui",
                     ) -> dict[str, str]:
+                        del remote_password
                         self.calls.append((session_id, task, str(model or ""), source))
                         self.root_agent_names.append(root_agent_name)
+                        self.enabled_skill_ids.append(enabled_skill_ids)
+                        self.enabled_mcp_server_ids.append(enabled_mcp_server_ids)
                         return {
                             "session_id": session_id,
                             "root_agent_id": "agent-root-live",
@@ -981,6 +1587,8 @@ model = "openai/gpt-4o-mini"
                     "root task live",
                     model="openai/gpt-4.1-mini",
                     root_agent_name="Root Live",
+                    enabled_skill_ids=["skill-a", "skill-b"],
+                    enabled_mcp_server_ids=["filesystem", "docs"],
                 )
                 self.assertEqual(
                     fake.calls,
@@ -994,8 +1602,11 @@ model = "openai/gpt-4o-mini"
                     ],
                 )
                 self.assertEqual(fake.root_agent_names, ["Root Live"])
+                self.assertEqual(fake.enabled_skill_ids, [["skill-a", "skill-b"]])
+                self.assertEqual(fake.enabled_mcp_server_ids, [["filesystem", "docs"]])
                 self.assertEqual(snapshot["runtime"]["session_status"], "running")
                 self.assertEqual(state.current_task, "root task live")
+                self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
                 self.assertIsNotNone(state.session_task)
                 assert state.session_task is not None
                 state.session_task.cancel()

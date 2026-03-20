@@ -57,6 +57,68 @@
       }
     }
   },
+  "list_mcp_servers": {
+    "type": "function",
+    "function": {
+      "name": "list_mcp_servers",
+      "description": "List enabled MCP servers for the current agent, including connection state and discovered tool/resource counts.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  "list_mcp_resources": {
+    "type": "function",
+    "function": {
+      "name": "list_mcp_resources",
+      "description": "List discovered MCP resources across enabled servers. Use this before read_mcp_resource when you need a URI.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "description": "Optional MCP server id to restrict the listing to one server."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of resources to return. Defaults to runtime.tools.list_default_limit and is capped by runtime.tools.list_max_limit."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Optional opaque pagination cursor from a previous list_mcp_resources result."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "read_mcp_resource": {
+    "type": "function",
+    "function": {
+      "name": "read_mcp_resource",
+      "description": "Read one MCP resource by URI. If the URI exists on multiple servers, also provide server_id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "uri": {
+            "type": "string",
+            "description": "Required MCP resource URI to read."
+          },
+          "server_id": {
+            "type": "string",
+            "description": "Optional MCP server id when the URI is ambiguous or you want to force one server."
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
   "list_agent_runs": {
     "type": "function",
     "function": {
