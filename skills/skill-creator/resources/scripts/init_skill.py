@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[ERROR] --examples requires at least one --resources entry.", file=sys.stderr)
         return 1
 
-    tags = parse_csv(args.tags) or ["todo"]
+    tags = parse_csv(args.tags) or ["custom"]
     try:
         skill_dir = init_skill(
             skill_name=skill_name,

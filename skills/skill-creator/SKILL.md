@@ -83,7 +83,7 @@ Rules:
 - `resources/scripts/init_skill.py`
   Creates an OpenCompany-style skill skeleton with `skill.toml`, `SKILL.md`, optional `SKILL_cn.md`, and optional `resources/...` subdirectories.
 - `resources/scripts/quick_validate.py`
-  Checks that a skill follows the OpenCompany layout and flags legacy Codex packaging patterns.
+  Checks that a skill follows the OpenCompany layout, uses a `[skill]` metadata table, and includes non-empty required metadata fields.
 
 ## Content guidelines
 

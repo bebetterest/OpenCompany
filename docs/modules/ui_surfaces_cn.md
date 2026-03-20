@@ -62,17 +62,21 @@ Web UI 特性：
 - 控制栏也提供一套 skills 选择器：点击卡片选择 + `发现` / `全选` / `清空`
   - skills 仍会作为 `enabled_skill_ids` 提交
   - discover 会按当前本地或远程 launch context 读取项目源/全局源 skills
-  - 已发现 skills 会以可切换卡片展示，并附带来源/文档元数据、已选 chips 和告警卡片；Web UI 不再保留手动文本输入
+  - skills 面板分为 `概览` → `当前启用 Skills` → `技能目录` → `Skill 告警` 四层
+  - 卡片默认采用精简视图（标题/状态/短描述），可按卡片展开详情查看结构、文档与来源元数据
+  - 折叠头摘要只保留关键计数，面板内移除重复的长状态行
+  - 已发现 skills 会以可切换卡片展示，并附带已选 chips 与告警卡片；Web UI 不再保留手动文本输入
   - 已在当前 session 物化生效的 skills，即使还没重新 discover，也会继续显示在选择器里
-  - Overview 卡片会展示当前启用 id、bundle root 与告警数量
+  - skills 概览区只展示关键计数（已选/目录/告警）与简短提示
 - 控制栏也提供一套 MCP server 选择器：点击卡片选择 + `发现` / `用默认项` / `全选` / `清空`
   - 选择结果会作为 `enabled_mcp_server_ids` 提交
   - 页面加载时会预加载 `opencompany.toml` 中配置的 MCP servers，`发现` 负责刷新目录
   - `用默认项` 会把配置中 `enabled = true` 的 servers 同步为本次运行的选择；手动选择仍然只覆盖当前 run
+  - MCP 面板分为 `概览` → `当前启用 MCP Servers` → `MCP 目录` → `MCP 告警` 四层
   - 对启用 OAuth 的 MCP 卡片，界面还会提供 `登录` / `继续登录` / `重新登录` 和 `清除登录`；登录处理中按钮仍可点击，用于重新打开授权页，而且不会额外启动第二条轮询；`清除登录` 会移除本地保存的 OAuth 记录，便于彻底重连
   - MCP OAuth 启动是异步链路：`/api/mcp/oauth/start` 可能先返回 pending `flow_id`，授权 `authorization_url` 会稍后可用；前端会持续轮询 `/api/mcp/oauth/{flow_id}`，并在 URL 就绪后再自动打开授权页
-  - 选择器会同时展示每个 server 的配置态与运行态信息，包括 transport、端点/命令、超时、allowed tools、roots 策略/运行态、协议版本、tool/resource 数量与告警
-  - Overview 卡片会展示当前启用的 MCP ids，以及来自 `session.mcp_state` 的 connected/tool/resource/warning 数量
+  - MCP 卡片默认采用精简视图，并可按卡片展开详情查看端点、roots、超时、allowed tools、认证字段、协议等配置/运行态信息
+  - 选择器仍展示每个 server 的配置态与运行态信息；概览区只保留已选/已连接/告警三项 KPI 以减少重复
 - `Agents` / `Workflow` 视图会显示每个 agent 的模型标签，数据来源于持久化 agent metadata
 - session 历史恢复改为窗口化：Web UI 首先请求 `/api/session/{id}/events?limit=200&activity_only=true` 与 `/api/session/{id}/messages?tail=200&limit=200`，更早内容通过 `before` cursor 按需继续加载
 - 首屏历史恢复会跳过持久化的 `llm_reasoning`、`llm_token` 与 `shell_stream`；这些内容只会在会话活跃时通过 WebSocket 实时展示

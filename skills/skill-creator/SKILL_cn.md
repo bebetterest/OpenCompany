@@ -73,7 +73,7 @@ tags = ["docs", "navigation"]
 
 1. 选一个简短的连字符 `skill_id`。
 2. 在目标 `skills/` 根目录下创建 skill 文件夹。
-3. 写 `skill.toml`。
+3. 在 `skill.toml` 中写全 `id`、`name`、`name_cn`、`description`、`description_cn`、`tags`。
 4. 写 `SKILL.md`，必要时再补 `SKILL_cn.md`。
 5. 把辅助资源放到 `resources/`。
 6. 用 `resources/scripts/quick_validate.py <path/to/skill>` 做检查。
@@ -83,4 +83,12 @@ tags = ["docs", "navigation"]
 - `resources/scripts/init_skill.py`
   生成 OpenCompany 风格的 skill 骨架。
 - `resources/scripts/quick_validate.py`
-  检查 skill 是否仍带有旧布局或缺失关键文件。
+  检查 skill 是否符合 OpenCompany 布局、是否使用 `[skill]` 元数据表，以及关键字段是否完整且非空。
+
+## 内容指南
+
+- 优先写短流程，不堆长篇理论。
+- 仅在确实能减少重复时引用外部文件。
+- 可重复或确定性的操作优先沉淀成脚本。
+- 示例要贴近真实任务形态。
+- 不要引入与执行任务无关的辅助文件。

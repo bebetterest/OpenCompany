@@ -62,17 +62,21 @@ Web UI-specific capabilities:
 - control-bar also exposes a skills selector driven by clickable cards plus `Discover` / `Select All` / `Clear`
   - skills are still submitted as `enabled_skill_ids`
   - discover reads project/global skills for the current local or remote launch context
-  - discovered skills render as selectable cards with source/doc metadata, selected chips, and warning cards; manual text entry is no longer part of the Web UI flow
+  - skills panel is organized into `Overview` → `Enabled Skills` → `Catalog` → `Skill Warnings` sections
+  - cards default to compact mode (title/status/short description) and expose per-card detail toggle for structure/doc/source metadata
+  - header summary is count-only; duplicated long status text is removed from panel body
+  - discovered skills render as selectable cards with selected chips and warning cards; manual text entry is no longer part of the Web UI flow
   - already-materialized session skills remain visible in the selector even before a fresh discover
-  - overview cards surface the current enabled ids, bundle root, and skill warning count
+  - skills overview surfaces key counts (selected/catalog/warnings) and keeps guidance text concise
 - control-bar also exposes an MCP server selector driven by clickable cards plus `Discover` / `Use Defaults` / `Select All` / `Clear`
   - selection is submitted as `enabled_mcp_server_ids`
   - configured MCP servers are preloaded from `opencompany.toml`, and `Discover` refreshes the catalog
   - `Use Defaults` mirrors servers marked `enabled = true` in config for the current run; manual selection remains a per-run override
+  - MCP panel is organized into `Overview` → `Enabled MCP Servers` → `Catalog` → `MCP Warnings` sections
   - OAuth-enabled MCP cards also expose `Login` / `Continue Login` / `Re-login` plus `Clear Auth`; pending logins stay clickable so the authorization page can be reopened without creating a second polling loop, and `Clear Auth` removes the stored OAuth record for a full reconnect
   - MCP OAuth start is asynchronous: `/api/mcp/oauth/start` may return a pending `flow_id` before an `authorization_url` is ready, and the client keeps polling `/api/mcp/oauth/{flow_id}` to open the auth page as soon as the URL becomes available
-  - selector surfaces both config metadata and runtime metadata per server, including transport, endpoint/command, timeout, allowed tools, roots policy/runtime, protocol version, tool/resource counts, and warnings
-  - overview cards surface enabled MCP ids plus connected/tool/resource/warning counts from session `mcp_state`
+  - MCP cards default to compact mode and expose per-card detail toggle for config/runtime structure fields (endpoint, roots, timeout, allowed tools, auth fields, protocol)
+  - selector surfaces both config metadata and runtime metadata per server, while the overview block keeps only selected/connected/warning KPIs to reduce duplication
 - `Agents`/`Workflow` views display per-agent model labels sourced from persisted agent metadata
 - session history bootstrap is windowed: Web UI first loads `/api/session/{id}/events?limit=200&activity_only=true` and `/api/session/{id}/messages?tail=200&limit=200`, then exposes explicit “load older” actions backed by `before` cursors
 - initial history restore skips persisted `llm_reasoning`, `llm_token`, and `shell_stream`; those remain live-only via WebSocket while a session is active

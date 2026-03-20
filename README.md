@@ -194,6 +194,8 @@ opencompany mcp-login --mcp-server notion
 - The `Skills` and `MCP Servers` sections start collapsed by default; expand the section header to manage selections.
 - Configured MCP servers are preloaded from `opencompany.toml` on page load; `Discover` refreshes the catalog.
 - Click tiles directly to enable or disable skills and MCP servers; manual text input is no longer part of the Web UI flow.
+- Both selectors now use a layered layout (`Overview` → `Selected` → `Catalog` → `Warnings`) and count-only header summaries to reduce redundant status text.
+- Skill/MCP cards default to compact mode and expose per-card detail toggles for advanced metadata.
 - OAuth-enabled MCP cards expose `Login` / `Continue Login` / `Re-login` plus `Clear Auth`; while a login is pending the button stays clickable so the authorization page can be reopened if it was closed accidentally, and `Clear Auth` drops the stored OAuth record so a hosted server can be fully reconnected from scratch.
 - Click `Use Defaults` to mirror servers with `enabled = true`, or use `Select All` to override the config for the current run.
 - Start or continue a session after selection; the MCP panel will then show connection status, roots exposure, tool/resource counts, protocol version, and warnings for each server.
@@ -282,7 +284,7 @@ Add a skill:
 - Put the skill directory under either `<project_dir>/skills/` or `<app_dir>/skills/`.
 - It is not enough to create only the folder name; a valid skill must include at least `skill.toml` and `SKILL.md`.
 - If the same `skill_id` exists in both places, the project source overrides the global source.
-- This repository already includes a default bundled set of skills under `skills/` (including `hf-cli`, adapted from Hugging Face Skills).
+- This repository already includes a default bundled set of skills under `skills/`, all migrated from Codex Skills and adapted to the OpenCompany skill format.
 
 ```text
 <project_dir>/skills/<skill_id>/

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.error
 import urllib.parse
 import zipfile
@@ -213,31 +214,115 @@ def _toml_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _write_skill_toml(skill_dir: Path, *, skill_name: str, frontmatter: dict[str, str]) -> None:
-    metadata_path = skill_dir / "skill.toml"
-    if metadata_path.exists():
-        return
-    name = frontmatter.get("name") or _title_case(skill_name)
-    description = (
-        frontmatter.get("description")
-        or "Imported skill. Review and refine this metadata before relying on the skill."
+def _clean_text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _parse_tags(value: object) -> list[str]:
+    raw_items: list[str] = []
+    if isinstance(value, list):
+        raw_items = [str(item).strip() for item in value]
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if normalized.startswith("[") and normalized.endswith("]"):
+            normalized = normalized[1:-1]
+        raw_items = [part.strip().strip('"').strip("'") for part in normalized.split(",")]
+    tags: list[str] = []
+    for item in raw_items:
+        if not item or item in tags:
+            continue
+        tags.append(item)
+    return tags
+
+
+def _render_skill_toml(
+    *,
+    skill_name: str,
+    name: str,
+    name_cn: str,
+    description: str,
+    description_cn: str,
+    tags: list[str],
+) -> str:
+    rendered_tags = ", ".join(_toml_quote(tag) for tag in tags)
+    return "\n".join(
+        [
+            "[skill]",
+            f"id = {_toml_quote(skill_name)}",
+            f"name = {_toml_quote(name)}",
+            f"name_cn = {_toml_quote(name_cn)}",
+            f"description = {_toml_quote(description)}",
+            f"description_cn = {_toml_quote(description_cn)}",
+            f"tags = [{rendered_tags}]",
+            "",
+        ]
     )
-    description_cn = "导入的 skill。请在使用前补充并核对中文说明。"
+
+
+def _normalize_skill_toml(skill_dir: Path, *, skill_name: str, frontmatter: dict[str, str]) -> list[str]:
+    metadata_path = skill_dir / "skill.toml"
+    warnings: list[str] = []
+    existing: dict[str, object] = {}
+
+    if metadata_path.exists():
+        if not metadata_path.is_file():
+            raise InstallError("skill.toml exists but is not a file.")
+        try:
+            payload = tomllib.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(payload.get("skill"), dict):
+                existing = payload.get("skill", {})
+            elif isinstance(payload, dict):
+                existing = payload
+                warnings.append("skill.toml used legacy top-level metadata; normalized to a [skill] table.")
+            else:
+                warnings.append("skill.toml did not decode to an object; replaced with normalized metadata.")
+        except Exception:
+            warnings.append("Failed to parse skill.toml; replaced with normalized metadata.")
+    else:
+        warnings.append("skill.toml was missing; synthesized normalized metadata.")
+
+    existing_id = _clean_text(existing.get("id"))
+    if existing_id and existing_id != skill_name:
+        warnings.append(f"Normalized metadata id from '{existing_id}' to '{skill_name}'.")
+
+    default_description = (
+        "Imported skill. Review and refine this metadata before relying on the skill."
+    )
+    default_description_cn = "导入的 skill。请在使用前补充并核对中文说明。"
+    name = _clean_text(existing.get("name")) or _clean_text(frontmatter.get("name")) or _title_case(skill_name)
+    name_cn = (
+        _clean_text(existing.get("name_cn"))
+        or _clean_text(frontmatter.get("name_cn"))
+        or name
+    )
+    description = (
+        _clean_text(existing.get("description"))
+        or _clean_text(frontmatter.get("description"))
+        or default_description
+    )
+    description_cn = (
+        _clean_text(existing.get("description_cn"))
+        or _clean_text(frontmatter.get("description_cn"))
+        or default_description_cn
+    )
+    tags = _parse_tags(existing.get("tags")) or _parse_tags(frontmatter.get("tags", "")) or ["imported"]
+    if tags == ["imported"] and not _parse_tags(existing.get("tags")) and not _parse_tags(frontmatter.get("tags", "")):
+        warnings.append("Missing tags metadata; defaulted to ['imported'].")
+
     metadata_path.write_text(
-        "\n".join(
-            [
-                "[skill]",
-                f"id = {_toml_quote(skill_name)}",
-                f"name = {_toml_quote(name)}",
-                f"name_cn = {_toml_quote(name)}",
-                f"description = {_toml_quote(description)}",
-                f"description_cn = {_toml_quote(description_cn)}",
-                'tags = ["imported"]',
-                "",
-            ]
+        _render_skill_toml(
+            skill_name=skill_name,
+            name=name,
+            name_cn=name_cn,
+            description=description,
+            description_cn=description_cn,
+            tags=tags,
         ),
         encoding="utf-8",
     )
+    return warnings
 
 
 def _merge_tree(source: Path, destination: Path) -> None:
@@ -268,9 +353,7 @@ def _normalize_skill(skill_dir: Path, *, skill_name: str) -> list[str]:
     if agents_dir.exists():
         shutil.rmtree(agents_dir, ignore_errors=True)
 
-    _write_skill_toml(skill_dir, skill_name=skill_name, frontmatter=frontmatter)
-
-    warnings: list[str] = []
+    warnings = _normalize_skill_toml(skill_dir, skill_name=skill_name, frontmatter=frontmatter)
     normalized_doc = skill_doc.read_text(encoding="utf-8")
     for pattern in LEGACY_HINT_PATTERNS:
         if re.search(pattern, normalized_doc):

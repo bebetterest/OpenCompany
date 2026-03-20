@@ -340,7 +340,7 @@ button {
   flex: 1 1 420px;
   min-width: 240px;
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .skills-toolbar {
@@ -350,28 +350,51 @@ button {
   align-items: center;
 }
 
-.skills-selected,
-.skills-catalog,
-.skills-warnings,
-.mcp-insight {
+.selector-section {
+  border: 1px solid rgba(118, 167, 208, 0.22);
+  border-radius: 12px;
+  background: linear-gradient(145deg, rgba(10, 24, 38, 0.76), rgba(9, 20, 32, 0.88));
+  padding: 9px;
   display: grid;
   gap: 8px;
 }
 
-.mcp-insight {
-  border: 1px solid rgba(118, 167, 208, 0.26);
-  border-radius: 10px;
-  background: linear-gradient(145deg, rgba(11, 27, 43, 0.82), rgba(9, 20, 32, 0.9));
-  padding: 8px;
+.selector-section-overview {
+  border-color: rgba(104, 176, 231, 0.3);
+  background: linear-gradient(145deg, rgba(13, 31, 49, 0.86), rgba(10, 23, 37, 0.92));
 }
 
-.mcp-insight-grid {
+.selector-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.selector-section-title {
+  margin: 0;
+  color: #d8eaf9;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.skills-selected,
+.skills-catalog,
+.skills-warnings,
+.mcp-insight,
+.selector-overview {
+  display: grid;
+  gap: 8px;
+}
+
+.selector-overview-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
   gap: 6px;
 }
 
-.mcp-insight-card {
+.selector-overview-card {
   border: 1px solid rgba(94, 155, 205, 0.24);
   border-radius: 9px;
   background: rgba(9, 20, 32, 0.82);
@@ -381,22 +404,22 @@ button {
   min-width: 0;
 }
 
-.mcp-insight-label {
+.selector-overview-label {
   color: #90acc8;
   font-size: 9px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 
-.mcp-insight-value {
+.selector-overview-value {
   color: #f0f8ff;
   font-size: 15px;
   font-weight: 700;
   line-height: 1.1;
 }
 
-.mcp-insight-sub,
-.mcp-insight-note {
+.selector-overview-sub,
+.selector-overview-note {
   color: #a8c2d8;
   font-size: 11px;
   line-height: 1.35;
@@ -404,7 +427,7 @@ button {
   word-break: break-word;
 }
 
-.mcp-insight-note {
+.selector-overview-note {
   margin-top: 6px;
   border-top: 1px dashed rgba(118, 167, 208, 0.24);
   padding-top: 6px;
@@ -536,6 +559,13 @@ button {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+}
+
+.skill-card-head-actions {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 6px;
+  justify-items: end;
 }
 
 .skill-card-title-block {
@@ -677,6 +707,23 @@ button {
   line-height: 1.5;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.selector-detail-toggle {
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.selector-card-detail {
+  display: none;
+  gap: 8px;
+  border-top: 1px dashed rgba(114, 166, 207, 0.28);
+  padding-top: 8px;
+}
+
+.selector-card-detail.is-open {
+  display: grid;
 }
 
 .skill-card-structure {
@@ -3020,6 +3067,10 @@ body.workflow-immersive {
     grid-template-columns: 1fr;
   }
 
+  .selector-overview-grid {
+    grid-template-columns: 1fr;
+  }
+
   .mcp-card .info-list {
     grid-template-columns: 1fr;
   }
@@ -3056,6 +3107,11 @@ body.workflow-immersive {
 
   .skill-card-head {
     flex-direction: column;
+  }
+
+  .skill-card-head-actions {
+    width: 100%;
+    justify-items: stretch;
   }
 
   .skill-card-action,

@@ -131,6 +131,19 @@ from opencompany.utils import (
 from opencompany.workspace import WorkspaceChangeSet, WorkspaceManager
 
 SESSION_HISTORY_STREAM_EVENT_TYPES = frozenset({"llm_token", "llm_reasoning", "shell_stream"})
+ACTIVITY_DIAGNOSTIC_EVENT_TYPES = frozenset(
+    {
+        "mcp_connect_started",
+        "mcp_transport_fallback_started",
+        "mcp_transport_fallback_succeeded",
+        "mcp_transport_fallback_failed",
+        "mcp_initialized",
+        "mcp_tools_refreshed",
+        "mcp_resources_refreshed",
+        "mcp_resources_not_supported",
+        "mcp_server_prepare_failed",
+    }
+)
 
 
 def _looks_like_app_dir(path: Path) -> bool:
@@ -10394,15 +10407,54 @@ class Orchestrator:
         error: BaseException | None = None,
         message: str = "",
     ) -> None:
+        resolved_session_id = session_id or self.latest_session_id
+        self._mirror_activity_diagnostic_event(
+            event_type,
+            session_id=resolved_session_id,
+            agent_id=agent_id,
+            level=level,
+            payload=payload,
+        )
         self.diagnostics.log(
             component="orchestrator",
             event_type=event_type,
             level=level,
-            session_id=session_id or self.latest_session_id,
+            session_id=resolved_session_id,
             agent_id=agent_id,
             message=message,
             payload=payload,
             error=error,
+        )
+
+    def _mirror_activity_diagnostic_event(
+        self,
+        event_type: str,
+        *,
+        session_id: str | None,
+        agent_id: str | None,
+        level: str,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        if event_type not in ACTIVITY_DIAGNOSTIC_EVENT_TYPES:
+            return
+        normalized_session_text = str(session_id or "").strip()
+        if not normalized_session_text:
+            return
+        try:
+            normalized_session_id = self._normalize_session_id(normalized_session_text)
+        except ValueError:
+            return
+        normalized_agent_id = str(agent_id or "").strip() or None
+        diagnostic_payload = dict(payload or {})
+        diagnostic_payload.setdefault("diagnostic_level", str(level or "info"))
+        self._get_logger(normalized_session_id).log(
+            session_id=normalized_session_id,
+            agent_id=normalized_agent_id,
+            parent_agent_id=None,
+            event_type=event_type,
+            phase="mcp",
+            payload=diagnostic_payload,
+            workspace_id=None,
         )
 
 def _public_action(action: dict[str, Any]) -> dict[str, Any]:

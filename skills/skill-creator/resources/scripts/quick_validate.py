@@ -31,9 +31,9 @@ def validate_skill(skill_dir: Path) -> list[str]:
         errors.append(f"Failed to parse skill.toml: {exc}")
         return errors
 
-    metadata = payload.get("skill") if isinstance(payload.get("skill"), dict) else payload
+    metadata = payload.get("skill")
     if not isinstance(metadata, dict):
-        errors.append("skill.toml must contain a [skill] table or top-level skill object")
+        errors.append("skill.toml must contain a [skill] table")
         return errors
 
     for key in REQUIRED_METADATA_KEYS:
@@ -52,7 +52,11 @@ def validate_skill(skill_dir: Path) -> list[str]:
             errors.append(f"Metadata field '{key}' must be a non-empty string")
 
     tags = metadata.get("tags", [])
-    if not isinstance(tags, list) or not all(isinstance(item, str) and item.strip() for item in tags):
+    if (
+        not isinstance(tags, list)
+        or not tags
+        or not all(isinstance(item, str) and item.strip() for item in tags)
+    ):
         errors.append("Metadata field 'tags' must be a non-empty list of strings")
 
     skill_doc = skill_doc_path.read_text(encoding="utf-8")

@@ -60,15 +60,35 @@
               </span>
             </button>
             <div id="skills-panel-body" class="skills-control-shell collapsible-body hidden">
-            <div class="skills-toolbar">
-              <button id="skills-discover-button" type="button">Discover</button>
-              <button id="skills-select-all-button" type="button">Select All</button>
-              <button id="skills-clear-button" type="button">Clear</button>
-            </div>
-            <div id="skills-status" class="path-label"></div>
-            <div id="skills-selected" class="skills-selected"></div>
-            <div id="skills-list" class="skills-catalog"></div>
-            <div id="skills-warnings" class="skills-warnings hidden"></div>
+              <div class="skills-toolbar">
+                <button id="skills-discover-button" type="button">Discover</button>
+                <button id="skills-select-all-button" type="button">Select All</button>
+                <button id="skills-clear-button" type="button">Clear</button>
+              </div>
+              <section class="selector-section selector-section-overview">
+                <div class="selector-section-head">
+                  <h3 id="skills-overview-title" class="selector-section-title">Overview</h3>
+                </div>
+                <div id="skills-overview" class="selector-overview"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="skills-selected-title" class="selector-section-title">Enabled Skills</h3>
+                </div>
+                <div id="skills-selected" class="skills-selected"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="skills-catalog-title" class="selector-section-title">Catalog</h3>
+                </div>
+                <div id="skills-list" class="skills-catalog"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="skills-warnings-title" class="selector-section-title">Skill Warnings</h3>
+                </div>
+                <div id="skills-warnings" class="skills-warnings hidden"></div>
+              </section>
             </div>
           </div>
         </div>
@@ -91,17 +111,36 @@
               </span>
             </button>
             <div id="mcp-panel-body" class="skills-control-shell collapsible-body hidden">
-            <div class="skills-toolbar">
-              <button id="mcp-discover-button" type="button">Discover</button>
-              <button id="mcp-use-defaults-button" type="button">Use Defaults</button>
-              <button id="mcp-select-all-button" type="button">Select All</button>
-              <button id="mcp-clear-button" type="button">Clear</button>
-            </div>
-            <div id="mcp-status" class="path-label"></div>
-            <div id="mcp-insight" class="mcp-insight"></div>
-            <div id="mcp-selected" class="skills-selected"></div>
-            <div id="mcp-list" class="skills-catalog mcp-catalog"></div>
-            <div id="mcp-warnings" class="skills-warnings hidden"></div>
+              <div class="skills-toolbar">
+                <button id="mcp-discover-button" type="button">Discover</button>
+                <button id="mcp-use-defaults-button" type="button">Use Defaults</button>
+                <button id="mcp-select-all-button" type="button">Select All</button>
+                <button id="mcp-clear-button" type="button">Clear</button>
+              </div>
+              <section class="selector-section selector-section-overview">
+                <div class="selector-section-head">
+                  <h3 id="mcp-overview-title" class="selector-section-title">Overview</h3>
+                </div>
+                <div id="mcp-insight" class="mcp-insight"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="mcp-selected-title" class="selector-section-title">Enabled MCP Servers</h3>
+                </div>
+                <div id="mcp-selected" class="skills-selected"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="mcp-catalog-title" class="selector-section-title">Catalog</h3>
+                </div>
+                <div id="mcp-list" class="skills-catalog mcp-catalog"></div>
+              </section>
+              <section class="selector-section">
+                <div class="selector-section-head">
+                  <h3 id="mcp-warnings-title" class="selector-section-title">MCP Warnings</h3>
+                </div>
+                <div id="mcp-warnings" class="skills-warnings hidden"></div>
+              </section>
             </div>
           </div>
         </div>

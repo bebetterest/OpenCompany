@@ -16,6 +16,7 @@ from opencompany.mcp.manager import (
     McpManager,
     _AgentMcpContext,
     _AgentServerContext,
+    _SessionMcpContext,
     render_mcp_prompt,
 )
 from opencompany.mcp.oauth import (
@@ -1616,6 +1617,81 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 
         asyncio.run(run())
 
+    def test_prepare_agent_reuses_session_mcp_context_across_agents(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text(
+                    """
+[mcp.servers.filesystem]
+transport = "streamable_http"
+url = "http://127.0.0.1:8787/mcp"
+""".strip(),
+                    encoding="utf-8",
+                )
+                manager = self._manager(project_dir)
+                session = RunSession(
+                    id="session-1",
+                    project_dir=project_dir,
+                    task="demo",
+                    locale="en",
+                    root_agent_id="agent-root",
+                    enabled_mcp_server_ids=["filesystem"],
+                )
+                root_agent = AgentNode(
+                    id="agent-root",
+                    session_id="session-1",
+                    name="Root",
+                    role=AgentRole.ROOT,
+                    instruction="demo",
+                    workspace_id="workspace-root",
+                )
+                worker_agent = AgentNode(
+                    id="agent-worker",
+                    session_id="session-1",
+                    name="Worker",
+                    role=AgentRole.WORKER,
+                    instruction="demo",
+                    workspace_id="workspace-worker",
+                )
+
+                expensive_initializations = 0
+
+                async def _fake_ensure_server_connected(*, context, server_context, tool_executor) -> None:  # type: ignore[no-untyped-def]
+                    del context, tool_executor
+                    nonlocal expensive_initializations
+                    if server_context.session is None:
+                        expensive_initializations += 1
+                        server_context.session = object()  # type: ignore[assignment]
+                    server_context.runtime_state.connected = True
+                    server_context.runtime_state.warning = ""
+
+                manager._ensure_server_connected = _fake_ensure_server_connected  # type: ignore[method-assign]
+
+                first_payload = await manager.prepare_agent(
+                    session=session,
+                    agent=root_agent,
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    tool_executor=object(),
+                )
+                second_payload = await manager.prepare_agent(
+                    session=session,
+                    agent=worker_agent,
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    tool_executor=object(),
+                )
+
+                self.assertEqual(expensive_initializations, 1)
+                self.assertTrue(first_payload["entries"][0]["connected"])
+                self.assertTrue(second_payload["entries"][0]["connected"])
+                root_context = manager._agent_contexts[("session-1", "agent-root")]  # type: ignore[attr-defined]
+                worker_context = manager._agent_contexts[("session-1", "agent-worker")]  # type: ignore[attr-defined]
+                self.assertIs(root_context.servers, worker_context.servers)
+
+        asyncio.run(run())
+
     def test_refresh_tools_and_resources_apply_filters_and_clear_dirty_flags(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -2559,6 +2635,62 @@ url = "http://127.0.0.1:8787/mcp"
 
                 self.assertEqual(closed, ["agent-1", "agent-2"])
                 self.assertEqual(manager._agent_contexts, {})  # type: ignore[attr-defined]
+
+        asyncio.run(run())
+
+    def test_close_agent_defers_shared_session_shutdown_until_last_agent(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                project_dir = Path(temp_dir)
+                (project_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                manager = self._manager(project_dir)
+                closed: list[str] = []
+
+                class _Session:
+                    async def close(self) -> None:
+                        closed.append("closed")
+
+                shared_servers = {
+                    "filesystem": _AgentServerContext(
+                        server=McpServerConfig(id="filesystem"),
+                        runtime_state=McpServerRuntimeState(
+                            server_id="filesystem",
+                            title="filesystem",
+                            transport="stdio",
+                            enabled=True,
+                            connected=True,
+                        ),
+                        session=_Session(),  # type: ignore[arg-type]
+                    )
+                }
+                manager._session_contexts["session-1"] = _SessionMcpContext(  # type: ignore[attr-defined]
+                    session_id="session-1",
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    enabled_server_ids=["filesystem"],
+                    servers=shared_servers,
+                )
+                manager._agent_contexts[("session-1", "agent-1")] = _AgentMcpContext(  # type: ignore[attr-defined]
+                    session_id="session-1",
+                    agent_id="agent-1",
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    enabled_server_ids=["filesystem"],
+                    servers=shared_servers,
+                )
+                manager._agent_contexts[("session-1", "agent-2")] = _AgentMcpContext(  # type: ignore[attr-defined]
+                    session_id="session-1",
+                    agent_id="agent-2",
+                    workspace_path=project_dir,
+                    workspace_is_remote=False,
+                    enabled_server_ids=["filesystem"],
+                    servers=shared_servers,
+                )
+
+                await manager.close_agent(session_id="session-1", agent_id="agent-1")
+                self.assertEqual(closed, [])
+                await manager.close_agent(session_id="session-1", agent_id="agent-2")
+                self.assertEqual(closed, ["closed"])
 
         asyncio.run(run())
 

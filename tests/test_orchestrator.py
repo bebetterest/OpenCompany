@@ -823,6 +823,53 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.status.value, "completed")
             self.assertEqual(session.final_summary, "Completed despite cancelled subscriber.")
 
+    def test_mcp_diagnostics_are_mirrored_into_runtime_activity_events(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-mcp-activity"
+            received: list[dict[str, object]] = []
+            orchestrator.subscribe(lambda payload: received.append(payload))
+
+            orchestrator._log_diagnostic(
+                "mcp_connect_started",
+                session_id=session_id,
+                agent_id="agent-root",
+                payload={"server_id": "docs", "transport": "streamable-http"},
+            )
+            orchestrator._log_diagnostic(
+                "mcp_initialized",
+                session_id=session_id,
+                agent_id="agent-root",
+                payload={"server_id": "docs", "protocol_version": "2025-06-18"},
+            )
+            orchestrator._log_diagnostic(
+                "subscriber_registered",
+                session_id=session_id,
+                agent_id="agent-root",
+                payload={"reason": "control"},
+            )
+
+            persisted = orchestrator.storage.load_events(session_id)
+            persisted_event_types = [str(row.get("event_type", "")) for row in persisted]
+            self.assertIn("mcp_connect_started", persisted_event_types)
+            self.assertIn("mcp_initialized", persisted_event_types)
+            self.assertNotIn("subscriber_registered", persisted_event_types)
+
+            for row in persisted:
+                if str(row.get("event_type", "")) != "mcp_initialized":
+                    continue
+                self.assertEqual(str(row.get("phase", "")), "mcp")
+                payload = json.loads(str(row.get("payload_json", "{}")))
+                self.assertEqual(payload.get("server_id"), "docs")
+                self.assertEqual(payload.get("diagnostic_level"), "info")
+
+            received_event_types = [str(item.get("event_type", "")) for item in received]
+            self.assertIn("mcp_connect_started", received_event_types)
+            self.assertIn("mcp_initialized", received_event_types)
+            self.assertNotIn("subscriber_registered", received_event_types)
+
     def test_invalid_session_id_is_rejected_without_creating_session_directory(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)

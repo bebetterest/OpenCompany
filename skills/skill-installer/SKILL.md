@@ -23,7 +23,8 @@ Imported skills should be normalized to the OpenCompany layout:
 
 During import:
 
-- Synthesize `skill.toml` if the upstream skill only has `SKILL.md`.
+- Ensure `skill.toml` exists and normalize it to a canonical OpenCompany `[skill]` table.
+- Rewrite incomplete or legacy metadata so `id`, `name`, `name_cn`, `description`, `description_cn`, and `tags` are always populated.
 - Move legacy top-level `scripts/`, `references/`, and `assets/` into `resources/`.
 - Remove stale `agents/` metadata directories.
 - Review `SKILL.md` and fix instructions that still assume Codex-only behavior.
@@ -46,6 +47,7 @@ Import rules:
 
 - `id` must match the final folder name.
 - If upstream metadata is missing, synthesize all six fields rather than relying on runtime fallbacks.
+- If upstream metadata exists but is incomplete or not in a `[skill]` table, rewrite it into the canonical `[skill]` layout.
 - If only English metadata exists upstream, it is acceptable to seed `name_cn` from `name` and `description_cn` from a review-needed placeholder, but the user should refine them afterward.
 - Default imported tags may start as `["imported"]`, but they should be tightened if the skill becomes a maintained bundled skill.
 
@@ -63,7 +65,7 @@ All scripts live under `resources/scripts/`.
 - `list-skills.py`
   Lists candidate skills from a GitHub repo path and annotates whether they are already present in the target OpenCompany skills directory.
 - `install-skill-from-github.py`
-  Downloads or sparse-checkouts skills from GitHub, copies them into the target skills directory, and runs the OpenCompany normalization step.
+  Downloads or sparse-checkouts skills from GitHub, copies them into the target skills directory, rewrites metadata into canonical OpenCompany `skill.toml`, and runs normalization checks.
 
 These scripts may need network access. If the sandbox blocks them, retry with approval instead of asking the user to manually download the repo first.
 

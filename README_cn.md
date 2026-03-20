@@ -194,6 +194,8 @@ opencompany mcp-login --mcp-server notion
 - `Skills` 和 `MCP Servers` 两块默认折叠；先展开对应标题栏，再进行选择和操作。
 - 页面加载时就会从 `opencompany.toml` 预加载已配置的 MCP servers；`发现` 用于刷新目录。
 - skills 和 MCP servers 都改成了直接点卡片启用/停用，不再需要手动输入。
+- 两个选择器现在统一为分层布局（`概览` → `已选` → `目录` → `告警`），折叠头摘要只保留关键计数，避免重复状态文案。
+- skill/MCP 卡片默认展示精简信息，可按卡片展开详情查看高级元数据。
 - 对启用了 OAuth 的 MCP 卡片，界面会直接显示 `登录` / `继续登录` / `重新登录` 和 `清除登录`；当登录仍在处理中时按钮不会被锁死，误关授权页后可直接重新打开，而 `清除登录` 会删除本地保存的 OAuth 记录，便于彻底重新授权。
 - 点击 `用默认项` 可同步 `enabled = true` 的默认集合；也可以用 `全选` 覆盖本次运行的配置默认项。
 - 完成选择后再启动或继续 session；此时 MCP 面板会显示每个 server 的连接状态、roots 暴露情况、tool/resource 数量、协议版本与告警信息。
@@ -282,7 +284,7 @@ opencompany skills --remote-target demo@example.com:22 --remote-dir /home/demo/w
 - 把 skill 目录放到 `<project_dir>/skills/` 或 `<app_dir>/skills/` 下即可参与发现。
 - 但不是只有目录名就行；一个有效 skill 至少要包含 `skill.toml` 和 `SKILL.md`。
 - 如果项目源和全局源里存在同一个 `skill_id`，项目源会覆盖全局源。
-- 本仓库已经在 `skills/` 下内置一组默认 skills（包含从 Hugging Face Skills 适配的 `hf-cli`）。
+- 本仓库已经在 `skills/` 下内置一组默认 skills，全部由 Codex Skills 迁移并适配为 OpenCompany skill 格式。
 
 ```text
 <project_dir>/skills/<skill_id>/

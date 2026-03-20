@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import shlex
 from dataclasses import dataclass, field
@@ -183,6 +184,15 @@ class _AgentMcpContext:
         }
 
 
+@dataclass(slots=True)
+class _SessionMcpContext:
+    session_id: str
+    workspace_path: Path
+    workspace_is_remote: bool
+    enabled_server_ids: list[str]
+    servers: dict[str, _AgentServerContext] = field(default_factory=dict)
+
+
 class McpManager:
     def __init__(
         self,
@@ -195,6 +205,8 @@ class McpManager:
         self.config = config
         self._log_diagnostic = log_diagnostic
         self._agent_contexts: dict[tuple[str, str], _AgentMcpContext] = {}
+        self._session_contexts: dict[str, _SessionMcpContext] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     def available_servers(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -338,36 +350,55 @@ class McpManager:
         workspace_is_remote: bool,
         tool_executor: "ToolExecutor",
     ) -> dict[str, Any]:
-        enabled_server_ids = self.normalize_enabled_server_ids(
-            session.enabled_mcp_server_ids
-        )
-        context_key = (session.id, agent.id)
-        context = self._agent_contexts.get(context_key)
-        if (
-            context is None
-            or context.workspace_path != workspace_path
-            or context.workspace_is_remote != workspace_is_remote
-            or context.enabled_server_ids != enabled_server_ids
-        ):
-            if context is not None:
-                await self._close_context(context)
-            context = _AgentMcpContext(
-                session_id=session.id,
-                agent_id=agent.id,
-                workspace_path=workspace_path,
-                workspace_is_remote=workspace_is_remote,
-                enabled_server_ids=list(enabled_server_ids),
+        enabled_server_ids = self.normalize_enabled_server_ids(session.enabled_mcp_server_ids)
+        lock = self._session_locks.setdefault(session.id, asyncio.Lock())
+        async with lock:
+            session_context = self._session_contexts.get(session.id)
+            if (
+                session_context is None
+                or session_context.workspace_path != workspace_path
+                or session_context.workspace_is_remote != workspace_is_remote
+                or session_context.enabled_server_ids != enabled_server_ids
+            ):
+                if session_context is not None:
+                    await self._close_session_context(
+                        session_context,
+                        session_id=session.id,
+                        agent_id=agent.id,
+                    )
+                session_context = _SessionMcpContext(
+                    session_id=session.id,
+                    workspace_path=workspace_path,
+                    workspace_is_remote=workspace_is_remote,
+                    enabled_server_ids=list(enabled_server_ids),
+                )
+                self._session_contexts[session.id] = session_context
+
+            context_key = (session.id, agent.id)
+            context = self._agent_contexts.get(context_key)
+            if context is None:
+                context = _AgentMcpContext(
+                    session_id=session.id,
+                    agent_id=agent.id,
+                    workspace_path=workspace_path,
+                    workspace_is_remote=workspace_is_remote,
+                    enabled_server_ids=list(enabled_server_ids),
+                    tool_executor=tool_executor,
+                    servers=session_context.servers,
+                )
+                self._agent_contexts[context_key] = context
+            else:
+                context.workspace_path = workspace_path
+                context.workspace_is_remote = workspace_is_remote
+                context.enabled_server_ids = list(enabled_server_ids)
+                context.tool_executor = tool_executor
+                context.servers = session_context.servers
+
+            await self._ensure_servers(
+                context=context,
                 tool_executor=tool_executor,
             )
-            self._agent_contexts[context_key] = context
-        else:
-            context.tool_executor = tool_executor
-        await self._ensure_servers(
-            context=context,
-            tool_executor=tool_executor,
-        )
-        payload = context.metadata_payload()
-        return payload
+            return context.metadata_payload()
 
     async def list_servers(
         self,
@@ -506,15 +537,41 @@ class McpManager:
 
     async def close_agent(self, *, session_id: str, agent_id: str) -> None:
         context = self._agent_contexts.pop((session_id, agent_id), None)
-        if context is not None:
+        if context is None:
+            return
+        session_context = self._session_contexts.get(session_id)
+        if session_context is None:
             await self._close_context(context)
+            return
+        if any(key[0] == session_id for key in self._agent_contexts):
+            return
+        self._session_contexts.pop(session_id, None)
+        await self._close_session_context(
+            session_context,
+            session_id=session_id,
+            agent_id=agent_id,
+        )
+        self._session_locks.pop(session_id, None)
 
     async def close_session(self, session_id: str) -> None:
         keys = [key for key in self._agent_contexts if key[0] == session_id]
+        contexts: list[_AgentMcpContext] = []
         for key in keys:
             context = self._agent_contexts.pop(key, None)
             if context is not None:
+                contexts.append(context)
+        session_context = self._session_contexts.pop(session_id, None)
+        if session_context is not None:
+            representative_agent_id = contexts[0].agent_id if contexts else "session"
+            await self._close_session_context(
+                session_context,
+                session_id=session_id,
+                agent_id=representative_agent_id,
+            )
+        else:
+            for context in contexts:
                 await self._close_context(context)
+        self._session_locks.pop(session_id, None)
 
     async def _ensure_servers(
         self,
@@ -1066,6 +1123,23 @@ class McpManager:
                 )
                 await server_context.session.close()
                 server_context.session = None
+
+    async def _close_session_context(
+        self,
+        session_context: _SessionMcpContext,
+        *,
+        session_id: str,
+        agent_id: str,
+    ) -> None:
+        synthetic_context = _AgentMcpContext(
+            session_id=session_id,
+            agent_id=agent_id,
+            workspace_path=session_context.workspace_path,
+            workspace_is_remote=session_context.workspace_is_remote,
+            enabled_server_ids=list(session_context.enabled_server_ids),
+            servers=session_context.servers,
+        )
+        await self._close_context(synthetic_context)
 
     async def _request_with_reconnect(
         self,
