@@ -25,6 +25,7 @@ OpenCompany is implemented as a local-first multi-agent runtime for arbitrary pr
 3. Expand sandbox backend options beyond the current local + SSH-remote path (for example Docker) without rewriting orchestration or storage layers.
 4. Improve UI scalability (large histories, richer diff navigation, denser diagnostics views).
 5. Strengthen system tests for resume/cancel/partial-failure patterns.
+6. Run a no-behavior-change split roadmap in two waves: (a) isolate UI state/render orchestration boundaries, (b) extract orchestration execution paths from `orchestrator.py` behind stable interfaces, with equivalence tests gating each step.
 
 ## Documentation Contract
 

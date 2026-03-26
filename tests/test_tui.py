@@ -635,6 +635,14 @@ class TuiInteractionTests(unittest.IsolatedAsyncioTestCase):
                 initial_height = task_input.size.height
                 task_input.load_text("line 1\nline 2")
                 await pilot.pause()
+                if task_input.size.height > initial_height:
+                    return
+
+                # Some textual versions render a two-line baseline height for this
+                # TextArea; ensure growth still happens once content exceeds that
+                # baseline.
+                task_input.load_text("line 1\nline 2\nline 3")
+                await pilot.pause()
                 self.assertGreater(task_input.size.height, initial_height)
 
     async def test_model_input_defaults_from_config_model(self) -> None:

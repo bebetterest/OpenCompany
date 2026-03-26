@@ -112,9 +112,17 @@ opencompany ui
 opencompany ui --host 0.0.0.0 --port 9090
 ```
 
+6. 开发前先验证本地环境：
+
+```bash
+pytest -q
+```
+
+请在已激活的 `OpenCompany` Conda 环境或当前 `uv` 虚拟环境中执行测试，避免出现导入路径或可选依赖不一致问题。
+
 ## 🔌 MCP 使用指南
 
-当前仓库已在 `opencompany.toml` 预置四个 MCP：两个默认启用的官方 hosted MCP（`huggingface`、`notion`），以及两个可选预置（`github`、`duckduckgo`）。
+当前仓库已在 `opencompany.toml` 预置四个 MCP，且四个默认都启用（`huggingface`、`notion`、`github`、`duckduckgo`）。
 
 1. 先在 `opencompany.toml` 里定义 MCP servers：
 
@@ -142,7 +150,7 @@ oauth_use_resource_param = false
 
 [mcp.servers.github]
 transport = "streamable_http"
-enabled = false
+enabled = true
 title = "GitHub MCP"
 timeout_seconds = 30
 url = "https://api.githubcopilot.com/mcp/"
@@ -150,7 +158,7 @@ headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
 
 [mcp.servers.duckduckgo]
 transport = "stdio"
-enabled = false
+enabled = true
 title = "DuckDuckGo MCP"
 timeout_seconds = 45
 command = "duckduckgo-mcp-server"
@@ -447,7 +455,7 @@ opencompany terminal <session_id> --self-check
 
 当前仓库默认值包括：
 
-- `[project].default_locale = "zh"`（若希望跟随系统语言请设为 `auto`）
+- `[project].default_locale = "auto"`（默认跟随系统语言；若系统语言不是中英文则回退到英文）
 - `[llm.openrouter].model = "stepfun/step-3.5-flash:free"`
 - `[llm.openrouter].max_retries = 8`
 - `[runtime.tool_timeouts].default_seconds = 30`

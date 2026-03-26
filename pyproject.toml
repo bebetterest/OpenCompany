@@ -22,7 +22,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<9.0",
-  "pytest-asyncio>=0.23,<1.0"
+  "pytest-asyncio>=0.23,<1.0",
+  "ruff>=0.6,<1.0",
+  "mypy>=1.11,<2.0"
 ]
 
 [project.scripts]
@@ -36,3 +38,28 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 opencompany = ["webui/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F821"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+files = [
+  "src/opencompany/config.py",
+  "src/opencompany/prompts.py",
+  "src/opencompany/utils.py",
+  "tests/test_repo_contracts.py"
+]
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["opencompany.config", "opencompany.utils"]
+disable_error_code = ["arg-type"]

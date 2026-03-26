@@ -4,7 +4,7 @@
 name = "OpenCompany"
 # 默认语言：auto 自动检测；可选 en / zh
 # Default locale: auto detects system locale; options: en / zh
-default_locale = "zh"
+default_locale = "auto"
 # 运行数据目录（日志、导出文件等会写入此目录）
 # Runtime data directory (logs/exports are stored here)
 data_dir = ".opencompany"

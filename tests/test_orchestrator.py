@@ -4085,3 +4085,96 @@ backend = "none"
             self.assertTrue(report["checks"]["workspace_write"]["ok"])
             self.assertFalse(report["checks"]["outside_write_blocked"]["ok"])
             self.assertTrue(report["checks"]["outside_write_policy_match"]["ok"])
+
+
+class OrchestratorRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_finalize_uses_root_agent_id_for_focus_loop_finished_log(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            orchestrator = Orchestrator(Path("."), app_dir=app_dir)
+
+            session = RunSession(
+                id="session-1",
+                project_dir=Path("."),
+                task="demo task",
+                locale="en",
+                root_agent_id="agent-root",
+                workspace_mode=WorkspaceMode.STAGED,
+                status=SessionStatus.RUNNING,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            root_agent = AgentNode(
+                id="agent-root",
+                session_id=session.id,
+                name="Root",
+                role=AgentRole.ROOT,
+                instruction="Coordinate work",
+                workspace_id="workspace-root",
+                status=AgentStatus.COMPLETED,
+                summary="Root completed",
+                completion_status="completed",
+            )
+
+            orchestrator._log_diagnostic = mock.Mock()  # type: ignore[method-assign]
+            orchestrator._checkpoint = mock.AsyncMock()  # type: ignore[method-assign]
+            orchestrator._get_logger = mock.Mock(  # type: ignore[method-assign]
+                return_value=mock.Mock(log=mock.Mock())
+            )
+            orchestrator.tool_executor.cleanup_session_remote_runtime = mock.Mock()
+
+            await orchestrator._auto_finalize_when_all_agents_done(
+                session=session,
+                agents={root_agent.id: root_agent},
+                workspace_manager=mock.MagicMock(spec=WorkspaceManager),
+                pending_agent_ids=[],
+                root_loop=2,
+            )
+
+            focus_finished_calls = [
+                call
+                for call in orchestrator._log_diagnostic.mock_calls
+                if call.args and call.args[0] == "focus_agent_loop_finished"
+            ]
+            self.assertTrue(focus_finished_calls)
+            self.assertEqual(
+                focus_finished_calls[-1].kwargs.get("agent_id"),
+                session.root_agent_id,
+            )
+
+    def test_find_active_duplicate_child_respects_active_status(self) -> None:
+        parent = AgentNode(
+            id="agent-parent",
+            session_id="session-1",
+            name="Parent",
+            role=AgentRole.ROOT,
+            instruction="Parent instruction",
+            workspace_id="workspace-parent",
+            children=["agent-cancelled", "agent-active"],
+        )
+        cancelled = AgentNode(
+            id="agent-cancelled",
+            session_id="session-1",
+            name="Cancelled",
+            role=AgentRole.WORKER,
+            instruction="duplicate instruction",
+            workspace_id="workspace-cancelled",
+            status=AgentStatus.CANCELLED,
+        )
+        active = AgentNode(
+            id="agent-active",
+            session_id="session-1",
+            name="Active",
+            role=AgentRole.WORKER,
+            instruction="duplicate instruction",
+            workspace_id="workspace-active",
+            status=AgentStatus.RUNNING,
+        )
+        result = Orchestrator._find_active_duplicate_child(
+            parent=parent,
+            agents={cancelled.id: cancelled, active.id: active},
+            instruction="duplicate instruction",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.id, active.id)

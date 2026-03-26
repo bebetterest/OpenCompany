@@ -6011,7 +6011,7 @@ class Orchestrator:
         self._log_diagnostic(
             "focus_agent_loop_finished",
             session_id=session.id,
-            agent_id=normalized_focus_agent_id,
+            agent_id=session.root_agent_id,
             payload={"status": session.status.value, "root_loop": root_loop},
         )
 
@@ -9447,7 +9447,7 @@ class Orchestrator:
             child = agents.get(child_id)
             if not child:
                 continue
-            if not self._is_active_agent(child):
+            if not Orchestrator._is_active_agent(child):
                 continue
             if child.instruction.strip() == normalized:
                 return child

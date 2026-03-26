@@ -112,9 +112,17 @@ Default address: `http://127.0.0.1:8765`
 opencompany ui --host 0.0.0.0 --port 9090
 ```
 
+6. Validate your local environment before development:
+
+```bash
+pytest -q
+```
+
+Run tests from the activated `OpenCompany` Conda environment or your active `uv` virtual environment to avoid import/optional-dependency mismatch.
+
 ## 🔌 MCP usage guide
 
-This repository now preconfigures four MCP servers in `opencompany.toml`: two enabled official hosted servers (`huggingface`, `notion`) plus two optional presets (`github`, `duckduckgo`).
+This repository now preconfigures four MCP servers in `opencompany.toml`, and all four are enabled by default (`huggingface`, `notion`, `github`, `duckduckgo`).
 
 1. Define MCP servers in `opencompany.toml`:
 
@@ -142,7 +150,7 @@ oauth_use_resource_param = false
 
 [mcp.servers.github]
 transport = "streamable_http"
-enabled = false
+enabled = true
 title = "GitHub MCP"
 timeout_seconds = 30
 url = "https://api.githubcopilot.com/mcp/"
@@ -150,7 +158,7 @@ headers = { Authorization = "env:GITHUB_MCP_AUTHORIZATION" }
 
 [mcp.servers.duckduckgo]
 transport = "stdio"
-enabled = false
+enabled = true
 title = "DuckDuckGo MCP"
 timeout_seconds = 45
 command = "duckduckgo-mcp-server"
@@ -447,7 +455,7 @@ Key config groups:
 
 Current defaults in this repository include:
 
-- `[project].default_locale = "zh"` (set `auto` to follow system locale)
+- `[project].default_locale = "auto"` (follow system locale; fallback to English when locale is neither Chinese nor English)
 - `[llm.openrouter].model = "stepfun/step-3.5-flash:free"`
 - `[llm.openrouter].max_retries = 8`
 - `[runtime.tool_timeouts].default_seconds = 30`
