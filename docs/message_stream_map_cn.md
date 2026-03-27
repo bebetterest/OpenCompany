@@ -10,7 +10,7 @@
 - 运行时事件日志：`sessions/<session_id>/events.jsonl`
   - 运行遥测与生命周期事件主源。
 - Tool run 持久化状态：`tool_runs`（SQLite + API/CLI）
-  - 工具生命周期（`queued/running/completed/failed/cancelled`）主源。
+- 工具生命周期（`queued/running/completed/failed/cancelled/abandoned`）主源。
 
 ## 各界面映射
 

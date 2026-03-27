@@ -119,7 +119,7 @@ worker：
 - `load_session_context(session_id)` 现在只是只读元数据加载：优先返回持久化 session 行（checkpoint 中的 session 负载仅作兜底），不会 clone、不会导入 conversation，也不会修改运行时状态。
 - `clone_session(session_id)` 会显式深拷贝 session 目录、checkpoints、messages、events、tool runs、steer runs 与 agent 行；clone 血缘通过 `continued_from_session_id` 与 `continued_from_checkpoint_seq` 记录。
 - `_import_session_context(session_id, source)` 才负责从 checkpoint 恢复会话、agent 图和 workspaces，并优先通过 `*_messages.jsonl` 重建 conversation（checkpoint conversation 仅兜底）。
-- 导入时会把活跃 agent（`pending`/`running`）统一规范为 `paused`，并取消关联的 queued/running tool run，然后立即写入新 checkpoint。
+- 导入时会把活跃 agent（`pending`/`running`）统一规范为 `paused`；关联的 queued/running tool run 在 `source=run` 下会标记为 `cancelled`，在 `source=resume` 下会标记为 `abandoned`，然后立即写入新 checkpoint。
 - 导入/恢复时，可运行 agent 会根据实时 agent 状态与 pending tool runs 重新推导；持久化的 `pending_agent_ids` 只作为派生元数据参考。
 - 中断路径会将活跃 agent（`pending`/`running`）标记为 `terminated`，取消 pending tool runs，会话标记为 `interrupted`，并持久化 checkpoint。
 - `continued_from_session_id` 现在只会来自显式 `clone_session(...)`；在 UI/TUI/CLI 中单纯加载 session 不会再产生新的 lineage 节点。

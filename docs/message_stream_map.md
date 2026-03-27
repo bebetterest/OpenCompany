@@ -11,7 +11,7 @@ This document is a quick map of where each visible runtime block comes from in C
 - Runtime events: `sessions/<session_id>/events.jsonl`
   - Source for operational telemetry and lifecycle events.
 - Tool-run state: persisted `tool_runs` records (SQLite + APIs/CLI export)
-  - Source for tool lifecycle (`queued/running/completed/failed/cancelled`).
+  - Source for tool lifecycle (`queued/running/completed/failed/cancelled/abandoned`).
 
 ## Surface-level mapping
 

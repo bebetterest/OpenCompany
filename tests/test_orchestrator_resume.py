@@ -154,6 +154,148 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(session_row.get("root_agent_id", "")), new_root_agent_id)
             self.assertEqual(str(session_row.get("task", "")), "second run task")
 
+    async def test_run_task_in_session_cancelled_interrupt_marks_session_interrupted(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-run-in-session-cancelled"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root = AgentNode(
+                id="agent-root-initial",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="initial task",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.COMPLETED,
+                completion_status="completed",
+                conversation=[{"role": "user", "content": "initial task"}],
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="initial task",
+                locale="en",
+                root_agent_id=root.id,
+                status=SessionStatus.COMPLETED,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root)
+            orchestrator._sync_agent_messages(root)
+            checkpoint_state = CheckpointState(
+                session=orchestrator._session_state(session),
+                agents={root.id: orchestrator._agent_state(root)},
+                workspaces=workspace_manager.serialize(),
+                pending_agent_ids=[],
+                pending_tool_run_ids=[],
+                root_loop=0,
+                interrupted=False,
+            )
+            orchestrator.storage.save_checkpoint(session_id, now, checkpoint_state)
+
+            async def fake_run_session(
+                *,
+                session: RunSession,
+                agents: dict[str, AgentNode],
+                workspace_manager: WorkspaceManager,
+                pending_agent_ids: list[str],
+                root_loop: int,
+                run_root_agent: bool = True,
+                focus_agent_id: str | None = None,
+            ) -> None:
+                del session, agents, workspace_manager, pending_agent_ids, root_loop, run_root_agent, focus_agent_id
+                orchestrator.interrupt_requested = True
+                raise asyncio.CancelledError()
+
+            orchestrator._run_session = fake_run_session  # type: ignore[method-assign]
+            resumed = await orchestrator.run_task_in_session(
+                session_id,
+                "second run task",
+                model="openai/gpt-4.1",
+            )
+
+            self.assertEqual(resumed.id, session_id)
+            self.assertEqual(resumed.status, SessionStatus.INTERRUPTED)
+            session_row = orchestrator.storage.load_session(session_id)
+            self.assertIsNotNone(session_row)
+            assert session_row is not None
+            self.assertEqual(str(session_row.get("status", "")), SessionStatus.INTERRUPTED.value)
+
+    async def test_resume_cancelled_interrupt_marks_session_interrupted(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-resume-cancelled"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root = AgentNode(
+                id="agent-root-resume",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="resume task",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.PAUSED,
+                conversation=[{"role": "user", "content": "resume task"}],
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="resume task",
+                locale="en",
+                root_agent_id=root.id,
+                status=SessionStatus.INTERRUPTED,
+                created_at=now,
+                updated_at=now,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root)
+            orchestrator._sync_agent_messages(root)
+            checkpoint_state = CheckpointState(
+                session=orchestrator._session_state(session),
+                agents={root.id: orchestrator._agent_state(root)},
+                workspaces=workspace_manager.serialize(),
+                pending_agent_ids=[],
+                pending_tool_run_ids=[],
+                root_loop=0,
+                interrupted=True,
+            )
+            orchestrator.storage.save_checkpoint(session_id, now, checkpoint_state)
+
+            async def fake_run_session(
+                *,
+                session: RunSession,
+                agents: dict[str, AgentNode],
+                workspace_manager: WorkspaceManager,
+                pending_agent_ids: list[str],
+                root_loop: int,
+                run_root_agent: bool = True,
+                focus_agent_id: str | None = None,
+            ) -> None:
+                del session, agents, workspace_manager, pending_agent_ids, root_loop, run_root_agent, focus_agent_id
+                orchestrator.interrupt_requested = True
+                raise asyncio.CancelledError()
+
+            orchestrator._run_session = fake_run_session  # type: ignore[method-assign]
+            resumed = await orchestrator.resume(
+                session_id,
+                "Resume with cancellation",
+            )
+
+            self.assertEqual(resumed.id, session_id)
+            self.assertEqual(resumed.status, SessionStatus.INTERRUPTED)
+            session_row = orchestrator.storage.load_session(session_id)
+            self.assertIsNotNone(session_row)
+            assert session_row is not None
+            self.assertEqual(str(session_row.get("status", "")), SessionStatus.INTERRUPTED.value)
+
     async def test_submit_run_in_active_session_appends_running_root(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
@@ -1437,6 +1579,127 @@ class OrchestratorResumeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 imported_workspace_manager.root_workspace().base_snapshot_path.resolve(),
                 project_dir.resolve(),
+            )
+
+    async def test_resume_marks_non_terminal_tool_runs_as_abandoned(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            session_id = "session-resume-abandoned-tool-runs"
+            now = utc_now()
+            workspace_manager = WorkspaceManager(orchestrator.paths.session_dir(session_id))
+            root_workspace = workspace_manager.create_root_workspace(project_dir)
+            root_agent = AgentNode(
+                id="agent-root-resume-abandoned",
+                session_id=session_id,
+                name="Root Coordinator",
+                role=AgentRole.ROOT,
+                instruction="Resume session",
+                workspace_id=root_workspace.id,
+                status=AgentStatus.RUNNING,
+                children=["agent-worker-completed"],
+                conversation=[{"role": "user", "content": "resume"}],
+            )
+            completed_worker = AgentNode(
+                id="agent-worker-completed",
+                session_id=session_id,
+                name="Completed Worker",
+                role=AgentRole.WORKER,
+                instruction="done",
+                workspace_id=root_workspace.id,
+                parent_agent_id=root_agent.id,
+                status=AgentStatus.COMPLETED,
+                completion_status="completed",
+                conversation=[{"role": "assistant", "content": "done"}],
+            )
+            session = RunSession(
+                id=session_id,
+                project_dir=project_dir,
+                task="Resume pending tool runs",
+                locale="en",
+                root_agent_id=root_agent.id,
+                status=SessionStatus.INTERRUPTED,
+                created_at=now,
+                updated_at=now,
+                loop_index=3,
+            )
+            orchestrator.storage.upsert_session(session)
+            orchestrator.storage.upsert_agent(root_agent)
+            orchestrator.storage.upsert_agent(completed_worker)
+            orchestrator._sync_agent_messages(root_agent)
+            orchestrator._sync_agent_messages(completed_worker)
+
+            queued_root_run = ToolRun(
+                id="toolrun-root-queued-abandoned",
+                session_id=session_id,
+                agent_id=root_agent.id,
+                tool_name="wait_time",
+                arguments={"type": "wait_time", "seconds": 10},
+                status=ToolRunStatus.QUEUED,
+                blocking=True,
+                created_at=now,
+            )
+            running_completed_worker_run = ToolRun(
+                id="toolrun-completed-worker-running",
+                session_id=session_id,
+                agent_id=completed_worker.id,
+                tool_name="wait_time",
+                arguments={"type": "wait_time", "seconds": 10},
+                status=ToolRunStatus.RUNNING,
+                blocking=True,
+                created_at=now,
+                started_at=now,
+            )
+            orchestrator.storage.upsert_tool_run(queued_root_run)
+            orchestrator.storage.upsert_tool_run(running_completed_worker_run)
+
+            checkpoint_state = CheckpointState(
+                session=orchestrator._session_state(session),
+                agents={
+                    root_agent.id: orchestrator._agent_state(root_agent),
+                    completed_worker.id: orchestrator._agent_state(completed_worker),
+                },
+                workspaces=workspace_manager.serialize(),
+                pending_agent_ids=[],
+                pending_tool_run_ids=[queued_root_run.id, running_completed_worker_run.id],
+                root_loop=3,
+                interrupted=True,
+            )
+            orchestrator.storage.save_checkpoint(session_id, now, checkpoint_state)
+
+            (
+                imported_session,
+                imported_agents,
+                imported_workspace_manager,
+                _pending_agent_ids,
+                root_loop,
+                _checkpoint_seq,
+            ) = orchestrator._import_session_context(session_id, source="resume")
+
+            refreshed_root_run = orchestrator.storage.load_tool_run(queued_root_run.id)
+            self.assertIsNotNone(refreshed_root_run)
+            assert refreshed_root_run is not None
+            self.assertEqual(
+                str(refreshed_root_run.get("status", "")),
+                ToolRunStatus.ABANDONED.value,
+            )
+
+            await orchestrator._rebuild_pending_tool_runs(
+                session=imported_session,
+                agents=imported_agents,
+                workspace_manager=imported_workspace_manager,
+                root_loop=root_loop,
+                tracked_pending_ids=None,
+            )
+            refreshed_completed_worker_run = orchestrator.storage.load_tool_run(
+                running_completed_worker_run.id
+            )
+            self.assertIsNotNone(refreshed_completed_worker_run)
+            assert refreshed_completed_worker_run is not None
+            self.assertEqual(
+                str(refreshed_completed_worker_run.get("status", "")),
+                ToolRunStatus.ABANDONED.value,
             )
 
     async def test_clone_session_rejects_running_source_session(self) -> None:

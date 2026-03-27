@@ -375,6 +375,28 @@ class Orchestrator:
         ):
             self._run_loop_task.cancel()
 
+    async def _handle_session_run_cancellation(
+        self,
+        *,
+        session: RunSession,
+        agents: dict[str, AgentNode],
+        workspace_manager: WorkspaceManager,
+    ) -> bool:
+        if not self.interrupt_requested or session.status != SessionStatus.RUNNING:
+            return False
+        current_task = asyncio.current_task()
+        if current_task is not None and hasattr(current_task, "uncancel"):
+            while current_task.cancelling():
+                current_task.uncancel()
+        await self._mark_interrupted(
+            session=session,
+            agents=agents,
+            workspace_manager=workspace_manager,
+            pending_agent_ids=self._runtime_pending_agent_ids(agents),
+            root_loop=int(session.loop_index),
+        )
+        return True
+
     async def run_task(
         self,
         task: str,
@@ -559,6 +581,12 @@ class Orchestrator:
                     payload={"success": run_session_succeeded},
                 )
         except asyncio.CancelledError:
+            if await self._handle_session_run_cancellation(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+            ):
+                return session
             raise
         except Exception as exc:
             if session.status == SessionStatus.RUNNING:
@@ -566,8 +594,8 @@ class Orchestrator:
                     session=session,
                     agents=agents,
                     workspace_manager=workspace_manager,
-                    pending_agent_ids=[],
-                    root_loop=0,
+                    pending_agent_ids=self._runtime_pending_agent_ids(agents),
+                    root_loop=int(session.loop_index),
                     error=exc,
                 )
             raise
@@ -753,6 +781,25 @@ class Orchestrator:
                     agent=root_agent,
                     payload={"success": run_session_succeeded},
                 )
+        except asyncio.CancelledError:
+            if await self._handle_session_run_cancellation(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+            ):
+                return session
+            raise
+        except Exception as exc:
+            if session.status == SessionStatus.RUNNING:
+                await self._mark_failed(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=self._runtime_pending_agent_ids(agents),
+                    root_loop=int(session.loop_index),
+                    error=exc,
+                )
+            raise
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -2282,6 +2329,25 @@ class Orchestrator:
                     agent_id=session.root_agent_id,
                     payload={"success": run_session_succeeded},
                 )
+        except asyncio.CancelledError:
+            if await self._handle_session_run_cancellation(
+                session=session,
+                agents=agents,
+                workspace_manager=workspace_manager,
+            ):
+                return session
+            raise
+        except Exception as exc:
+            if session.status == SessionStatus.RUNNING:
+                await self._mark_failed(
+                    session=session,
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    pending_agent_ids=self._runtime_pending_agent_ids(agents),
+                    root_loop=int(session.loop_index),
+                    error=exc,
+                )
+            raise
         finally:
             if self._run_loop_task is asyncio.current_task():
                 self._run_loop_task = None
@@ -3098,6 +3164,11 @@ class Orchestrator:
             skip_tool_run_id=None,
             reason=(
                 f"Cancelled because session context import ({source}) paused active agents."
+            ),
+            terminal_status=(
+                ToolRunStatus.ABANDONED
+                if source == "resume"
+                else ToolRunStatus.CANCELLED
             ),
         )
         if paused_agent_ids:
@@ -6675,19 +6746,16 @@ class Orchestrator:
         force_wait: bool = False,
     ) -> dict[str, Any]:
         action_type = str(action.get("type", "")).strip()
-        if not action_type:
-            return {
-                "agent_result": {
-                    "error": "Action is missing a non-empty 'type'.",
-                }
-            }
         validation_error = self._validate_action_before_submit(agent=agent, action=action)
         if validation_error:
-            return {
-                "agent_result": {
-                    "error": validation_error,
-                }
-            }
+            return self._submit_failed_tool_run(
+                session=session,
+                agent=agent,
+                action=action,
+                action_type=action_type,
+                error=validation_error,
+                status_reason="failed_by_action_validation",
+            )
         run = ToolRun(
             id=self._new_tool_run_id(),
             session_id=session.id,
@@ -6807,6 +6875,81 @@ class Orchestrator:
                 run_id=run.id,
             ),
             "finish_payload": finish_payload,
+        }
+
+    def _submit_failed_tool_run(
+        self,
+        *,
+        session: RunSession,
+        agent: AgentNode,
+        action: dict[str, Any],
+        action_type: str,
+        error: str,
+        status_reason: str,
+    ) -> dict[str, Any]:
+        timestamp = utc_now()
+        run = ToolRun(
+            id=self._new_tool_run_id(),
+            session_id=session.id,
+            agent_id=agent.id,
+            tool_name=action_type or "invalid_action",
+            arguments={
+                key: value
+                for key, value in action.items()
+                if key not in {"_tool_call_id", "blocking"}
+            },
+            status=ToolRunStatus.FAILED,
+            blocking=True,
+            status_reason=status_reason,
+            result=None,
+            error=error,
+            created_at=timestamp,
+            started_at=timestamp,
+            completed_at=timestamp,
+        )
+        self.storage.upsert_tool_run(run)
+        self._log_agent_event(
+            agent,
+            event_type="tool_run_submitted",
+            phase="tool",
+            payload={
+                "tool_run_id": run.id,
+                "tool_name": run.tool_name,
+                "action": _public_action(action),
+            },
+        )
+        self._notify_tool_run_waiters(run.id)
+        self._log_agent_event(
+            agent,
+            event_type="tool_run_updated",
+            phase="tool",
+            payload={
+                "tool_run_id": run.id,
+                "tool_name": run.tool_name,
+                "status": run.status.value,
+                "error": error,
+            },
+        )
+        persisted_run = self.storage.load_tool_run(run.id) or {
+            "id": run.id,
+            "tool_name": run.tool_name,
+            "status": run.status.value,
+            "agent_id": run.agent_id,
+            "created_at": run.created_at,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "error": run.error,
+        }
+        return {
+            "agent_result": self._project_tool_result(
+                action=action,
+                raw_result={
+                    "error": error,
+                    "tool_run": persisted_run,
+                },
+                run_id=run.id,
+            ),
+            "finish_payload": None,
         }
 
     async def _execute_tool_run_background(
@@ -8058,6 +8201,8 @@ class Orchestrator:
         action: dict[str, Any],
     ) -> str | None:
         action_type = str(action.get("type", "")).strip()
+        if not action_type:
+            return "Action is missing a non-empty 'type'."
         if action_type == "finish":
             return validate_finish_action(agent.role, action)
         if action_type == "wait_time":
@@ -8743,7 +8888,7 @@ class Orchestrator:
 
             action_type = run.tool_name.strip()
             if not action_type:
-                self._mark_pending_tool_run_cancelled(
+                self._mark_pending_tool_run_abandoned(
                     run,
                     error="Cannot resume tool run with empty tool name.",
                 )
@@ -8766,7 +8911,7 @@ class Orchestrator:
 
             owner = agents.get(run.agent_id)
             if owner is None:
-                self._mark_pending_tool_run_cancelled(
+                self._mark_pending_tool_run_abandoned(
                     run,
                     error=(
                         f"Cannot resume tool run {run.id}: owner agent {run.agent_id} does not exist."
@@ -8775,7 +8920,7 @@ class Orchestrator:
                 skipped_count += 1
                 continue
             if not self._is_active_agent(owner):
-                self._mark_pending_tool_run_cancelled(
+                self._mark_pending_tool_run_abandoned(
                     run,
                     error=(
                         f"Cannot resume tool run {run.id}: owner agent {owner.id} is {owner.status.value}."
@@ -8839,7 +8984,7 @@ class Orchestrator:
     ) -> bool:
         parent = agents.get(run.agent_id)
         if parent is None:
-            self._mark_pending_tool_run_cancelled(
+            self._mark_pending_tool_run_abandoned(
                 run,
                 error=(
                     f"Cannot resume spawn tool run {run.id}: parent agent {run.agent_id} does not exist."
@@ -8849,7 +8994,7 @@ class Orchestrator:
         arguments = run.arguments if isinstance(run.arguments, dict) else {}
         child_id = str(arguments.get("child_agent_id", "")).strip()
         if not child_id:
-            self._mark_pending_tool_run_cancelled(
+            self._mark_pending_tool_run_abandoned(
                 run,
                 error=(
                     f"Cannot resume spawn tool run {run.id}: missing child_agent_id in arguments."
@@ -8858,7 +9003,7 @@ class Orchestrator:
             return False
         child = agents.get(child_id)
         if child is None:
-            self._mark_pending_tool_run_cancelled(
+            self._mark_pending_tool_run_abandoned(
                 run,
                 error=(
                     f"Cannot resume spawn tool run {run.id}: child agent {child_id} does not exist."
@@ -8905,10 +9050,10 @@ class Orchestrator:
         )
         return True
 
-    def _mark_pending_tool_run_cancelled(self, run: ToolRun, *, error: str) -> None:
+    def _mark_pending_tool_run_abandoned(self, run: ToolRun, *, error: str) -> None:
         if run.status.value in TERMINAL_TOOL_RUN_STATUSES:
             return
-        run.status = ToolRunStatus.CANCELLED
+        run.status = ToolRunStatus.ABANDONED
         run.status_reason = error
         run.error = error
         run.result = None
@@ -10175,6 +10320,7 @@ class Orchestrator:
         agent_ids: set[str],
         skip_tool_run_id: str | None,
         reason: str,
+        terminal_status: ToolRunStatus = ToolRunStatus.CANCELLED,
     ) -> list[str]:
         if not agent_ids:
             return []
@@ -10202,7 +10348,7 @@ class Orchestrator:
                 cancelled_run_ids.append(run_id)
                 continue
             pending = self._tool_run_from_record(refreshed)
-            pending.status = ToolRunStatus.CANCELLED
+            pending.status = terminal_status
             pending.status_reason = reason
             pending.result = None
             pending.error = reason

@@ -14,6 +14,7 @@ TERMINAL_TOOL_RUN_STATUSES = frozenset(
         ToolRunStatus.COMPLETED.value,
         ToolRunStatus.FAILED.value,
         ToolRunStatus.CANCELLED.value,
+        ToolRunStatus.ABANDONED.value,
     }
 )
 
@@ -30,6 +31,7 @@ KNOWN_TOOL_RUN_STATUSES = (
     ToolRunStatus.COMPLETED.value,
     ToolRunStatus.FAILED.value,
     ToolRunStatus.CANCELLED.value,
+    ToolRunStatus.ABANDONED.value,
 )
 KNOWN_TOOL_RUN_STATUS_SET = frozenset(KNOWN_TOOL_RUN_STATUSES)
 
@@ -350,7 +352,7 @@ def tool_run_metrics(
             if status == ToolRunStatus.FAILED.value:
                 failed_runs += 1
                 failed_or_cancelled_runs += 1
-            elif status == ToolRunStatus.CANCELLED.value:
+            elif status in {ToolRunStatus.CANCELLED.value, ToolRunStatus.ABANDONED.value}:
                 cancelled_runs += 1
                 failed_or_cancelled_runs += 1
 
@@ -551,7 +553,7 @@ def _update_group_metrics(
         row["terminal_runs"] = int(row["terminal_runs"]) + 1
         if status == ToolRunStatus.FAILED.value:
             row["failed_runs"] = int(row["failed_runs"]) + 1
-        elif status == ToolRunStatus.CANCELLED.value:
+        elif status in {ToolRunStatus.CANCELLED.value, ToolRunStatus.ABANDONED.value}:
             row["cancelled_runs"] = int(row["cancelled_runs"]) + 1
     if duration_ms is not None:
         row["durations_ms"].append(duration_ms)

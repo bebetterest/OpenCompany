@@ -1318,6 +1318,39 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(finished_result, dict)
             self.assertEqual(set(finished_result.keys()), {"accepted"})
 
+    async def test_submit_tool_run_validation_failure_persists_failed_tool_run(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-validation-failed-tool-run",
+            )
+
+            submitted = await orchestrator._submit_tool_run(
+                session=session,
+                agent=root,
+                action={"type": "finish", "status": "completed"},
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+            projected = submitted.get("agent_result")
+            assert isinstance(projected, dict)
+            self.assertFalse(bool(projected.get("accepted", True)))
+            self.assertIn("summary", str(projected.get("error", "")))
+
+            latest = orchestrator.list_tool_runs(session.id, limit=5)
+            self.assertEqual(len(latest), 1)
+            self.assertEqual(str(latest[0].get("tool_name", "")), "finish")
+            self.assertEqual(str(latest[0].get("status", "")), ToolRunStatus.FAILED.value)
+            self.assertEqual(
+                str(latest[0].get("status_reason", "")),
+                "failed_by_action_validation",
+            )
+            self.assertIn("summary", str(latest[0].get("error", "")))
+
     async def test_shell_inline_wait_completes_within_threshold(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)

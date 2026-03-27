@@ -106,7 +106,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 8. `list_tool_runs`
 - input: `status`, `limit`, `cursor`
 - output: `tool_runs_count`, `tool_runs`, `next_cursor`, `has_more`
-- status filter validation: `queued|running|completed|failed|cancelled`
+- status filter validation: `queued|running|completed|failed|cancelled|abandoned`
 
 9. `get_tool_run`
 - input: `tool_run_id`, `include_result` (default `false`)
@@ -152,7 +152,7 @@ Cursor encoding strategy:
 Every accepted tool action becomes a persisted `tool_run` with:
 
 - identity: `toolrun-*`
-- status: `queued` -> `running` -> `completed|failed|cancelled`
+- status: `queued` -> `running` -> `completed|failed|cancelled|abandoned`
 - timestamps: `created_at`, `started_at`, `completed_at`
 - payload: arguments, raw result, error
 - detail timeline: read from projected lifecycle rows (`tool_call_started`, `tool_call`, `tool_run_submitted`, `tool_run_updated`) keyed by `tool_run_id`

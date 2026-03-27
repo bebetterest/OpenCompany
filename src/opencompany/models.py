@@ -39,6 +39,7 @@ class ToolRunStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ABANDONED = "abandoned"
 
 
 class SteerRunStatus(str, Enum):

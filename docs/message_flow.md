@@ -60,7 +60,7 @@ Every action becomes a persisted `tool_run` record:
 - `session_id`, `agent_id`
 - `tool_name`, `arguments`
 - lifecycle timestamps (`created_at`, `started_at`, `completed_at`)
-- `status` (`queued`, `running`, `completed`, `failed`, `cancelled`)
+- `status` (`queued`, `running`, `completed`, `failed`, `cancelled`, `abandoned`)
 - raw `result` / `error`
 
 The runtime keeps two views of one tool execution:

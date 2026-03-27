@@ -92,8 +92,8 @@ class ToolRuntimeHelpersTests(unittest.TestCase):
         self.assertIn("unsupported field", str(error))
 
     def test_parse_tool_run_status_filters_validates_unknown_values(self) -> None:
-        statuses, invalid = parse_tool_run_status_filters(["running", "bad", "COMPLETED"])
-        self.assertEqual(statuses, ["running", "completed"])
+        statuses, invalid = parse_tool_run_status_filters(["running", "bad", "COMPLETED", "ABANDONED"])
+        self.assertEqual(statuses, ["running", "completed", "abandoned"])
         self.assertEqual(invalid, ["bad"])
 
     def test_steer_run_cursor_round_trip(self) -> None:

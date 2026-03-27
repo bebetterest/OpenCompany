@@ -60,7 +60,7 @@ messages = [{"role": "system", "content": system_prompt}, *prompt_window]
 - `session_id`、`agent_id`
 - `tool_name`、`arguments`
 - 生命周期时间戳（`created_at`、`started_at`、`completed_at`）
-- `status`（`queued`、`running`、`completed`、`failed`、`cancelled`）
+- `status`（`queued`、`running`、`completed`、`failed`、`cancelled`、`abandoned`）
 - 原始 `result` / `error`
 
 同一次工具执行在运行时维护两种视图：

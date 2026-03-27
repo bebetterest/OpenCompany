@@ -106,7 +106,7 @@ agent 可见工具返回采用精简投影协议：
 8. `list_tool_runs`
 - 输入：`status`、`limit`、`cursor`
 - 输出：`tool_runs_count`、`tool_runs`、`next_cursor`、`has_more`
-- 状态过滤校验：`queued|running|completed|failed|cancelled`
+- 状态过滤校验：`queued|running|completed|failed|cancelled|abandoned`
 
 9. `get_tool_run`
 - 输入：`tool_run_id`、`include_result`（默认 `false`）
@@ -152,7 +152,7 @@ agent 可见工具返回采用精简投影协议：
 每次通过校验的工具 action 都会写成持久化 `tool_run`：
 
 - 标识：`toolrun-*`
-- 状态：`queued` -> `running` -> `completed|failed|cancelled`
+- 状态：`queued` -> `running` -> `completed|failed|cancelled|abandoned`
 - 时间戳：`created_at`、`started_at`、`completed_at`
 - 负载：arguments、原始 result、error
 - 详情时间线：按 `tool_run_id` 读取投影后的生命周期行（`tool_call_started`、`tool_call`、`tool_run_submitted`、`tool_run_updated`）

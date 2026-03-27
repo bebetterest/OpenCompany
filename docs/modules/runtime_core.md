@@ -119,7 +119,7 @@ Worker agents:
 - `load_session_context(session_id)` is read-only metadata load: it returns the original persisted session row when available (checkpoint session payload is fallback), and it does not clone, import conversations, or mutate runtime state.
 - `clone_session(session_id)` creates an explicit deep copy of the session directory, checkpoints, message logs, events, tool runs, steer runs, and agent rows; clone lineage is recorded through `continued_from_session_id` and `continued_from_checkpoint_seq`.
 - `_import_session_context(session_id, source)` restores session + agent graph + workspaces from checkpoint, but reconstructs conversations from `*_messages.jsonl` first (checkpoint conversation is fallback only).
-- During import, active agents (`pending`/`running`) are normalized to `paused`, related queued/running tool runs are cancelled, and a fresh checkpoint is written immediately.
+- During import, active agents (`pending`/`running`) are normalized to `paused`; related queued/running tool runs become `cancelled` for `source=run` and `abandoned` for `source=resume`, then a fresh checkpoint is written immediately.
 - During import/resume, runnable agents are rebuilt from live agent statuses plus pending tool runs; stored `pending_agent_ids` are treated as derived metadata only.
 - Interrupt path marks active agents (`pending`/`running`) as `terminated`, cancels pending tool runs, marks session `interrupted`, and persists a checkpoint.
 - `continued_from_session_id` now originates only from explicit `clone_session(...)`; merely loading a session in UI/TUI/CLI no longer creates a new lineage node.
