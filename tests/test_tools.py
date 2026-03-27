@@ -217,6 +217,25 @@ class ToolDefinitionTests(unittest.TestCase):
         required = parameters.get("required")
         self.assertEqual(required, ["seconds"])
 
+    def test_wait_time_tool_schema_follows_runtime_configuration(self) -> None:
+        config = OpenCompanyConfig()
+        config.runtime.tools.wait_time_min_seconds = 4
+        config.runtime.tools.wait_time_max_seconds = 9
+        tools = tool_definitions_for_role(AgentRole.WORKER, "en", config=config)
+        wait_tool = _tool_by_name(tools, "wait_time")
+        function = wait_tool["function"]
+        assert isinstance(function, dict)
+        parameters = function["parameters"]
+        assert isinstance(parameters, dict)
+        properties = parameters["properties"]
+        assert isinstance(properties, dict)
+        seconds_schema = properties["seconds"]
+        assert isinstance(seconds_schema, dict)
+        self.assertEqual(seconds_schema.get("minimum"), 4)
+        self.assertEqual(seconds_schema.get("maximum"), 9)
+        self.assertIn(">= 4", str(seconds_schema.get("description")))
+        self.assertIn("<= 9", str(seconds_schema.get("description")))
+
     def test_compress_context_tool_schema_has_no_parameters(self) -> None:
         tools = tool_definitions_for_role(AgentRole.ROOT, "en")
         compress_tool = _tool_by_name(tools, "compress_context")

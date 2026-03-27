@@ -199,6 +199,8 @@ class RuntimeToolsConfig:
     list_default_limit: int = 20
     list_max_limit: int = 200
     shell_inline_wait_seconds: float = 5.0
+    wait_time_min_seconds: float = 10.0
+    wait_time_max_seconds: float = 60.0
 
     def tool_names_for_role(self, role: str) -> list[str]:
         if role == "root":
@@ -220,6 +222,19 @@ class RuntimeToolsConfig:
             numeric = default_limit
         return max(1, min(max_limit, numeric))
 
+    def wait_time_bounds(self) -> tuple[float, float]:
+        minimum = self.normalize_wait_time_bound_seconds(
+            self.wait_time_min_seconds,
+            fallback=10.0,
+        )
+        maximum = self.normalize_wait_time_bound_seconds(
+            self.wait_time_max_seconds,
+            fallback=60.0,
+        )
+        if maximum < minimum:
+            maximum = minimum
+        return minimum, maximum
+
     @staticmethod
     def normalize_shell_inline_wait_seconds(value: Any, *, fallback: float = 5.0) -> float:
         try:
@@ -239,6 +254,18 @@ class RuntimeToolsConfig:
                 "[runtime.tools].steer_agent_scope must be one of: " + allowed + "."
             )
         return normalized
+
+    @staticmethod
+    def normalize_wait_time_bound_seconds(value: Any, *, fallback: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(fallback)
+        if numeric <= 0:
+            numeric = float(fallback)
+        if numeric <= 0:
+            return 1.0
+        return float(numeric)
 
     @staticmethod
     def _coerce_positive_int(value: Any, *, fallback: int) -> int:
@@ -425,6 +452,14 @@ class OpenCompanyConfig:
             "shell_inline_wait_seconds",
             self.runtime.tools.shell_inline_wait_seconds,
         )
+        wait_time_min_seconds = tools.get(
+            "wait_time_min_seconds",
+            self.runtime.tools.wait_time_min_seconds,
+        )
+        wait_time_max_seconds = tools.get(
+            "wait_time_max_seconds",
+            self.runtime.tools.wait_time_max_seconds,
+        )
         normalized_list_default = RuntimeToolsConfig._coerce_positive_int(
             list_default_limit,
             fallback=self.runtime.tools.list_default_limit,
@@ -441,6 +476,16 @@ class OpenCompanyConfig:
             shell_inline_wait_seconds,
             fallback=self.runtime.tools.shell_inline_wait_seconds,
         )
+        normalized_wait_time_min_seconds = RuntimeToolsConfig.normalize_wait_time_bound_seconds(
+            wait_time_min_seconds,
+            fallback=self.runtime.tools.wait_time_min_seconds,
+        )
+        normalized_wait_time_max_seconds = RuntimeToolsConfig.normalize_wait_time_bound_seconds(
+            wait_time_max_seconds,
+            fallback=self.runtime.tools.wait_time_max_seconds,
+        )
+        if normalized_wait_time_max_seconds < normalized_wait_time_min_seconds:
+            normalized_wait_time_max_seconds = normalized_wait_time_min_seconds
         normalized_context = RuntimeContextConfig(
             enabled=bool(context.get("enabled", self.runtime.context.enabled)),
             reminder_ratio=RuntimeContextConfig.normalize_reminder_ratio(
@@ -534,6 +579,8 @@ class OpenCompanyConfig:
                 list_default_limit=normalized_list_default,
                 list_max_limit=normalized_list_max,
                 shell_inline_wait_seconds=normalized_shell_inline_wait_seconds,
+                wait_time_min_seconds=normalized_wait_time_min_seconds,
+                wait_time_max_seconds=normalized_wait_time_max_seconds,
             ),
         )
 

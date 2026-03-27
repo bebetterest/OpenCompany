@@ -152,6 +152,12 @@ list_max_limit = 200
 # shell 工具前台等待秒数；超时后会先返回当前输出并在后台继续运行
 # Foreground wait seconds for shell; after timeout it returns current output and continues in background
 shell_inline_wait_seconds = 10
+# wait_time 工具允许的最小等待秒数（需 > 0）
+# Minimum allowed wait_time duration in seconds (must be > 0)
+wait_time_min_seconds = 10
+# wait_time 工具允许的最大等待秒数（若配置小于最小值会自动提升到最小值）
+# Maximum allowed wait_time duration in seconds (auto-raised to min when configured lower)
+wait_time_max_seconds = 60
 
 
 # 上下文压缩与运行控制

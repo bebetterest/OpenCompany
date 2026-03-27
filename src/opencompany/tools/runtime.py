@@ -6,6 +6,7 @@ import math
 from datetime import UTC, datetime
 from typing import Any, Sequence
 
+from opencompany.config import RuntimeToolsConfig
 from opencompany.models import AgentRole, SteerRunStatus, ToolRunStatus
 from opencompany.utils import utc_now
 
@@ -52,8 +53,7 @@ _DURATION_BUCKETS: tuple[tuple[str, int | None], ...] = (
     (">=60s", None),
 )
 
-WAIT_TIME_MIN_SECONDS = 10.0
-WAIT_TIME_MAX_SECONDS = 60.0
+WAIT_TIME_MIN_SECONDS, WAIT_TIME_MAX_SECONDS = RuntimeToolsConfig().wait_time_bounds()
 
 
 def normalize_tool_run_limit(
@@ -258,12 +258,21 @@ def validate_finish_action(role: AgentRole, action: dict[str, Any]) -> str | Non
     return None
 
 
-def validate_wait_time_action(action: dict[str, Any]) -> str | None:
+def validate_wait_time_action(
+    action: dict[str, Any],
+    *,
+    minimum_seconds: float = WAIT_TIME_MIN_SECONDS,
+    maximum_seconds: float = WAIT_TIME_MAX_SECONDS,
+) -> str | None:
     allowed_keys = {"type", "_tool_call_id", "seconds"}
     unknown_keys = sorted(key for key in action.keys() if key not in allowed_keys)
     if unknown_keys:
         joined = ", ".join(f"'{key}'" for key in unknown_keys)
         return f"wait_time received unsupported field(s): {joined}."
+    min_seconds, max_seconds = _normalize_wait_time_bounds(
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
+    )
     raw_seconds = action.get("seconds")
     if raw_seconds is None:
         return "wait_time requires 'seconds'."
@@ -273,11 +282,29 @@ def validate_wait_time_action(action: dict[str, Any]) -> str | None:
         return "wait_time field 'seconds' must be a number."
     if not math.isfinite(seconds):
         return "wait_time field 'seconds' must be finite."
-    if seconds < WAIT_TIME_MIN_SECONDS:
-        return f"wait_time field 'seconds' must be >= {WAIT_TIME_MIN_SECONDS:g}."
-    if seconds > WAIT_TIME_MAX_SECONDS:
-        return f"wait_time field 'seconds' must be <= {WAIT_TIME_MAX_SECONDS:g}."
+    if seconds < min_seconds:
+        return f"wait_time field 'seconds' must be >= {min_seconds:g}."
+    if seconds > max_seconds:
+        return f"wait_time field 'seconds' must be <= {max_seconds:g}."
     return None
+
+
+def _normalize_wait_time_bounds(
+    *,
+    minimum_seconds: float,
+    maximum_seconds: float,
+) -> tuple[float, float]:
+    min_seconds = RuntimeToolsConfig.normalize_wait_time_bound_seconds(
+        minimum_seconds,
+        fallback=WAIT_TIME_MIN_SECONDS,
+    )
+    max_seconds = RuntimeToolsConfig.normalize_wait_time_bound_seconds(
+        maximum_seconds,
+        fallback=WAIT_TIME_MAX_SECONDS,
+    )
+    if max_seconds < min_seconds:
+        max_seconds = min_seconds
+    return min_seconds, max_seconds
 
 
 def validate_wait_run_action(action: dict[str, Any]) -> str | None:

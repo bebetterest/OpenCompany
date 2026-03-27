@@ -19,7 +19,7 @@ Current default tool set for root and worker:
 - `list_tool_runs`, `get_tool_run`, `wait_run`, `cancel_tool_run`
 - `finish`
 
-Role-specific availability is configurable via `[runtime.tools]`, including `steer_agent_scope` (`session` or `descendants`).
+Role-specific availability is configurable via `[runtime.tools]`, including `steer_agent_scope` (`session` or `descendants`) and `wait_time` bounds (`wait_time_min_seconds`/`wait_time_max_seconds`).
 
 ## MCP Tool and Resource Surface
 
@@ -55,7 +55,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 ## Per-Tool Contract
 
 1. `wait_time`
-- input: `seconds` (must be between `10` and `60`, inclusive)
+- input: `seconds` (must be within `[runtime.tools].wait_time_min_seconds`..`[runtime.tools].wait_time_max_seconds`, defaults `10`..`60`)
 - output success: `wait_time_status=true`
 - output failure: `wait_time_status=false` with optional `timed_out`, `timeout_seconds`, `error`
 
@@ -195,5 +195,5 @@ Every accepted tool action becomes a persisted `tool_run` with:
 ## Validation and Metrics
 
 - `validate_finish_action(...)` enforces role-field compatibility pre-execution
-- `validate_wait_time_action(...)` and `validate_wait_run_action(...)` enforce wait tool constraints
+- `validate_wait_time_action(...)` and `validate_wait_run_action(...)` enforce wait tool constraints (`wait_time` bounds come from `[runtime.tools]`).
 - `tool_run_metrics(...)` computes totals, status counts, failure/cancel ratios, duration quantiles/histogram, and per-tool/per-agent aggregates

@@ -91,16 +91,21 @@ empty_response_retries = 3
 list_default_limit = 80
 list_max_limit = 40
 shell_inline_wait_seconds = 2.5
+wait_time_min_seconds = 3.5
+wait_time_max_seconds = 2.0
 """.strip(),
                 encoding="utf-8",
             )
             config = OpenCompanyConfig.load(project_dir)
             default_limit, max_limit = config.runtime.tools.list_limit_bounds()
+            wait_time_min, wait_time_max = config.runtime.tools.wait_time_bounds()
             self.assertEqual(default_limit, 40)
             self.assertEqual(max_limit, 40)
             self.assertEqual(config.runtime.tools.normalize_list_limit(None), 40)
             self.assertEqual(config.runtime.tools.normalize_list_limit(5_000), 40)
             self.assertEqual(config.runtime.tools.shell_inline_wait_seconds, 2.5)
+            self.assertEqual(wait_time_min, 3.5)
+            self.assertEqual(wait_time_max, 3.5)
 
     def test_runtime_tools_shell_inline_wait_seconds_accepts_zero(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -7685,7 +7685,14 @@ class Orchestrator:
         *,
         action: dict[str, Any],
     ) -> dict[str, Any]:
-        validation_error = validate_wait_time_action(action)
+        wait_time_min_seconds, wait_time_max_seconds = (
+            self.config.runtime.tools.wait_time_bounds()
+        )
+        validation_error = validate_wait_time_action(
+            action,
+            minimum_seconds=wait_time_min_seconds,
+            maximum_seconds=wait_time_max_seconds,
+        )
         if validation_error:
             return {"wait_time_status": False, "error": validation_error}
         seconds = float(action["seconds"])
@@ -8206,7 +8213,14 @@ class Orchestrator:
         if action_type == "finish":
             return validate_finish_action(agent.role, action)
         if action_type == "wait_time":
-            return validate_wait_time_action(action)
+            wait_time_min_seconds, wait_time_max_seconds = (
+                self.config.runtime.tools.wait_time_bounds()
+            )
+            return validate_wait_time_action(
+                action,
+                minimum_seconds=wait_time_min_seconds,
+                maximum_seconds=wait_time_max_seconds,
+            )
         if action_type == "wait_run":
             return validate_wait_run_action(action)
         if action_type == "compress_context":

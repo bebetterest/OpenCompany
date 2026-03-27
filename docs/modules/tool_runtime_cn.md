@@ -19,7 +19,7 @@
 - `list_tool_runs`、`get_tool_run`、`wait_run`、`cancel_tool_run`
 - `finish`
 
-角色可用工具可通过 `[runtime.tools]` 配置，其中也包括 `steer_agent_scope`（`session` / `descendants`）。
+角色可用工具可通过 `[runtime.tools]` 配置，其中包括 `steer_agent_scope`（`session` / `descendants`）以及 `wait_time` 的上下限（`wait_time_min_seconds` / `wait_time_max_seconds`）。
 
 ## MCP 工具与资源表面
 
@@ -55,7 +55,7 @@ agent 可见工具返回采用精简投影协议：
 ## 逐工具协议
 
 1. `wait_time`
-- 输入：`seconds`（必须在 `10` 到 `60` 之间，含边界）
+- 输入：`seconds`（必须位于 `[runtime.tools].wait_time_min_seconds`..`[runtime.tools].wait_time_max_seconds` 范围内，默认 `10`..`60`）
 - 成功输出：`wait_time_status=true`
 - 失败输出：`wait_time_status=false`，并可带 `timed_out`、`timeout_seconds`、`error`
 
@@ -195,5 +195,5 @@ agent 可见工具返回采用精简投影协议：
 ## 校验与指标
 
 - `validate_finish_action(...)` 在执行前校验角色字段组合
-- `validate_wait_time_action(...)` 与 `validate_wait_run_action(...)` 校验等待工具约束
+- `validate_wait_time_action(...)` 与 `validate_wait_run_action(...)` 校验等待工具约束（`wait_time` 上下限来自 `[runtime.tools]`）
 - `tool_run_metrics(...)` 输出总量、状态分布、失败/取消率、耗时分位与直方图、按工具/agent 聚合

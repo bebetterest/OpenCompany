@@ -75,6 +75,33 @@ class ToolRuntimeHelpersTests(unittest.TestCase):
         self.assertIsNone(validate_wait_time_action({"type": "wait_time", "seconds": 10}))
         self.assertIn(">= 10", str(validate_wait_time_action({"type": "wait_time", "seconds": 9.99})))
         self.assertIn("<= 60", str(validate_wait_time_action({"type": "wait_time", "seconds": 60.01})))
+        self.assertIsNone(
+            validate_wait_time_action(
+                {"type": "wait_time", "seconds": 7},
+                minimum_seconds=3,
+                maximum_seconds=7,
+            )
+        )
+        self.assertIn(
+            ">= 3",
+            str(
+                validate_wait_time_action(
+                    {"type": "wait_time", "seconds": 2.9},
+                    minimum_seconds=3,
+                    maximum_seconds=7,
+                )
+            ),
+        )
+        self.assertIn(
+            "<= 7",
+            str(
+                validate_wait_time_action(
+                    {"type": "wait_time", "seconds": 7.1},
+                    minimum_seconds=3,
+                    maximum_seconds=7,
+                )
+            ),
+        )
 
     def test_wait_run_validation_requires_xor(self) -> None:
         self.assertIn(
