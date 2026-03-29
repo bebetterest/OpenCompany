@@ -276,6 +276,31 @@ class ToolDefinitionTests(unittest.TestCase):
         assert isinstance(include_result_schema, dict)
         self.assertEqual(include_result_schema.get("type"), "boolean")
 
+    def test_wait_run_schema_uses_descriptive_xor_without_top_level_oneof_not(self) -> None:
+        english_tools = tool_definitions_for_role(AgentRole.ROOT, "en")
+        chinese_tools = tool_definitions_for_role(AgentRole.WORKER, "zh")
+
+        wait_run_en = _tool_by_name(english_tools, "wait_run")
+        wait_run_zh = _tool_by_name(chinese_tools, "wait_run")
+        for tool in (wait_run_en, wait_run_zh):
+            function = tool["function"]
+            assert isinstance(function, dict)
+            parameters = function["parameters"]
+            assert isinstance(parameters, dict)
+            self.assertNotIn("oneOf", parameters)
+            self.assertNotIn("not", parameters)
+            properties = parameters["properties"]
+            assert isinstance(properties, dict)
+            self.assertIn("tool_run_id", properties)
+            self.assertIn("agent_id", properties)
+
+        wait_run_en_function = wait_run_en["function"]
+        wait_run_zh_function = wait_run_zh["function"]
+        assert isinstance(wait_run_en_function, dict)
+        assert isinstance(wait_run_zh_function, dict)
+        self.assertIn("exactly one", str(wait_run_en_function.get("description", "")))
+        self.assertIn("必须且只能提供一个", str(wait_run_zh_function.get("description", "")))
+
     def test_finish_schema_is_role_specific_and_has_no_blocking(self) -> None:
         root_tools = tool_definitions_for_role(AgentRole.ROOT, "en")
         worker_tools = tool_definitions_for_role(AgentRole.WORKER, "en")

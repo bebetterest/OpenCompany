@@ -334,41 +334,19 @@
     "type": "function",
     "function": {
       "name": "wait_run",
-      "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。",
+      "description": "阻塞等待指定 tool run 或 agent run 进入要求的终态。`tool_run_id` 与 `agent_id` 必须且只能提供一个；该约束由运行时校验。",
       "parameters": {
         "type": "object",
         "properties": {
           "tool_run_id": {
             "type": "string",
-            "description": "目标 tool run 的稳定 ID（前缀：toolrun-）。"
+            "description": "目标 tool run 的稳定 ID（前缀：toolrun-）。与 agent_id 互斥，且二选一。"
           },
           "agent_id": {
             "type": "string",
-            "description": "目标 agent 的稳定 ID（前缀：agent-）。"
+            "description": "目标 agent 的稳定 ID（前缀：agent-）。与 tool_run_id 互斥，且二选一。"
           }
         },
-        "oneOf": [
-          {
-            "required": [
-              "tool_run_id"
-            ],
-            "not": {
-              "required": [
-                "agent_id"
-              ]
-            }
-          },
-          {
-            "required": [
-              "agent_id"
-            ],
-            "not": {
-              "required": [
-                "tool_run_id"
-              ]
-            }
-          }
-        ],
         "additionalProperties": false
       }
     }

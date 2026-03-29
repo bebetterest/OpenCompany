@@ -334,41 +334,19 @@
     "type": "function",
     "function": {
       "name": "wait_run",
-      "description": "Block until a tool run or agent run reaches the required terminal state.",
+      "description": "Block until a tool run or agent run reaches the required terminal state. Provide exactly one target: tool_run_id or agent_id; runtime enforces this constraint.",
       "parameters": {
         "type": "object",
         "properties": {
           "tool_run_id": {
             "type": "string",
-            "description": "Target tool run id (prefix: toolrun-)."
+            "description": "Target tool run id (prefix: toolrun-). Mutually exclusive with agent_id; provide exactly one."
           },
           "agent_id": {
             "type": "string",
-            "description": "Target agent id (prefix: agent-)."
+            "description": "Target agent id (prefix: agent-). Mutually exclusive with tool_run_id; provide exactly one."
           }
         },
-        "oneOf": [
-          {
-            "required": [
-              "tool_run_id"
-            ],
-            "not": {
-              "required": [
-                "agent_id"
-              ]
-            }
-          },
-          {
-            "required": [
-              "agent_id"
-            ],
-            "not": {
-              "required": [
-                "tool_run_id"
-              ]
-            }
-          }
-        ],
         "additionalProperties": false
       }
     }

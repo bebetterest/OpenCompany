@@ -116,6 +116,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 
 10. `wait_run`
 - input: exactly one of `tool_run_id` or `agent_id`
+- schema compatibility note: to avoid provider-side tool schema rejections, this XOR rule is documented in field descriptions (not encoded as top-level `oneOf`/`not`)
 - output success: `wait_run_status=true`
 - output failure: `wait_run_status=false` with optional `timed_out`, `timeout_seconds`, `error`
 - agent wait success requires terminal status; `paused` is not a success state
