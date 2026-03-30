@@ -1963,6 +1963,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                             },
                             "finish_reason": "stop",
                             "native_finish_reason": "stop",
+                            "no_tool_calls": True,
                         }
                     ],
                 },

@@ -67,6 +67,13 @@ class ChatResult:
             "finish_reason": self.finish_reason,
             "native_finish_reason": self.native_finish_reason,
         }
+        if _no_tool_calls_termination(
+            tool_call_count=len(self.tool_calls),
+            finish_reason=self.finish_reason,
+            native_finish_reason=self.native_finish_reason,
+            response_error=self.response_error,
+        ):
+            choice["no_tool_calls"] = True
         if self.response_error is not None:
             choice["error"] = self.response_error
         payload = {
@@ -291,6 +298,12 @@ class OpenRouterClient:
                         "content": partial_content,
                         "reasoning": partial_reasoning,
                         "reasoning_details": partial_reasoning_details,
+                        "no_tool_calls": _no_tool_calls_termination(
+                            tool_call_count=len(partial_tool_calls),
+                            finish_reason=finish_reason,
+                            native_finish_reason=native_finish_reason,
+                            response_error=response_error,
+                        ),
                         "tool_calls": partial_tool_calls,
                         "stream": {
                             "raw_event_count": len(raw_events),
@@ -381,6 +394,12 @@ class OpenRouterClient:
                         "content": content,
                         "reasoning": reasoning,
                         "reasoning_details": reasoning_details,
+                        "no_tool_calls": _no_tool_calls_termination(
+                            tool_call_count=len(tool_calls),
+                            finish_reason=finish_reason,
+                            native_finish_reason=native_finish_reason,
+                            response_error=response_error,
+                        ),
                         "tool_calls": [
                             {
                                 "id": tool_call.id,
@@ -422,6 +441,12 @@ class OpenRouterClient:
                     "content": content,
                     "reasoning": reasoning,
                     "reasoning_details": reasoning_details,
+                    "no_tool_calls": _no_tool_calls_termination(
+                        tool_call_count=len(tool_calls),
+                        finish_reason=finish_reason,
+                        native_finish_reason=native_finish_reason,
+                        response_error=response_error,
+                    ),
                     "tool_calls": [
                         {
                             "id": tool_call.id,
@@ -725,6 +750,27 @@ def _final_response_object(stream_object: str | None) -> str:
     if stream_object == "chat.completion.chunk":
         return "chat.completion"
     return stream_object or "chat.completion"
+
+
+def _no_tool_calls_termination(
+    *,
+    tool_call_count: int,
+    finish_reason: str | None,
+    native_finish_reason: str | None,
+    response_error: dict[str, Any] | None,
+) -> bool:
+    if tool_call_count > 0:
+        return False
+    if response_error is not None:
+        return False
+    normalized_finish_reason = str(finish_reason or "").strip().lower()
+    normalized_native_finish_reason = str(native_finish_reason or "").strip().lower()
+    if (
+        normalized_finish_reason == "tool_calls"
+        or normalized_native_finish_reason == "tool_calls"
+    ):
+        return False
+    return bool(normalized_finish_reason or normalized_native_finish_reason)
 
 
 def _should_retry_empty_stream_response(
