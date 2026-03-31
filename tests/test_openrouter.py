@@ -363,16 +363,24 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
             max_retries=2,
             retry_backoff_seconds=0.0,
         )
+        retries: list[dict[str, object]] = []
+
+        async def _on_retry(payload: dict[str, object]) -> None:
+            retries.append(payload)
+
         with mock.patch("httpx.AsyncClient", _EmptyThenRecoverClient):
             result = await client.stream_chat(
                 model="openai/gpt-4o-mini",
                 messages=[{"role": "user", "content": "test"}],
                 temperature=0.1,
                 max_tokens=64,
+                on_retry=_on_retry,
             )
 
         self.assertEqual(result.content, "ok")
         self.assertEqual(_EmptyThenRecoverClient.attempts, 2)
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(str(retries[0].get("retry_reason", "")), "empty_stream_response")
 
     async def test_stream_chat_retries_remote_protocol_error_before_first_event(self) -> None:
         import httpx

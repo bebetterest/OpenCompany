@@ -87,6 +87,29 @@ class AgentRuntime:
         self.persist_agent(agent)
         if not llm_client:
             raise RuntimeError("OPENROUTER_API_KEY is required to run agents.")
+        overall_retry_attempt = 0
+
+        def next_overall_retry_attempt() -> int:
+            nonlocal overall_retry_attempt
+            overall_retry_attempt += 1
+            return overall_retry_attempt
+
+        def overall_retry_category(retry_reason: str) -> str:
+            normalized = str(retry_reason or "").strip().lower()
+            if normalized == "empty_protocol_response":
+                return "empty_protocol"
+            if normalized == "empty_stream_response":
+                return "empty_stream"
+            if normalized in {
+                "http_status_error",
+                "timeout",
+                "network_error",
+                "remote_protocol_error",
+                "transport_error",
+            }:
+                return "api_or_network"
+            return "unknown"
+
         async def on_token(token: str) -> None:
             self._log_agent_event(
                 agent,
@@ -104,11 +127,15 @@ class AgentRuntime:
             )
 
         async def on_retry(payload: dict[str, Any]) -> None:
+            retry_payload = dict(payload)
+            retry_reason = str(retry_payload.get("retry_reason", ""))
+            retry_payload["overall_retry_attempt"] = next_overall_retry_attempt()
+            retry_payload["overall_retry_category"] = overall_retry_category(retry_reason)
             self._log_agent_event(
                 agent,
                 event_type="llm_retry",
                 phase="llm",
-                payload=payload,
+                payload=retry_payload,
             )
 
         max_empty_response_retries = max(
@@ -405,19 +432,30 @@ class AgentRuntime:
                         0.0,
                         float(self.config.llm.openrouter.retry_backoff_seconds),
                     ) * (2 ** (protocol_retry_attempt - 1))
+                    retry_payload = {
+                        "attempt": protocol_retry_attempt,
+                        "max_attempts": max_empty_response_retries + 1,
+                        "max_retries": max_empty_response_retries,
+                        "next_attempt": protocol_retry_attempt + 1,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "retry_reason": "empty_protocol_response",
+                        "status_code": None,
+                        "status_text": None,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "response_id": result.response_id,
+                        "provider": result.provider,
+                        "model": result.model,
+                        "overall_retry_attempt": next_overall_retry_attempt(),
+                        "overall_retry_category": overall_retry_category(
+                            "empty_protocol_response"
+                        ),
+                    }
                     self._log_agent_event(
                         agent,
-                        event_type="protocol_retry",
+                        event_type="llm_retry",
                         phase="llm",
-                        payload={
-                            "reason": "empty_response",
-                            "attempt": protocol_retry_attempt,
-                            "max_retries": max_empty_response_retries,
-                            "retry_delay_seconds": retry_delay_seconds,
-                            "response_id": result.response_id,
-                            "provider": result.provider,
-                            "model": result.model,
-                        },
+                        payload=retry_payload,
                     )
                     if retry_delay_seconds > 0:
                         await asyncio.sleep(retry_delay_seconds)

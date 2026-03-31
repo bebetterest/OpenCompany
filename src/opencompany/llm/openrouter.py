@@ -420,7 +420,27 @@ class OpenRouterClient:
                     debug_agent_id=debug_agent_id,
                     debug_module=debug_module,
                 )
-                await asyncio.sleep(self._retry_delay_seconds(attempt=attempt))
+                retry_delay_seconds = self._retry_delay_seconds(attempt=attempt)
+                if on_retry is not None:
+                    retry_payload = {
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                        "max_retries": self.max_retries,
+                        "next_attempt": attempt + 2,
+                        "retry_delay_seconds": retry_delay_seconds,
+                        "retry_reason": "empty_stream_response",
+                        "status_code": status_code,
+                        "status_text": status_text,
+                        "error_type": "EmptyStreamResponse",
+                        "error": "Stream response was empty and produced no actionable output.",
+                    }
+                    try:
+                        maybe = on_retry(retry_payload)
+                        if hasattr(maybe, "__await__"):
+                            await maybe
+                    except Exception:
+                        pass
+                await asyncio.sleep(retry_delay_seconds)
                 attempt += 1
                 continue
             self._append_debug_record(

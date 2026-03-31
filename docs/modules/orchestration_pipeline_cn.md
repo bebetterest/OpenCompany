@@ -48,6 +48,7 @@
 空协议重试：
 
 - 仅在“结构性空响应且仍有重试额度”时触发
+- 每次空协议重试会以 `llm_retry` 事件记录（`retry_reason=empty_protocol_response`），并与 API/网络/空流重试共用统一统计口径
 - 否则注入 invalid-response 控制消息并走失败型 fallback `finish`
 
 ## 上下文组装与写入

@@ -757,10 +757,20 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                 event for event in events if event["event_type"] == "protocol_error"
             ]
             self.assertEqual(len(protocol_errors), 1)
-            protocol_retries = [
-                event for event in events if event["event_type"] == "protocol_retry"
+            llm_retries = [
+                event for event in events if event["event_type"] == "llm_retry"
             ]
-            self.assertEqual(len(protocol_retries), 1)
+            self.assertEqual(len(llm_retries), 1)
+            llm_retry_payload = json.loads(llm_retries[0]["payload_json"])
+            self.assertEqual(
+                str(llm_retry_payload.get("retry_reason", "")),
+                "empty_protocol_response",
+            )
+            self.assertEqual(int(llm_retry_payload.get("overall_retry_attempt", -1)), 1)
+            self.assertEqual(
+                str(llm_retry_payload.get("overall_retry_category", "")),
+                "empty_protocol",
+            )
             wait_tool_calls = []
             for event in events:
                 if event["event_type"] != "tool_call" or event["phase"] != "tool":
@@ -791,10 +801,20 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                 event for event in events if event["event_type"] == "protocol_error"
             ]
             self.assertEqual(len(protocol_errors), 2)
-            protocol_retries = [
-                event for event in events if event["event_type"] == "protocol_retry"
+            llm_retries = [
+                event for event in events if event["event_type"] == "llm_retry"
             ]
-            self.assertEqual(len(protocol_retries), 1)
+            self.assertEqual(len(llm_retries), 1)
+            llm_retry_payload = json.loads(llm_retries[0]["payload_json"])
+            self.assertEqual(
+                str(llm_retry_payload.get("retry_reason", "")),
+                "empty_protocol_response",
+            )
+            self.assertEqual(int(llm_retry_payload.get("overall_retry_attempt", -1)), 1)
+            self.assertEqual(
+                str(llm_retry_payload.get("overall_retry_category", "")),
+                "empty_protocol",
+            )
             session_failed = [
                 event for event in events if event["event_type"] == "session_failed"
             ]

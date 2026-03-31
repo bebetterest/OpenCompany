@@ -27,11 +27,13 @@ Retry behavior exists for:
 
 - transport/API failures before the first streamed event (`max_retries`, exponential backoff + jitter; retries all HTTP error status codes `4xx/5xx`, plus retryable transport errors, and respects server retry hints like `Retry-After`/`RateLimit-Reset` when present)
 - empty stream responses under guarded conditions
+- empty protocol responses with no JSON object (`empty_response_retries` in `AgentRuntime`)
 
 Runtime event logging for observability:
 
-- `llm_retry`: emitted when OpenRouter retries, including `status_code`, `status_text`, attempt counters, delay, and retry reason
+- `llm_retry`: unified retry event for API/network/empty-stream/empty-protocol retries, including `status_code`, `status_text`, per-source attempt counters, delay, retry reason, and unified fields (`overall_retry_attempt`, `overall_retry_category`)
 - `llm_request_error`: emitted when an OpenRouter request fails and bubbles up, including HTTP status metadata when available
+- `context_overflow_retry`: separate overflow-specific retry path (forced compression + retry), independent from `llm_retry` accounting
 
 ## Protocol Normalization
 
