@@ -780,6 +780,64 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                     wait_tool_calls.append(payload)
             self.assertEqual(wait_tool_calls, [])
 
+    async def test_worker_protocol_fallback_uses_progress_review_recommendation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            orchestrator.llm_client = RoutedLLMClient(
+                {
+                    "root": [
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "spawn_agent",
+                                        "name": "Inspect",
+                                        "instruction": "Inspect the repository",
+                                        "blocking": True,
+                                    }
+                                ]
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "finish",
+                                        "status": "partial",
+                                        "summary": "Root finalized after worker protocol fallback.",
+                                    }
+                                ]
+                            }
+                        ),
+                    ],
+                    "worker:Inspect the repository": [
+                        "This is a plain text response and not a valid protocol action payload."
+                    ],
+                }
+            )
+
+            session = await orchestrator.run_task("Inspect this project")
+            self.assertEqual(session.status.value, "completed")
+            self.assertEqual(
+                session.final_summary,
+                "Root finalized after worker protocol fallback.",
+            )
+
+            storage = Storage(project_dir / ".opencompany" / "opencompany.db")
+            agents = storage.load_agents(session.id)
+            worker = next(agent for agent in agents if agent["role"] == "worker")
+            self.assertEqual(worker["status"], "failed")
+            self.assertEqual(
+                worker["summary"],
+                "The agent produced an invalid protocol response.",
+            )
+            self.assertEqual(
+                worker["next_recommendation"],
+                "Review this agent's progress first, then plan and take the next steps.",
+            )
+
     async def test_root_protocol_fallback_exhausted_empty_responses_does_not_crash_runtime(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)

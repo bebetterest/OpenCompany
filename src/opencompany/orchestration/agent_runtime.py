@@ -490,7 +490,7 @@ class AgentRuntime:
                 }
                 if agent.role != AgentRole.ROOT:
                     fallback_finish["next_recommendation"] = (
-                        "Retry with more explicit instructions."
+                        "Review this agent's progress first, then plan and take the next steps."
                     )
                 return [
                     fallback_finish
