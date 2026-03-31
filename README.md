@@ -456,7 +456,7 @@ Key config groups:
 Current defaults in this repository include:
 
 - `[project].default_locale = "auto"` (follow system locale; fallback to English when locale is neither Chinese nor English)
-- `[llm.openrouter].model = "stepfun/step-3.5-flash:free"`
+- `[llm.openrouter].model = "qwen/qwen3.6-plus-preview:free"`
 - `[llm.openrouter].max_retries = 8`
 - `[runtime.tool_timeouts].default_seconds = 30`
 - `[runtime.tool_timeouts].shell_seconds = 300`

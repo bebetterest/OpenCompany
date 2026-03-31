@@ -28,7 +28,7 @@ class ProjectConfig:
 @dataclass(slots=True)
 class OpenRouterConfig:
     base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "openai/gpt-4o-mini"
+    model: str = "qwen/qwen3.6-plus-preview:free"
     coordinator_model: str = ""
     worker_model: str = ""
     timeout_seconds: int = 120

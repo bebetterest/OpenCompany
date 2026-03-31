@@ -18,7 +18,7 @@ data_dir = ".opencompany"
 base_url = "https://openrouter.ai/api/v1"
 # 默认模型（当未为不同角色单独指定模型时使用）
 # Default model (used when no per-role override is set)
-model = "stepfun/step-3.5-flash:free"
+model = "qwen/qwen3.6-plus-preview:free"
 # 协调者（root）专用模型；留空则使用 model
 # Coordinator (root) model override; empty means fallback to model
 coordinator_model = ""

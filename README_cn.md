@@ -456,7 +456,7 @@ opencompany terminal <session_id> --self-check
 当前仓库默认值包括：
 
 - `[project].default_locale = "auto"`（默认跟随系统语言；若系统语言不是中英文则回退到英文）
-- `[llm.openrouter].model = "stepfun/step-3.5-flash:free"`
+- `[llm.openrouter].model = "qwen/qwen3.6-plus-preview:free"`
 - `[llm.openrouter].max_retries = 8`
 - `[runtime.tool_timeouts].default_seconds = 30`
 - `[runtime.tool_timeouts].shell_seconds = 300`
