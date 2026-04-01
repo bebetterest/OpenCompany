@@ -3526,6 +3526,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
             launch_command = str(captured["command"])
             self.assertIn("&& exec ", launch_command)
+            self.assertIn("NODE_USE_ENV_PROXY=1", launch_command)
             self.assertIn("--settings", launch_command)
             self.assertIn(str(workspace_root), launch_command)
             self.assertIn("/bin/bash --noprofile --norc -i", launch_command)
@@ -3692,6 +3693,7 @@ backend = "none"
             self.assertIn("ControlPath=/tmp/opencompany-ssh/", launch_command)
             self.assertNotIn(".opencompany/remote_runtime", launch_command)
             self.assertIn("[opencompany][remote-setup]", launch_command)
+            self.assertIn("NODE_USE_ENV_PROXY=1", launch_command)
             self.assertIn("resolved_workspace_root", launch_command)
             self.assertIn("/bin/pwd -P", launch_command)
 

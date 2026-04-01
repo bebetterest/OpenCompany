@@ -4610,7 +4610,10 @@ class Orchestrator:
                     "resolved_workspace_root=\"$workspace_root\"; "
                     "if [ -d \"$workspace_root\" ]; then resolved_workspace_root=$(cd \"$workspace_root\" && /bin/pwd -P); fi; "
                     "cd \"$resolved_workspace_root\"; "
-                    f"exec srt --settings {remote_settings_path} /bin/bash --noprofile --norc -i"
+                    "exec env "
+                    f"{AnthropicSandboxBackend.NODE_USE_ENV_PROXY_VAR}="
+                    f"{shlex.quote(AnthropicSandboxBackend.NODE_USE_ENV_PROXY_DEFAULT)} "
+                    f"srt --settings {remote_settings_path} /bin/bash --noprofile --norc -i"
                 )
             control_path = self._remote_terminal_control_path(
                 normalized_session_id,
@@ -4706,6 +4709,11 @@ class Orchestrator:
             if runtime_command is None:
                 runtime_command = shlex.join(
                     [
+                        "env",
+                        (
+                            f"{AnthropicSandboxBackend.NODE_USE_ENV_PROXY_VAR}="
+                            f"{AnthropicSandboxBackend.NODE_USE_ENV_PROXY_DEFAULT}"
+                        ),
                         backend.resolve_cli_path(),
                         "--settings",
                         str(settings_path),

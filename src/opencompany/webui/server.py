@@ -190,6 +190,7 @@ def create_webui_app(
                         remote=remote_payload if isinstance(remote_payload, dict) else None,
                         remote_password=remote_password,
                         sandbox_backend=sandbox_backend_text,
+                        clear_runtime_context=False,
                     )
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc

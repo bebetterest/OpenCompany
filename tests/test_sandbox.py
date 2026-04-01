@@ -662,8 +662,50 @@ class AnthropicSandboxBackendRunCommandTests(unittest.IsolatedAsyncioTestCase):
             env = kwargs["env"]
             assert isinstance(env, dict)
             self.assertEqual(env["FOO"], "bar")
+            self.assertEqual(env["NODE_USE_ENV_PROXY"], "1")
             self.assertNotIn("BASH_ENV", env)
             self.assertNotIn("ENV", env)
+
+    async def test_run_command_respects_explicit_node_use_env_proxy_value(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            app_dir = root / "app"
+            workspace = root / "workspace"
+            app_dir.mkdir()
+            workspace.mkdir()
+            backend = AnthropicSandboxBackend(SandboxConfig(), app_dir)
+            request = ShellCommandRequest(
+                command="echo hello",
+                cwd=workspace,
+                workspace_root=workspace,
+                writable_paths=[workspace],
+                timeout_seconds=1,
+                environment={"NODE_USE_ENV_PROXY": "0"},
+            )
+            process = _CompletedProcess()
+            captured: dict[str, object] = {}
+
+            async def fake_create_subprocess_exec(*args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                return process
+
+            with mock.patch.object(backend, "resolve_cli_path", return_value="/fake/srt"), mock.patch.object(
+                backend,
+                "build_settings",
+                return_value={},
+            ), mock.patch(
+                "opencompany.sandbox.anthropic.asyncio.create_subprocess_exec",
+                new=fake_create_subprocess_exec,
+            ):
+                result = await backend.run_command(request)
+
+            self.assertEqual(result.exit_code, 0)
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            self.assertEqual(env["NODE_USE_ENV_PROXY"], "0")
 
     async def test_run_command_cancellation_terminates_process(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -986,6 +1028,10 @@ class AnthropicSandboxBackendRemoteTests(unittest.IsolatedAsyncioTestCase):
                 all("exec srt --settings ${HOME}/.opencompany_remote/session-1/settings.json" in cmd for cmd in exec_calls),
                 msg="Remote exec command should pass an expanded ${HOME}-based settings path, not a single-quoted literal.",
             )
+            self.assertTrue(
+                all("NODE_USE_ENV_PROXY=1" in cmd for cmd in exec_calls),
+                msg="Remote exec command should export NODE_USE_ENV_PROXY=1 before launching srt.",
+            )
 
     async def test_prepare_remote_runtime_request_includes_resolved_alias_paths(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1117,6 +1163,10 @@ class AnthropicSandboxBackendRemoteTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 any("cd /srv/project/workspace;" in command for command in commands),
                 msg="Remote exec command should cd into prepared runtime cwd.",
+            )
+            self.assertTrue(
+                any("NODE_USE_ENV_PROXY=1;" in command for command in commands),
+                msg="Remote exec command should export NODE_USE_ENV_PROXY before launching srt.",
             )
 
     async def test_run_ssh_command_deletes_password_temp_file(self) -> None:

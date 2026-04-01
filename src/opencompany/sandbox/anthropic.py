@@ -83,6 +83,8 @@ class AnthropicSandboxBackend(SandboxBackend):
     PROCESS_KILL_TIMEOUT_SECONDS = 5.0
     STREAM_DRAIN_TIMEOUT_SECONDS = 1.0
     REMOTE_DEPENDENCY_TIMEOUT_SECONDS = 600.0
+    NODE_USE_ENV_PROXY_VAR = "NODE_USE_ENV_PROXY"
+    NODE_USE_ENV_PROXY_DEFAULT = "1"
 
     def __init__(self, config: SandboxConfig, app_dir: Path) -> None:
         self.config = config
@@ -95,6 +97,25 @@ class AnthropicSandboxBackend(SandboxBackend):
         self._remote_contexts: dict[str, RemoteShellContext] = {}
         self._remote_gc_checked: set[str] = set()
         self._remote_resolved_paths: dict[str, dict[str, str]] = {}
+
+    def _runtime_env(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        if overrides:
+            env.update(overrides)
+        current_proxy_flag = str(env.get(self.NODE_USE_ENV_PROXY_VAR, "")).strip()
+        if not current_proxy_flag:
+            env[self.NODE_USE_ENV_PROXY_VAR] = self.NODE_USE_ENV_PROXY_DEFAULT
+        env.pop("BASH_ENV", None)
+        env.pop("ENV", None)
+        return env
+
+    def _node_use_env_proxy_value(self, environment: dict[str, str] | None = None) -> str:
+        if environment is None:
+            return self.NODE_USE_ENV_PROXY_DEFAULT
+        raw = str(environment.get(self.NODE_USE_ENV_PROXY_VAR, "")).strip()
+        if raw:
+            return raw
+        return self.NODE_USE_ENV_PROXY_DEFAULT
 
     def resolve_cli_path(self) -> str:
         if self._resolved_cli_path:
@@ -271,10 +292,7 @@ class AnthropicSandboxBackend(SandboxBackend):
             handle.flush()
             settings_path = handle.name
 
-        env = os.environ.copy()
-        env.update(request.environment)
-        env.pop("BASH_ENV", None)
-        env.pop("ENV", None)
+        env = self._runtime_env(request.environment)
 
         loop = asyncio.get_running_loop()
         started_at = loop.time()
@@ -393,10 +411,7 @@ class AnthropicSandboxBackend(SandboxBackend):
             handle.flush()
             settings_path = Path(handle.name)
 
-        env = os.environ.copy()
-        env.update(request.environment)
-        env.pop("BASH_ENV", None)
-        env.pop("ENV", None)
+        env = self._runtime_env(request.environment)
         sandbox_command = self.build_sandbox_command(request.command)
         process = await asyncio.create_subprocess_exec(
             cli_path,
@@ -549,9 +564,12 @@ class AnthropicSandboxBackend(SandboxBackend):
             self._remote_settings_hash[cache_key] = settings_hash
 
         sandbox_command = self.build_sandbox_command(runtime_request.command)
+        node_use_env_proxy_value = self._node_use_env_proxy_value(runtime_request.environment)
         remote_exec = (
             "set -euo pipefail; "
             "PATH=\"$HOME/.local/bin:$HOME/.npm/bin:$PATH\"; "
+            f"{self.NODE_USE_ENV_PROXY_VAR}={shlex.quote(node_use_env_proxy_value)}; "
+            f"export {self.NODE_USE_ENV_PROXY_VAR}; "
             f"cd {shlex.quote(str(runtime_request.cwd))}; "
             f"exec srt --settings {remote_settings_path} {sandbox_command}"
         )

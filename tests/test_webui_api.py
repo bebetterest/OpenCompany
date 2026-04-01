@@ -299,6 +299,49 @@ url = "https://example.com/mcp"
             self.assertEqual(captured["task"], "demo")
             self.assertEqual(captured["enabled_skill_ids"], ["skill-a", "skill-b"])
 
+    def test_run_reconfigure_preserves_runtime_selection_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            app = create_webui_app(app_dir=app_dir)
+            runtime_state = app.state.runtime_state
+            captured: dict[str, Any] = {}
+
+            def _fake_set_launch_config(**kwargs):  # type: ignore[no-untyped-def]
+                captured["set_launch_config_kwargs"] = kwargs
+                return {"ok": True}
+
+            async def _fake_start_run(
+                task: str,
+                model: str | None = None,
+                root_agent_name: str | None = None,
+                enabled_skill_ids: list[str] | None = None,
+                enabled_mcp_server_ids: list[str] | None = None,
+            ) -> dict[str, object]:
+                del model, root_agent_name, enabled_skill_ids, enabled_mcp_server_ids
+                captured["task"] = task
+                return {"ok": True}
+
+            runtime_state.set_launch_config = _fake_set_launch_config  # type: ignore[method-assign]
+            runtime_state.start_run = _fake_start_run  # type: ignore[method-assign]
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/run",
+                    json={
+                        "task": "demo",
+                        "project_dir": str(project_dir),
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(captured["task"], "demo")
+            self.assertFalse(
+                bool((captured.get("set_launch_config_kwargs") or {}).get("clear_runtime_context", True))
+            )
+
     def test_run_forwards_enabled_mcp_server_ids(self) -> None:
         with TemporaryDirectory() as temp_dir:
             app_dir = Path(temp_dir)

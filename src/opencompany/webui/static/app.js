@@ -45,6 +45,7 @@ const AGENT_MASONRY_COLUMN_GAP_PX = 10;
 const WORKFLOW_ACTIVITY_MAX_ENTRIES = 2000;
 const SESSION_ACTIVITY_WINDOW_LIMIT = 200;
 const SESSION_MESSAGE_WINDOW_LIMIT = 200;
+const SESSION_OLDER_MESSAGE_PAGE_LIMIT = 10;
 
 const state = {
   locale: "en",
@@ -224,6 +225,7 @@ const state = {
     cursor: null,
     beforeCursor: null,
     hasMoreBefore: false,
+    byAgent: new Map(),
     syncing: false,
     loadingOlder: false,
     timer: null,
@@ -1602,6 +1604,7 @@ function resetRuntimeViews() {
   state.messages.cursor = null;
   state.messages.beforeCursor = null;
   state.messages.hasMoreBefore = false;
+  state.messages.byAgent.clear();
   state.messages.syncing = false;
   state.messages.loadingOlder = false;
   if (state.messages.timer !== null) {
@@ -2052,10 +2055,14 @@ function ensureAgent(record, details) {
       stepEntries: new Map(),
       nextMessageStep: 1,
       lastMessageIndex: -1,
+      seenMessageIndexes: new Set(),
     };
     state.agents.set(agentId, agent);
     state.agentOrder.push(agentId);
     graphChanged = true;
+  }
+  if (!(agent.seenMessageIndexes instanceof Set)) {
+    agent.seenMessageIndexes = new Set();
   }
   if (record.parent_agent_id) {
     const parentAgentId = String(record.parent_agent_id);
@@ -2640,13 +2647,64 @@ function formatLabeledStructuredValue(label, value, { fallback = "" } = {}) {
 }
 
 function messageStepNumber(agent, record, role) {
+  const rawStepCount =
+    record && typeof record === "object" ? record.step_count : undefined;
+  const parsedStepCount = Number(rawStepCount);
+  if (Number.isFinite(parsedStepCount)) {
+    // Persisted message records may be replayed out of order when loading older pages.
+    // Always trust their own step count to avoid remapping old rows to the latest step.
+    return Math.max(1, Math.floor(parsedStepCount));
+  }
   const nextStep = Math.max(1, Number(agent.nextMessageStep || 1));
   const derivedStep = role === "assistant" ? nextStep : Math.max(1, nextStep - 1);
-  const explicitStep = safeInt(record && record.step_count, 0);
-  if (explicitStep > 0) {
-    return Math.max(derivedStep, explicitStep);
-  }
   return derivedStep;
+}
+
+function promptProjectionForRecord(record) {
+  const promptVisible =
+    typeof record.prompt_visible === "boolean"
+      ? record.prompt_visible
+      : !Boolean(record.internal) && !Boolean(record.exclude_from_context_compression);
+  const promptBucket =
+    typeof record.prompt_bucket === "string"
+      ? String(record.prompt_bucket).trim()
+      : Boolean(record.internal)
+        ? "internal"
+        : promptVisible
+          ? "tail"
+          : "hidden_middle";
+  return { promptVisible, promptBucket };
+}
+
+function isDisplayableRecord(record) {
+  if (!record || typeof record !== "object") {
+    return false;
+  }
+  const { promptVisible, promptBucket } = promptProjectionForRecord(record);
+  return promptVisible && promptBucket !== "internal";
+}
+
+function countNewLoadableOlderRecords(records, agent) {
+  if (!Array.isArray(records)) {
+    return 0;
+  }
+  const seenIndexes =
+    agent && agent.seenMessageIndexes instanceof Set ? agent.seenMessageIndexes : null;
+  let count = 0;
+  for (const record of records) {
+    if (!isDisplayableRecord(record)) {
+      continue;
+    }
+    if (String(record.prompt_bucket || "").trim() === "pinned") {
+      continue;
+    }
+    const messageIndex = safeInt(record && record.message_index, -1);
+    if (messageIndex >= 0 && seenIndexes && seenIndexes.has(messageIndex)) {
+      continue;
+    }
+    count += 1;
+  }
+  return count;
 }
 
 function applyMessageRecord(record) {
@@ -2666,21 +2724,13 @@ function applyMessageRecord(record) {
     return;
   }
   const messageIndex = safeInt(record.message_index, -1);
-  if (messageIndex <= Number(agent.lastMessageIndex || -1)) {
+  if (messageIndex >= 0 && agent.seenMessageIndexes.has(messageIndex)) {
     return;
   }
-  const promptVisible =
-    typeof record.prompt_visible === "boolean"
-      ? record.prompt_visible
-      : !Boolean(record.internal) && !Boolean(record.exclude_from_context_compression);
-  const promptBucket =
-    typeof record.prompt_bucket === "string"
-      ? String(record.prompt_bucket).trim()
-      : Boolean(record.internal)
-        ? "internal"
-        : promptVisible
-          ? "tail"
-          : "hidden_middle";
+  if (messageIndex >= 0) {
+    agent.seenMessageIndexes.add(messageIndex);
+  }
+  const { promptVisible, promptBucket } = promptProjectionForRecord(record);
   const hiddenFromStepView = !promptVisible || promptBucket === "internal";
   if (hiddenFromStepView) {
     agent.lastMessageIndex = Math.max(Number(agent.lastMessageIndex || -1), messageIndex);
@@ -2688,7 +2738,6 @@ function applyMessageRecord(record) {
   }
   const role = String(record.role || "").trim();
   const message = record.message && typeof record.message === "object" ? record.message : {};
-  const explicitStep = safeInt(record.step_count, 0);
   const stepNumber = messageStepNumber(agent, record, role);
   clearPreviewEntries(agent, stepNumber);
 
@@ -2754,7 +2803,7 @@ function applyMessageRecord(record) {
       agent.stepCount = Math.max(Number(agent.stepCount || 0), stepNumber);
     }
   }
-  agent.lastMessageIndex = messageIndex;
+  agent.lastMessageIndex = Math.max(Number(agent.lastMessageIndex || -1), messageIndex);
 }
 
 function applyMessageRecords(records) {
@@ -2809,6 +2858,11 @@ function resetAgentMessageEntries({ preserveNonMessage = true } = {}) {
     agent.stepOrder = [];
     agent.nextMessageStep = 1;
     agent.lastMessageIndex = -1;
+    if (agent.seenMessageIndexes instanceof Set) {
+      agent.seenMessageIndexes.clear();
+    } else {
+      agent.seenMessageIndexes = new Set();
+    }
     agent.outputTokensTotal = 0;
     agent.isGenerating = false;
   }
@@ -3952,20 +4006,311 @@ async function loadSessionEvents(sessionId) {
   state.activity.beforeCursor =
     payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
   state.activity.hasMoreBefore = Boolean(payload && payload.has_more_before);
-  await loadSessionMessages(sessionId);
+  await loadSessionMessages(sessionId, { agentRows: snapshotAgents });
   if (snapshotAgents.length > 0) {
     applyAgentSnapshot(snapshotAgents);
   }
   scheduleRender();
 }
 
-async function loadSessionMessages(sessionId) {
+function hasAgentSummaryWindow(agentRow) {
+  if (!agentRow || typeof agentRow !== "object") {
+    return false;
+  }
+  const summaryVersion = coerceNonNegativeInt(agentRow.summary_version);
+  if (summaryVersion !== null && summaryVersion > 0) {
+    return true;
+  }
+  const summaryText = String(agentRow.context_latest_summary || "").trim();
+  if (summaryText) {
+    return true;
+  }
+  const summarizedUntil = Number(agentRow.summarized_until_message_index);
+  return Number.isFinite(summarizedUntil) && Math.floor(summarizedUntil) >= 0;
+}
+
+function pinnedKeepCount(agentRow) {
+  const configured = coerceNonNegativeInt(agentRow && agentRow.keep_pinned_messages);
+  if (configured !== null) {
+    return configured;
+  }
+  const fallback = coerceNonNegativeInt(state.runtime.keep_pinned_messages);
+  return fallback === null ? 1 : fallback;
+}
+
+function loadedPinnedAgentIds(records) {
+  const pinned = new Set();
+  if (!Array.isArray(records)) {
+    return pinned;
+  }
+  for (const record of records) {
+    if (!record || typeof record !== "object") {
+      continue;
+    }
+    if (String(record.prompt_bucket || "").trim() !== "pinned") {
+      continue;
+    }
+    const agentId = String(record.agent_id || "").trim();
+    if (agentId) {
+      pinned.add(agentId);
+    }
+  }
+  return pinned;
+}
+
+function fallbackAgentRowsFromState() {
+  return state.agentOrder
+    .map((agentId) => state.agents.get(agentId))
+    .filter((agent) => agent !== undefined)
+    .map((agent) => ({
+      id: agent.id,
+      keep_pinned_messages: agent.keepPinnedMessages,
+      summary_version: agent.summaryVersion,
+      context_latest_summary: agent.contextLatestSummary,
+      summarized_until_message_index: agent.summarizedUntilMessageIndex,
+    }));
+}
+
+function ensureAgentMessageHistoryState(agentId) {
+  const normalizedAgentId = String(agentId || "").trim();
+  if (!normalizedAgentId) {
+    return null;
+  }
+  if (!state.messages.byAgent.has(normalizedAgentId)) {
+    state.messages.byAgent.set(normalizedAgentId, {
+      beforeCursor: null,
+      hasMoreBefore: false,
+      loadingOlder: false,
+      loadedStepFloor: null,
+    });
+  }
+  const history = state.messages.byAgent.get(normalizedAgentId) || null;
+  if (!history) {
+    return null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(history, "loadedStepFloor")) {
+    history.loadedStepFloor = null;
+  }
+  return history;
+}
+
+function collectHistoryAgentIds({ agentRows = null, records = [] } = {}) {
+  const ids = new Set();
+  if (Array.isArray(agentRows)) {
+    for (const row of agentRows) {
+      if (!row || typeof row !== "object") {
+        continue;
+      }
+      const agentId = String(row.id || row.agent_id || "").trim();
+      if (agentId) {
+        ids.add(agentId);
+      }
+    }
+  }
+  if (Array.isArray(records)) {
+    for (const record of records) {
+      if (!record || typeof record !== "object") {
+        continue;
+      }
+      const agentId = String(record.agent_id || "").trim();
+      if (agentId) {
+        ids.add(agentId);
+      }
+    }
+  }
+  for (const agentId of state.agentOrder) {
+    const normalized = String(agentId || "").trim();
+    if (normalized) {
+      ids.add(normalized);
+    }
+  }
+  return [...ids];
+}
+
+async function refreshAgentMessageHistoryState(sessionId, { agentRows = null, records = [] } = {}) {
+  if (!sessionId) {
+    return;
+  }
+  const agentIds = collectHistoryAgentIds({ agentRows, records });
+  if (agentIds.length === 0) {
+    return;
+  }
+  const results = await Promise.all(
+    agentIds.map(async (agentId) => {
+      try {
+        const query = new URLSearchParams({
+          agent_id: agentId,
+          limit: "1",
+          tail: "1",
+        });
+        const payload = await fetchJson(
+          `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
+        );
+        const rows = payload && Array.isArray(payload.messages) ? payload.messages : [];
+        const latestRecord = rows.length > 0 ? rows[rows.length - 1] : null;
+        const latestStepRaw =
+          latestRecord && typeof latestRecord === "object" ? Number(latestRecord.step_count) : Number.NaN;
+        const latestStep = Number.isFinite(latestStepRaw) && latestStepRaw > 0 ? Math.floor(latestStepRaw) : null;
+        return {
+          agentId,
+          beforeCursor:
+            payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null,
+          hasMoreBefore: Boolean(
+            payload &&
+              payload.has_more_before &&
+              typeof payload.before_cursor === "string" &&
+              String(payload.before_cursor || "").trim()
+          ),
+          latestStep,
+        };
+      } catch (_error) {
+        return {
+          agentId,
+          beforeCursor: null,
+          hasMoreBefore: false,
+          latestStep: null,
+        };
+      }
+    })
+  );
+  for (const row of results) {
+    const history = ensureAgentMessageHistoryState(row.agentId);
+    if (!history) {
+      continue;
+    }
+    history.beforeCursor = row.beforeCursor;
+    history.hasMoreBefore = Boolean(row.hasMoreBefore);
+    const latestStep = coerceNonNegativeInt(row.latestStep);
+    const existingLoadedStep = coerceNonNegativeInt(history.loadedStepFloor);
+    if (latestStep === null || latestStep <= 0) {
+      history.loadedStepFloor = existingLoadedStep === null || existingLoadedStep <= 0 ? null : existingLoadedStep;
+    } else if (existingLoadedStep === null || existingLoadedStep <= 0) {
+      history.loadedStepFloor = latestStep;
+    } else {
+      history.loadedStepFloor = Math.min(existingLoadedStep, latestStep);
+    }
+    if (!history.hasMoreBefore) {
+      history.loadingOlder = false;
+    }
+  }
+}
+
+function updateLoadedStepFloorFromRecords(records) {
+  if (!Array.isArray(records)) {
+    return;
+  }
+  for (const record of records) {
+    if (!record || typeof record !== "object") {
+      continue;
+    }
+    if (String(record.prompt_bucket || "").trim() === "pinned") {
+      continue;
+    }
+    const agentId = String(record.agent_id || "").trim();
+    if (!agentId) {
+      continue;
+    }
+    const stepCount = Number(record.step_count);
+    if (!Number.isFinite(stepCount) || stepCount <= 0) {
+      continue;
+    }
+    const normalizedStep = Math.floor(stepCount);
+    const history = ensureAgentMessageHistoryState(agentId);
+    if (!history) {
+      continue;
+    }
+    const existing = Number(history.loadedStepFloor);
+    if (!Number.isFinite(existing) || existing <= 0) {
+      history.loadedStepFloor = normalizedStep;
+      continue;
+    }
+    history.loadedStepFloor = Math.min(existing, normalizedStep);
+  }
+}
+
+async function fetchPinnedHeadRecords(sessionId, { agentRows = [], existingRecords = [] } = {}) {
+  if (!sessionId) {
+    return [];
+  }
+  const candidates = Array.isArray(agentRows) && agentRows.length > 0 ? agentRows : fallbackAgentRowsFromState();
+  if (candidates.length === 0) {
+    return [];
+  }
+  const pinnedLoaded = loadedPinnedAgentIds(existingRecords);
+  const requests = [];
+  for (const row of candidates) {
+    if (!row || typeof row !== "object") {
+      continue;
+    }
+    const agentId = String(row.id || row.agent_id || "").trim();
+    if (!agentId || pinnedLoaded.has(agentId)) {
+      continue;
+    }
+    if (!hasAgentSummaryWindow(row)) {
+      continue;
+    }
+    const keepCount = pinnedKeepCount(row);
+    if (keepCount <= 0) {
+      continue;
+    }
+    requests.push({
+      agentId,
+      limit: Math.max(20, Math.min(120, keepCount * 10)),
+    });
+  }
+  if (requests.length === 0) {
+    return [];
+  }
+  const chunks = await Promise.all(
+    requests.map(async ({ agentId, limit }) => {
+      try {
+        const query = new URLSearchParams({
+          agent_id: agentId,
+          limit: String(limit),
+        });
+        const payload = await fetchJson(
+          `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
+        );
+        const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
+        return records.filter(
+          (record) =>
+            record &&
+            typeof record === "object" &&
+            String(record.agent_id || "").trim() === agentId &&
+            String(record.prompt_bucket || "").trim() === "pinned"
+        );
+      } catch (_error) {
+        return [];
+      }
+    })
+  );
+  const collected = [];
+  const seen = new Set();
+  for (const records of chunks) {
+    for (const record of records) {
+      const agentId = String(record.agent_id || "").trim();
+      const messageIndex = safeInt(record.message_index, -1);
+      const dedupeKey = `${agentId}:${messageIndex}`;
+      if (agentId && messageIndex >= 0 && seen.has(dedupeKey)) {
+        continue;
+      }
+      if (agentId && messageIndex >= 0) {
+        seen.add(dedupeKey);
+      }
+      collected.push(record);
+    }
+  }
+  return collected;
+}
+
+async function loadSessionMessages(sessionId, { agentRows = null } = {}) {
   if (!sessionId) {
     return;
   }
   state.messages.cursor = null;
   state.messages.beforeCursor = null;
   state.messages.hasMoreBefore = false;
+  state.messages.byAgent.clear();
   resetAgentMessageEntries({ preserveNonMessage: false });
   const query = new URLSearchParams({
     limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
@@ -3977,7 +4322,20 @@ async function loadSessionMessages(sessionId) {
   const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
   if (records.length > 0) {
     applyMessageRecords(records);
+    updateLoadedStepFloorFromRecords(records);
   }
+  const pinnedHeadRecords = await fetchPinnedHeadRecords(sessionId, {
+    agentRows: Array.isArray(agentRows) ? agentRows : null,
+    existingRecords: records,
+  });
+  if (pinnedHeadRecords.length > 0) {
+    applyMessageRecords(pinnedHeadRecords);
+    updateLoadedStepFloorFromRecords(pinnedHeadRecords);
+  }
+  await refreshAgentMessageHistoryState(sessionId, {
+    agentRows: Array.isArray(agentRows) ? agentRows : null,
+    records: [...records, ...pinnedHeadRecords],
+  });
   state.messages.cursor =
     payload && typeof payload.next_cursor === "string" ? payload.next_cursor : null;
   state.messages.beforeCursor =
@@ -4015,35 +4373,76 @@ async function loadOlderActivity() {
   }
 }
 
-async function loadOlderMessages() {
+async function loadOlderMessagesForAgent(agentId) {
   const sessionId = activeSessionId();
-  const beforeCursor = String(state.messages.beforeCursor || "").trim();
-  if (!sessionId || !beforeCursor || state.messages.loadingOlder) {
+  const normalizedAgentId = String(agentId || "").trim();
+  const history = ensureAgentMessageHistoryState(normalizedAgentId);
+  const agent = state.agents.get(normalizedAgentId) || null;
+  const summaryMode = hasContextSummary(agent);
+  const latestCompactedStep = summaryMode ? latestCompactedStepForAgent(agent) : null;
+  const beforeCursor = String(history && history.beforeCursor ? history.beforeCursor : "").trim();
+  if (!sessionId || !normalizedAgentId || !history || !beforeCursor || history.loadingOlder) {
     return;
   }
-  state.messages.loadingOlder = true;
+  history.loadingOlder = true;
   state.agentPanel.preserveScrollNextRender = true;
   state.agentPanel.preservedScrollTop = dom.agentsLive.scrollTop;
   state.agentPanel.preservedScrollHeight = dom.agentsLive.scrollHeight;
   state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
   scheduleRender();
   try {
-    const query = new URLSearchParams({
-      limit: String(SESSION_MESSAGE_WINDOW_LIMIT),
-      before: beforeCursor,
-    });
-    const payload = await fetchJson(
-      `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
-    );
-    const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
-    if (records.length > 0) {
-      applyMessageRecords(records);
+    let cursor = beforeCursor;
+    let hasMoreBefore = true;
+    let loadedVisibleCount = 0;
+    for (let pageIndex = 0; pageIndex < 200; pageIndex += 1) {
+      if (!cursor || !hasMoreBefore || loadedVisibleCount >= SESSION_OLDER_MESSAGE_PAGE_LIMIT) {
+        break;
+      }
+      const remaining = Math.max(1, SESSION_OLDER_MESSAGE_PAGE_LIMIT - loadedVisibleCount);
+      const query = new URLSearchParams({
+        agent_id: normalizedAgentId,
+        limit: String(remaining),
+        before: cursor,
+      });
+      const payload = await fetchJson(
+        `/api/session/${encodeURIComponent(sessionId)}/messages?${query.toString()}`
+      );
+      const records = payload && Array.isArray(payload.messages) ? payload.messages : [];
+      const newVisibleCount = countNewLoadableOlderRecords(records, agent);
+      if (records.length > 0) {
+        applyMessageRecords(records);
+        updateLoadedStepFloorFromRecords(records);
+      }
+      loadedVisibleCount += newVisibleCount;
+      const nextBeforeCursor =
+        payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
+      const nextHasMoreBefore = Boolean(
+        payload &&
+          payload.has_more_before &&
+          typeof payload.before_cursor === "string" &&
+          String(payload.before_cursor || "").trim()
+      );
+      if (nextHasMoreBefore && nextBeforeCursor && nextBeforeCursor === cursor) {
+        hasMoreBefore = false;
+        cursor = nextBeforeCursor;
+        break;
+      }
+      hasMoreBefore = nextHasMoreBefore;
+      cursor = nextBeforeCursor;
+      const loadedStepFloor = coerceNonNegativeInt(history.loadedStepFloor);
+      if (
+        summaryMode &&
+        latestCompactedStep !== null &&
+        loadedStepFloor !== null &&
+        loadedStepFloor <= latestCompactedStep
+      ) {
+        break;
+      }
     }
-    state.messages.beforeCursor =
-      payload && typeof payload.before_cursor === "string" ? payload.before_cursor : null;
-    state.messages.hasMoreBefore = Boolean(payload && payload.has_more_before);
+    history.beforeCursor = cursor;
+    history.hasMoreBefore = hasMoreBefore;
   } finally {
-    state.messages.loadingOlder = false;
+    history.loadingOlder = false;
     markAgentPanelDirty();
     scheduleRender();
   }
@@ -5665,24 +6064,7 @@ function renderAgentPanel() {
     state.agentPanel.lastRenderedAt = now;
     return;
   }
-  const historyControls = `
-    <div class="history-controls">
-      <div class="entry-sub">${escapeHtml(t("recent_history_window_note"))}</div>
-      ${
-        state.messages.hasMoreBefore
-          ? `<button
-                type="button"
-                class="history-load-button"
-                data-action="load-older-messages"
-                ${state.messages.loadingOlder ? "disabled" : ""}
-              >${escapeHtml(
-                state.messages.loadingOlder ? t("loading") : t("load_older_messages")
-              )}</button>`
-          : ""
-      }
-    </div>
-  `;
-  dom.agentsLive.innerHTML = `${historyControls}${renderAgentMasonryLayout(agents)}`;
+  dom.agentsLive.innerHTML = `${renderAgentMasonryLayout(agents)}`;
   if (preserveScrollNextRender && Number.isFinite(preservedScrollTop)) {
     const heightDelta = Number.isFinite(preservedScrollHeight)
       ? Math.max(0, dom.agentsLive.scrollHeight - preservedScrollHeight)
@@ -6184,7 +6566,7 @@ function renderAgentCard(agent) {
           <div class="agent-link-wrap">${childButtons}</div>
         </div>
       </div>
-      <div class="agent-stream-list">${renderStepGroups(agent, stepGroups)}</div>
+      <div class="agent-stream-list">${renderStepGroups(agent, stepGroups, { showHistoryLoader: true })}</div>
     </section>
   `;
 }
@@ -6387,11 +6769,68 @@ function renderStreamEntry(entry) {
   `;
 }
 
-function renderStepGroups(agent, groups) {
-  if (!Array.isArray(groups) || groups.length === 0) {
-    return `<div class="entry-sub">${escapeHtml(t("no_active_stream"))}</div>`;
+function latestCompactedStepForAgent(agent) {
+  const stepEnds = [];
+  const lastRange = normalizeRange(agent && agent.lastCompactedStepRange);
+  if (lastRange) {
+    stepEnds.push(lastRange.end);
   }
-  return `<div class="step-group-list">${groups
+  const ranges = Array.isArray(agent && agent.compactedStepRanges) ? agent.compactedStepRanges : [];
+  for (const row of ranges) {
+    const normalized = normalizeRange(row);
+    if (normalized) {
+      stepEnds.push(normalized.end);
+    }
+  }
+  if (stepEnds.length === 0) {
+    return null;
+  }
+  return Math.max(...stepEnds);
+}
+
+function shouldShowOlderButtonForAgent(agent, historyState) {
+  if (
+    !historyState ||
+    !historyState.hasMoreBefore ||
+    !String(historyState.beforeCursor || "").trim()
+  ) {
+    return false;
+  }
+  if (!hasContextSummary(agent)) {
+    return true;
+  }
+  const latestCompactedStep = latestCompactedStepForAgent(agent);
+  if (latestCompactedStep === null) {
+    return true;
+  }
+  const loadedStepFloor = coerceNonNegativeInt(historyState.loadedStepFloor);
+  if (loadedStepFloor === null) {
+    return true;
+  }
+  return loadedStepFloor > latestCompactedStep;
+}
+
+function renderStepGroups(agent, groups, options = {}) {
+  const normalizedAgentId = String((agent && agent.id) || "").trim();
+  const historyState = normalizedAgentId ? ensureAgentMessageHistoryState(normalizedAgentId) : null;
+  const showHistoryLoader =
+    Boolean(options.showHistoryLoader) && shouldShowOlderButtonForAgent(agent, historyState);
+  const loadingOlder = Boolean(historyState && historyState.loadingOlder);
+  const historyLoader = showHistoryLoader
+    ? `<div class="stream-history-inline">
+        <button
+          type="button"
+          class="history-load-button"
+          data-action="load-older-messages"
+          data-agent-id="${escapeHtml(normalizedAgentId)}"
+          ${loadingOlder ? "disabled" : ""}
+        >${escapeHtml(loadingOlder ? t("loading") : t("load_older_messages"))}</button>
+      </div>`
+    : "";
+  if (!Array.isArray(groups) || groups.length === 0) {
+    return `${historyLoader}<div class="entry-sub">${escapeHtml(t("no_active_stream"))}</div>`;
+  }
+  return `<div class="step-group-list">${historyLoader}${groups
     .map((group) => {
       const step = Number(group.step);
       if (!Number.isFinite(step)) {
@@ -9503,7 +9942,8 @@ function bindEvents() {
     }
     const action = button.getAttribute("data-action");
     if (action === "load-older-messages") {
-      void loadOlderMessages();
+      const agentId = button.getAttribute("data-agent-id") || "";
+      void loadOlderMessagesForAgent(agentId);
       return;
     }
     if (action === "copy-agent-id") {

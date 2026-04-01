@@ -1,0 +1,7 @@
+[skill]
+id = "aiheal-cli-operator"
+name = "AIHeal CLI Operator"
+name_cn = "AIHeal CLI 操作器"
+description = "Operate and troubleshoot the AIHealingMe CLI through the npm package (`aihealingmecli`)."
+description_cn = "通过 npm 包（`aihealingmecli`）执行与排障 AIHealingMe CLI。"
+tags = ["aiheal", "cli", "auth", "audio", "chat", "diagnostics"]

@@ -261,6 +261,7 @@ class WebUIRuntimeState:
         remote: dict[str, Any] | None = None,
         remote_password: str | None = None,
         sandbox_backend: str | None = None,
+        clear_runtime_context: bool = True,
     ) -> dict[str, Any]:
         normalized_project = self._normalize_project_dir(project_dir) if project_dir else None
         normalized_session = self._normalize_optional_session_id(session_id)
@@ -290,7 +291,13 @@ class WebUIRuntimeState:
             self.session_mode_locked = False
             if normalized_remote is not None:
                 self.project_dir = None
-            self._clear_session_runtime_context()
+            if clear_runtime_context:
+                self._clear_session_runtime_context()
+            else:
+                self.current_session_id = None
+                self.current_task = ""
+                self.current_session_status = "idle"
+                self.current_summary = ""
             if normalized_project is not None:
                 self.status_message = self.translator.text("configuration_saved")
             elif normalized_remote is not None:
@@ -391,13 +398,17 @@ class WebUIRuntimeState:
             normalized_skill_ids = (
                 normalize_skill_ids(enabled_skill_ids)
                 if enabled_skill_ids is not None
+                else normalize_skill_ids(self.selected_skill_ids)
+            )
+            run_skill_ids: list[str] | None = (
+                list(normalized_skill_ids)
+                if enabled_skill_ids is not None or normalized_skill_ids
                 else None
             )
             normalized_mcp_server_ids = self._normalize_mcp_server_ids(enabled_mcp_server_ids)
             self.selected_model = resolved_model
             self.root_agent_name = resolved_root_agent_name
-            if normalized_skill_ids is not None:
-                self.selected_skill_ids = list(normalized_skill_ids)
+            self.selected_skill_ids = list(normalized_skill_ids)
             if normalized_mcp_server_ids is not None:
                 self.selected_mcp_server_ids = list(normalized_mcp_server_ids)
             resolved_session_id = self._normalize_optional_session_id(
@@ -421,7 +432,7 @@ class WebUIRuntimeState:
                     normalized_task,
                     model=resolved_model,
                     root_agent_name=resolved_root_agent_name or None,
-                    enabled_skill_ids=normalized_skill_ids,
+                    enabled_skill_ids=run_skill_ids,
                     enabled_mcp_server_ids=normalized_mcp_server_ids,
                     remote_password=self.remote_password,
                     source="webui",
@@ -448,7 +459,7 @@ class WebUIRuntimeState:
                         resolved_model,
                         resolved_root_agent_name,
                         self.remote_password,
-                        normalized_skill_ids,
+                        run_skill_ids,
                         normalized_mcp_server_ids,
                     )
                 )
@@ -471,7 +482,7 @@ class WebUIRuntimeState:
                     self.session_mode,
                     self.remote_config,
                     self.remote_password,
-                    normalized_skill_ids,
+                    run_skill_ids,
                     normalized_mcp_server_ids,
                 )
             )

@@ -50,7 +50,7 @@ temperature = 1.0
 [runtime.limits]
 # 每个代理最多可创建的子代理数量
 # Max child agents each agent can spawn
-max_children_per_agent = 8
+max_children_per_agent = 32
 # 系统同时活跃代理数量上限
 # Max concurrently active agents in session
 max_active_agents = 32
@@ -247,6 +247,10 @@ allowed_domains = [
   "archive.ubuntu.com",
   "security.ubuntu.com",
   "dl-cdn.alpinelinux.org",
+  # mine
+  "registry.npmjs.org",
+  "aihealing.me",
+  "www.aihealing.me"
 ]
 # 沙箱命令统一超时（秒）
 # Unified sandbox command timeout in seconds

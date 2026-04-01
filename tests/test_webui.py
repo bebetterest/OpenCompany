@@ -158,6 +158,45 @@ class WebUIStateTests(unittest.TestCase):
                 "offline",
             )
 
+    def test_set_launch_config_can_preserve_skill_selection(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir)
+            project_dir = app_dir / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+            state = WebUIRuntimeState(
+                project_dir=None,
+                session_id=None,
+                app_dir=app_dir,
+                locale="en",
+                debug=False,
+            )
+            state.current_session_id = "session-old"
+            state.current_task = "old task"
+            state.current_session_status = "running"
+            state.current_summary = "old summary"
+            state.selected_skill_ids = ["skill-a", "skill-b"]
+            state.skills_state = {
+                "bundle_root": ".opencompany_skills/session-old",
+                "warnings": [],
+            }
+            state.available_skills = [{"id": "skill-a"}]
+
+            state.set_launch_config(
+                project_dir=str(project_dir),
+                session_id=None,
+                clear_runtime_context=False,
+            )
+
+            self.assertEqual(state.project_dir, project_dir.resolve())
+            self.assertIsNone(state.current_session_id)
+            self.assertEqual(state.current_task, "")
+            self.assertEqual(state.current_session_status, "idle")
+            self.assertEqual(state.current_summary, "")
+            self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
+            self.assertEqual(state.skills_state.get("bundle_root"), ".opencompany_skills/session-old")
+            self.assertEqual(state.available_skills, [{"id": "skill-a"}])
+
     def test_discover_skills_and_mcp_servers_update_runtime_caches(self) -> None:
         async def run() -> None:
             with TemporaryDirectory() as temp_dir:
@@ -1252,6 +1291,60 @@ model = "openai/gpt-4o-mini"
                 self.assertEqual(fake.task, "demo task")
                 self.assertEqual(fake.model, "openai/gpt-4.1")
                 self.assertEqual(fake.root_agent_name, "Root Alpha")
+                self.assertEqual(state.current_session_status, "completed")
+
+        asyncio.run(run())
+
+    def test_start_run_uses_existing_selected_skills_when_not_explicitly_provided(self) -> None:
+        async def run() -> None:
+            with TemporaryDirectory() as temp_dir:
+                app_dir = Path(temp_dir)
+                project_dir = app_dir / "project"
+                project_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "opencompany.toml").write_text("", encoding="utf-8")
+                state = WebUIRuntimeState(
+                    project_dir=project_dir,
+                    session_id=None,
+                    app_dir=app_dir,
+                    locale="en",
+                    debug=False,
+                )
+                state.selected_skill_ids = ["skill-a", "skill-b"]
+
+                class _FakeOrchestrator:
+                    def __init__(self) -> None:
+                        self.app_dir = app_dir
+                        self.enabled_skill_ids: list[str] | None = None
+
+                    def subscribe(self, callback) -> None:  # type: ignore[no-untyped-def]
+                        self.callback = callback
+
+                    async def run_task(
+                        self,
+                        task: str,
+                        model: str | None = None,
+                        root_agent_name: str | None = None,
+                        enabled_skill_ids: list[str] | None = None,
+                    ) -> RunSession:
+                        del model, root_agent_name
+                        self.enabled_skill_ids = enabled_skill_ids
+                        return RunSession(
+                            id="session-run-skills",
+                            project_dir=project_dir,
+                            task=task,
+                            locale="en",
+                            root_agent_id="agent-root",
+                            status=SessionStatus.COMPLETED,
+                            enabled_skill_ids=list(enabled_skill_ids or []),
+                        )
+
+                fake = _FakeOrchestrator()
+                state._create_orchestrator = lambda _project_dir: fake  # type: ignore[method-assign]
+                await state.start_run("demo task")
+                assert state.session_task is not None
+                await state.session_task
+                self.assertEqual(fake.enabled_skill_ids, ["skill-a", "skill-b"])
+                self.assertEqual(state.selected_skill_ids, ["skill-a", "skill-b"])
                 self.assertEqual(state.current_session_status, "completed")
 
         asyncio.run(run())

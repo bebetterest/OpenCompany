@@ -165,6 +165,7 @@ agent 可见工具返回采用精简投影协议：
 - 大多数工具按阻塞模式执行
 - `shell` 使用 `[runtime.tools].shell_inline_wait_seconds`（默认 `5.0`）：若命令在阈值内未完成，会返回 `status=running`、`background=true`、`tool_run_id` 与当前 `stdout`/`stderr`，并继续后台执行
 - `shell` 在同一工具契约下同时支持本地路径与远程（`direct` 模式 SSH）路径，具体执行由 `[sandbox].backend`（`anthropic`/`none`）决定
+- `anthropic` 运行时会在受约束 shell/terminal 会话里默认注入 `NODE_USE_ENV_PROXY=1`，让 Node 客户端遵循 sandbox 代理路径；若命令显式传入同名环境变量，仍可覆盖默认值
 - `spawn_agent` 创建 child 后立即返回（`child_agent_id` + `tool_run_id`）
 - `steer_agent` 与用户/UI steer 提交共用同一套持久化 steer-run 流程
 - tool schema 不提供按调用覆盖的阻塞参数

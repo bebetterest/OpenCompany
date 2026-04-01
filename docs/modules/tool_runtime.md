@@ -165,6 +165,7 @@ Every accepted tool action becomes a persisted `tool_run` with:
 - most tools execute in blocking mode
 - `shell` uses `[runtime.tools].shell_inline_wait_seconds` (default `5.0`): if the command does not finish in time, the tool returns `status=running`, `background=true`, `tool_run_id`, current `stdout`/`stderr`, and keeps running in the background
 - `shell` supports local and remote (`direct` mode SSH) runtime paths under the same tool contract, selected by `[sandbox].backend` (`anthropic` or `none`)
+- `anthropic` runtime defaults `NODE_USE_ENV_PROXY=1` for sandboxed shell and terminal sessions so Node-based clients honor the sandbox proxy path; explicit command environment values can still override it
 - `spawn_agent` returns immediately after child creation (`child_agent_id` + `tool_run_id`)
 - `steer_agent` reuses the same persisted steer-run pipeline as user/UI steer submission
 - tool schemas do not expose per-call blocking overrides
