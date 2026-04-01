@@ -1531,9 +1531,25 @@ body.workflow-immersive {
   gap: 6px;
 }
 
+.agent-head-action-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .agent-focus-trigger {
   font-size: 11px;
   padding: 4px 8px;
+}
+
+.agent-collapse-trigger {
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.agent-live-body {
+  display: grid;
+  gap: 8px;
 }
 
 .agent-name {

@@ -237,6 +237,7 @@ const state = {
     lastRenderedAt: 0,
     deferredTimer: null,
     expandedSteps: new Map(),
+    collapsedCards: new Set(),
     preserveScrollNextRender: false,
     preservedScrollTop: null,
     preservedScrollHeight: null,
@@ -1614,6 +1615,7 @@ function resetRuntimeViews() {
   markAgentPanelDirty();
   state.agentPanel.lastRenderedAt = 0;
   state.agentPanel.expandedSteps.clear();
+  state.agentPanel.collapsedCards.clear();
   state.agentPanel.preserveScrollNextRender = false;
   state.agentPanel.preservedScrollTop = null;
   state.agentPanel.preservedScrollHeight = null;
@@ -6454,9 +6456,10 @@ function renderAgentCard(agent) {
       : `<span class="agent-meta-empty">${escapeHtml(t("none_value"))}</span>`;
   const statusClass = `status-${normalizeStatus(agent.status)}`;
   const stepGroups = groupedAgentEntries(agent);
+  const collapsed = isAgentCardCollapsed(agent.id);
 
   return `
-    <section class="agent-live-card" data-agent-id="${escapeHtml(agent.id)}">
+    <section class="agent-live-card${collapsed ? " is-collapsed" : ""}" data-agent-id="${escapeHtml(agent.id)}">
       <div class="agent-live-head">
         <div>
           <div class="agent-name">${escapeHtml(`${statusToEmoji(agent.status)} ${agent.name}`)}</div>
@@ -6480,93 +6483,104 @@ function renderAgentCard(agent) {
         </div>
         <div class="agent-head-actions">
           <div class="badge ${statusClass}">${escapeHtml(localizeStatus(agent.status))}</div>
-          <button
-            type="button"
-            class="agent-focus-trigger"
-            data-action="focus-agent"
-            data-agent-id="${escapeHtml(agent.id)}"
-          >${escapeHtml(t("expand_view"))}</button>
+          <div class="agent-head-action-row">
+            <button
+              type="button"
+              class="agent-collapse-trigger"
+              data-action="toggle-agent-card"
+              data-agent-id="${escapeHtml(agent.id)}"
+              aria-expanded="${collapsed ? "false" : "true"}"
+            >${escapeHtml(collapsed ? t("expand") : t("collapse"))}</button>
+            <button
+              type="button"
+              class="agent-focus-trigger"
+              data-action="focus-agent"
+              data-agent-id="${escapeHtml(agent.id)}"
+            >${escapeHtml(t("tool_runs_detail_button"))}</button>
+          </div>
         </div>
       </div>
-      <button
-        type="button"
-        class="agent-steer-trigger"
-        data-action="steer-agent"
-        data-agent-id="${escapeHtml(agent.id)}"
-      >${escapeHtml(t("steer_button"))}</button>
-      <button
-        type="button"
-        class="agent-terminate-trigger"
-        data-action="terminate-agent"
-        data-agent-id="${escapeHtml(agent.id)}"
-      >${escapeHtml(t("terminate_button"))}</button>
-      <div class="agent-meta-grid">
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("step_label"))}</span>
-          <span class="badge">${escapeHtml(String(agent.stepCount || 0))}</span>
+      <div class="agent-live-body${collapsed ? " hidden" : ""}">
+        <button
+          type="button"
+          class="agent-steer-trigger"
+          data-action="steer-agent"
+          data-agent-id="${escapeHtml(agent.id)}"
+        >${escapeHtml(t("steer_button"))}</button>
+        <button
+          type="button"
+          class="agent-terminate-trigger"
+          data-action="terminate-agent"
+          data-agent-id="${escapeHtml(agent.id)}"
+        >${escapeHtml(t("terminate_button"))}</button>
+        <div class="agent-meta-grid">
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("step_label"))}</span>
+            <span class="badge">${escapeHtml(String(agent.stepCount || 0))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("output_tokens_total"))}</span>
+            <span class="badge">${escapeHtml(String(agent.outputTokensTotal || 0))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("context_tokens_total"))}</span>
+            <span class="badge">${escapeHtml(
+              agent.contextLimitTokens > 0
+                ? `${agent.currentContextTokens || 0}/${agent.contextLimitTokens}`
+                : t("none_value")
+            )}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("usage_last_cache_label"))}</span>
+            <span class="badge">${escapeHtml(usageCacheText(agent))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("usage_last_total_label"))}</span>
+            <span class="badge">${escapeHtml(usageTotalText(agent))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("usage_ratio_label"))}</span>
+            <span class="badge">${escapeHtml(
+              Number.isFinite(Number(agent.usageRatio || 0))
+                ? Number(agent.usageRatio || 0).toFixed(4)
+                : "0.0000"
+            )}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("context_warning_count_label"))}</span>
+            <span class="badge">${escapeHtml(contextWarningSummaryText(agent))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("compression_count_label"))}</span>
+            <span class="badge">${escapeHtml(String(agent.compressionCount || 0))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("last_compacted_label"))}</span>
+            <span class="badge">${escapeHtml(compactedRangeText(agent.lastCompactedStepRange))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("keep_pinned_messages_label"))}</span>
+            <span class="badge">${escapeHtml(String(Math.max(0, Number(agent.keepPinnedMessages || 0))))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("summary_version_label"))}</span>
+            <span class="badge">${escapeHtml(summaryVersionText(agent))}</span>
+          </div>
+          <div class="agent-meta-line">
+            <span class="agent-meta-key">${escapeHtml(t("agent_model_label"))}</span>
+            <span class="badge">${escapeHtml(String(agent.model || t("none_value")))}</span>
+          </div>
+          <div class="agent-meta-line agent-meta-line-wide">
+            <span class="agent-meta-key">${escapeHtml(t("parent_agent_label"))}</span>
+            <div class="agent-link-wrap">${parentButton}</div>
+          </div>
+          <div class="agent-meta-line agent-meta-line-wide">
+            <span class="agent-meta-key">${escapeHtml(t("child_agents_label"))}</span>
+            <div class="agent-link-wrap">${childButtons}</div>
+          </div>
         </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("output_tokens_total"))}</span>
-          <span class="badge">${escapeHtml(String(agent.outputTokensTotal || 0))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("context_tokens_total"))}</span>
-          <span class="badge">${escapeHtml(
-            agent.contextLimitTokens > 0
-              ? `${agent.currentContextTokens || 0}/${agent.contextLimitTokens}`
-              : t("none_value")
-          )}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("usage_last_cache_label"))}</span>
-          <span class="badge">${escapeHtml(usageCacheText(agent))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("usage_last_total_label"))}</span>
-          <span class="badge">${escapeHtml(usageTotalText(agent))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("usage_ratio_label"))}</span>
-          <span class="badge">${escapeHtml(
-            Number.isFinite(Number(agent.usageRatio || 0))
-              ? Number(agent.usageRatio || 0).toFixed(4)
-              : "0.0000"
-          )}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("context_warning_count_label"))}</span>
-          <span class="badge">${escapeHtml(contextWarningSummaryText(agent))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("compression_count_label"))}</span>
-          <span class="badge">${escapeHtml(String(agent.compressionCount || 0))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("last_compacted_label"))}</span>
-          <span class="badge">${escapeHtml(compactedRangeText(agent.lastCompactedStepRange))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("keep_pinned_messages_label"))}</span>
-          <span class="badge">${escapeHtml(String(Math.max(0, Number(agent.keepPinnedMessages || 0))))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("summary_version_label"))}</span>
-          <span class="badge">${escapeHtml(summaryVersionText(agent))}</span>
-        </div>
-        <div class="agent-meta-line">
-          <span class="agent-meta-key">${escapeHtml(t("agent_model_label"))}</span>
-          <span class="badge">${escapeHtml(String(agent.model || t("none_value")))}</span>
-        </div>
-        <div class="agent-meta-line agent-meta-line-wide">
-          <span class="agent-meta-key">${escapeHtml(t("parent_agent_label"))}</span>
-          <div class="agent-link-wrap">${parentButton}</div>
-        </div>
-        <div class="agent-meta-line agent-meta-line-wide">
-          <span class="agent-meta-key">${escapeHtml(t("child_agents_label"))}</span>
-          <div class="agent-link-wrap">${childButtons}</div>
-        </div>
+        <div class="agent-stream-list">${renderStepGroups(agent, stepGroups, { showHistoryLoader: true })}</div>
       </div>
-      <div class="agent-stream-list">${renderStepGroups(agent, stepGroups, { showHistoryLoader: true })}</div>
     </section>
   `;
 }
@@ -6630,6 +6644,39 @@ function setStepExpanded(agentId, stepNumber, expanded) {
   if (set.size === 0) {
     state.agentPanel.expandedSteps.delete(id);
   }
+}
+
+function isAgentCardCollapsed(agentId) {
+  const id = String(agentId || "").trim();
+  if (!id) {
+    return true;
+  }
+  const expandedCards = state.agentPanel.collapsedCards;
+  return !(expandedCards instanceof Set && expandedCards.has(id));
+}
+
+function setAgentCardCollapsed(agentId, collapsed) {
+  const id = String(agentId || "").trim();
+  if (!id) {
+    return;
+  }
+  if (!(state.agentPanel.collapsedCards instanceof Set)) {
+    state.agentPanel.collapsedCards = new Set();
+  }
+  // Default is collapsed; this set stores explicit expanded cards.
+  if (collapsed) {
+    state.agentPanel.collapsedCards.delete(id);
+  } else {
+    state.agentPanel.collapsedCards.add(id);
+  }
+}
+
+function toggleAgentCardCollapsed(agentId) {
+  const id = String(agentId || "").trim();
+  if (!id) {
+    return;
+  }
+  setAgentCardCollapsed(id, !isAgentCardCollapsed(id));
 }
 
 function flattenAgentEntries(agent) {
@@ -9944,6 +9991,21 @@ function bindEvents() {
     if (action === "load-older-messages") {
       const agentId = button.getAttribute("data-agent-id") || "";
       void loadOlderMessagesForAgent(agentId);
+      return;
+    }
+    if (action === "toggle-agent-card") {
+      const agentId = button.getAttribute("data-agent-id") || "";
+      if (!agentId || !state.agents.has(agentId)) {
+        return;
+      }
+      const preservedTop = dom.agentsLive.scrollTop;
+      state.agentPanel.preserveScrollNextRender = true;
+      state.agentPanel.preservedScrollTop = preservedTop;
+      state.agentPanel.preservedScrollHeight = dom.agentsLive.scrollHeight;
+      state.agentPanel.suppressAutoStickToBottomUntil = performance.now() + 1200;
+      toggleAgentCardCollapsed(agentId);
+      markAgentPanelDirty();
+      scheduleRender();
       return;
     }
     if (action === "copy-agent-id") {
