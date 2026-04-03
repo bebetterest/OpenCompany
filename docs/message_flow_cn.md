@@ -88,7 +88,7 @@ tool-run 查询行为：
 
 - `list_tool_runs`：仅返回概览行
 - `get_tool_run`：默认概览（对 `shell` 运行中会带 `stdout`/`stderr` 快照）；仅 `include_result=true` 时带原始 `result`
-- `wait_run`：状态型返回（`wait_run_status`，必要时附超时/错误标记）
+- `wait_run`：状态型返回（`wait_run_status`，必要时附 `end_reason`、超时/错误标记）
 - `cancel_tool_run`：最小返回（`final_status`、`cancelled_agents_count`）
 
 ## 工具调用语义

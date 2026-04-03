@@ -15,6 +15,7 @@ from opencompany.models import (
     EventRecord,
     RunSession,
     SessionStatus,
+    SteerRunStatus,
     ToolRun,
     ToolRunStatus,
 )
@@ -1032,6 +1033,91 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(paused_wait_result.get("wait_run_status"), False)
             self.assertIn("paused", str(paused_wait_result.get("error", "")))
 
+    async def test_wait_run_returns_early_when_steer_arrives(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-wait-run-steer",
+            )
+
+            waiting_tool_run_id = "toolrun-target-running"
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id=waiting_tool_run_id,
+                    session_id=session.id,
+                    agent_id=root.id,
+                    tool_name="shell",
+                    arguments={"type": "shell", "command": "sleep 30"},
+                    status=ToolRunStatus.RUNNING,
+                    blocking=True,
+                    created_at=utc_now(),
+                    started_at=utc_now(),
+                )
+            )
+
+            wait_task = asyncio.create_task(
+                orchestrator._submit_tool_run(
+                    session=session,
+                    agent=root,
+                    action={"type": "wait_run", "tool_run_id": waiting_tool_run_id},
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=0,
+                    tracked_pending_ids=[],
+                )
+            )
+            try:
+                await asyncio.sleep(0.1)
+                steer_run = orchestrator.submit_steer_run(
+                    session_id=session.id,
+                    agent_id=root.id,
+                    content="Pause waiting and continue with this steer.",
+                )
+                waited = await asyncio.wait_for(wait_task, timeout=3)
+            finally:
+                if not wait_task.done():
+                    wait_task.cancel()
+                    await asyncio.gather(wait_task, return_exceptions=True)
+
+            waited_result = waited.get("agent_result")
+            assert isinstance(waited_result, dict)
+            self.assertEqual(waited_result.get("wait_run_status"), True)
+            self.assertEqual(waited_result.get("end_reason"), "steer_received")
+            steer_id = str(steer_run.get("id", "")).strip()
+            record = orchestrator.storage.load_steer_run(steer_id)
+            assert isinstance(record, dict)
+            self.assertEqual(str(record.get("status", "")), SteerRunStatus.WAITING.value)
+
+    async def test_wait_run_keeps_invalid_target_error_even_with_pending_steer(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-wait-run-invalid-target",
+            )
+
+            orchestrator.submit_steer_run(
+                session_id=session.id,
+                agent_id=root.id,
+                content="Pending steer should not hide invalid wait target.",
+            )
+            waited = await orchestrator._submit_tool_run(
+                session=session,
+                agent=root,
+                action={"type": "wait_run", "tool_run_id": "toolrun-missing"},
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+            waited_result = waited.get("agent_result")
+            assert isinstance(waited_result, dict)
+            self.assertEqual(waited_result.get("wait_run_status"), False)
+            self.assertIn("not found", str(waited_result.get("error", "")))
+
     async def test_cancel_tool_run_completed_spawn_noop_and_running_spawn_terminates(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
@@ -1317,6 +1403,48 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             finished_result = finished.get("agent_result")
             assert isinstance(finished_result, dict)
             self.assertEqual(set(finished_result.keys()), {"accepted"})
+
+    async def test_wait_time_returns_early_when_steer_arrives(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-wait-time-steer",
+            )
+
+            wait_task = asyncio.create_task(
+                orchestrator._submit_tool_run(
+                    session=session,
+                    agent=root,
+                    action={"type": "wait_time", "seconds": 10},
+                    agents=agents,
+                    workspace_manager=workspace_manager,
+                    root_loop=0,
+                    tracked_pending_ids=[],
+                )
+            )
+            try:
+                await asyncio.sleep(0.1)
+                steer_run = orchestrator.submit_steer_run(
+                    session_id=session.id,
+                    agent_id=root.id,
+                    content="Stop waiting and continue with steer.",
+                )
+                waited = await asyncio.wait_for(wait_task, timeout=3)
+            finally:
+                if not wait_task.done():
+                    wait_task.cancel()
+                    await asyncio.gather(wait_task, return_exceptions=True)
+
+            waited_result = waited.get("agent_result")
+            assert isinstance(waited_result, dict)
+            self.assertEqual(waited_result.get("wait_time_status"), True)
+            self.assertEqual(waited_result.get("end_reason"), "steer_received")
+            steer_id = str(steer_run.get("id", "")).strip()
+            record = orchestrator.storage.load_steer_run(steer_id)
+            assert isinstance(record, dict)
+            self.assertEqual(str(record.get("status", "")), SteerRunStatus.WAITING.value)
 
     async def test_submit_tool_run_validation_failure_persists_failed_tool_run(self) -> None:
         with TemporaryDirectory() as temp_dir:

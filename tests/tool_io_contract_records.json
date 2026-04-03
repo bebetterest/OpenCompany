@@ -25,7 +25,7 @@
   "wait_time": {
     "input": {"type": "wait_time", "seconds": 10},
     "output_example": {"wait_time_status": true},
-    "allowed_output_keys": ["wait_time_status", "timed_out", "timeout_seconds", "error"],
+    "allowed_output_keys": ["wait_time_status", "end_reason", "timed_out", "timeout_seconds", "error"],
     "required_output_keys": ["wait_time_status"],
     "forbidden_output_keys": ["seconds"]
   },
@@ -184,7 +184,7 @@
   "wait_run": {
     "input": {"type": "wait_run", "tool_run_id": "toolrun-sample"},
     "output_example": {"wait_run_status": true},
-    "allowed_output_keys": ["wait_run_status", "timed_out", "timeout_seconds", "error"],
+    "allowed_output_keys": ["wait_run_status", "end_reason", "timed_out", "timeout_seconds", "error"],
     "required_output_keys": ["wait_run_status"],
     "forbidden_output_keys": ["tool_run_id", "agent_id"]
   },

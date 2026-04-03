@@ -88,7 +88,7 @@ Tool-run inspection behavior:
 
 - `list_tool_runs`: overview rows only
 - `get_tool_run`: overview by default (for `shell`, includes `stdout`/`stderr` snapshot while running); include raw `result` only when `include_result=true`
-- `wait_run`: status-only contract (`wait_run_status` plus optional timeout/error markers)
+- `wait_run`: status contract (`wait_run_status` plus optional `end_reason`, timeout/error markers)
 - `cancel_tool_run`: minimal contract (`final_status`, `cancelled_agents_count`)
 
 ## Tool-call semantics

@@ -57,6 +57,7 @@ agent 可见工具返回采用精简投影协议：
 1. `wait_time`
 - 输入：`seconds`（必须位于 `[runtime.tools].wait_time_min_seconds`..`[runtime.tools].wait_time_max_seconds` 范围内，默认 `10`..`60`）
 - 成功输出：`wait_time_status=true`
+- 若等待中的 agent 收到新的 steer 并提前结束等待，成功输出会包含 `end_reason=steer_received`
 - 失败输出：`wait_time_status=false`，并可带 `timed_out`、`timeout_seconds`、`error`
 
 2. `compress_context`
@@ -118,6 +119,7 @@ agent 可见工具返回采用精简投影协议：
 - 输入：`tool_run_id` 或 `agent_id` 二选一
 - schema 兼容性说明：为避免 provider 侧工具参数校验拒绝，此互斥约束仅写在字段描述中（不再使用顶层 `oneOf`/`not`），并由运行时校验
 - 成功输出：`wait_run_status=true`
+- 若等待中的 agent 收到新的 steer 并提前结束等待，成功输出会包含 `end_reason=steer_received`
 - 失败输出：`wait_run_status=false`，并可带 `timed_out`、`timeout_seconds`、`error`
 - 对 agent 的等待仅在终态算成功；`paused` 不算成功
 

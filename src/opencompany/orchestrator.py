@@ -7126,7 +7126,11 @@ class Orchestrator:
                     tracked_pending_ids=tracked_pending_ids,
                 )
             elif action_type == "wait_time":
-                raw_result = await self._wait_time_result(action=action)
+                raw_result = await self._wait_time_result(
+                    session=session,
+                    agent=agent,
+                    action=action,
+                )
             elif action_type == "compress_context":
                 raw_result = await self.agent_runtime.compress_context(
                     agent,
@@ -7666,6 +7670,14 @@ class Orchestrator:
                         "wait_run_status": False,
                         "error": f"Agent {target_agent_id} is paused and not in a terminal status.",
                     }
+            if self._has_waiting_steer_for_agent(
+                session_id=agent.session_id,
+                agent_id=agent.id,
+            ):
+                return {
+                    "wait_run_status": True,
+                    "end_reason": "steer_received",
+                }
             if timeout_seconds > 0 and (time.perf_counter() - started) >= timeout_seconds:
                 return {
                     "wait_run_status": False,
@@ -7691,6 +7703,8 @@ class Orchestrator:
     async def _wait_time_result(
         self,
         *,
+        session: RunSession | None = None,
+        agent: AgentNode | None = None,
         action: dict[str, Any],
     ) -> dict[str, Any]:
         wait_time_min_seconds, wait_time_max_seconds = (
@@ -7705,18 +7719,60 @@ class Orchestrator:
             return {"wait_time_status": False, "error": validation_error}
         seconds = float(action["seconds"])
         timeout_seconds = self.tool_executor.timeout_seconds_for_action("wait_time")
-        try:
-            if timeout_seconds > 0:
-                await asyncio.wait_for(asyncio.sleep(seconds), timeout=timeout_seconds)
-            else:
-                await asyncio.sleep(seconds)
-        except asyncio.TimeoutError:
+        started = time.perf_counter()
+
+        def _timed_out_result() -> dict[str, Any]:
             return {
                 "wait_time_status": False,
                 "timed_out": True,
                 "timeout_seconds": timeout_seconds,
             }
+
+        while True:
+            elapsed = time.perf_counter() - started
+            if (
+                session is not None
+                and agent is not None
+                and self._has_waiting_steer_for_agent(
+                    session_id=session.id,
+                    agent_id=agent.id,
+                )
+            ):
+                return {
+                    "wait_time_status": True,
+                    "end_reason": "steer_received",
+                }
+            if elapsed >= seconds:
+                break
+            if timeout_seconds > 0 and elapsed >= timeout_seconds:
+                return _timed_out_result()
+            remaining_wait = max(0.0, seconds - elapsed)
+            sleep_slice = min(0.2, remaining_wait)
+            if timeout_seconds > 0:
+                remaining_timeout = max(0.0, timeout_seconds - elapsed)
+                if remaining_timeout <= 0:
+                    return _timed_out_result()
+                sleep_slice = min(sleep_slice, remaining_timeout)
+            await asyncio.sleep(max(0.01, sleep_slice))
         return {"wait_time_status": True}
+
+    def _has_waiting_steer_for_agent(
+        self,
+        *,
+        session_id: str,
+        agent_id: str,
+    ) -> bool:
+        normalized_session_id = self._normalize_session_id(session_id)
+        normalized_agent_id = str(agent_id or "").strip()
+        if not normalized_agent_id:
+            return False
+        runs = self.storage.list_steer_runs(
+            session_id=normalized_session_id,
+            agent_id=normalized_agent_id,
+            statuses=[SteerRunStatus.WAITING.value],
+            limit=1,
+        )
+        return bool(runs)
 
     async def _tool_run_cancel_result(
         self,
@@ -8515,6 +8571,9 @@ class Orchestrator:
             projected = {
                 "wait_time_status": bool(raw_result.get("wait_time_status", False)),
             }
+            end_reason = str(raw_result.get("end_reason", "")).strip()
+            if end_reason:
+                projected["end_reason"] = end_reason
             if bool(raw_result.get("timed_out", False)):
                 projected["timed_out"] = True
                 projected["timeout_seconds"] = raw_result.get("timeout_seconds")
@@ -8637,6 +8696,9 @@ class Orchestrator:
             projected = {
                 "wait_run_status": bool(raw_result.get("wait_run_status", False)),
             }
+            end_reason = str(raw_result.get("end_reason", "")).strip()
+            if end_reason:
+                projected["end_reason"] = end_reason
             if bool(raw_result.get("timed_out", False)):
                 projected["timed_out"] = True
                 projected["timeout_seconds"] = raw_result.get("timeout_seconds")

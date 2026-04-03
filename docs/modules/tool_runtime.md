@@ -57,6 +57,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 1. `wait_time`
 - input: `seconds` (must be within `[runtime.tools].wait_time_min_seconds`..`[runtime.tools].wait_time_max_seconds`, defaults `10`..`60`)
 - output success: `wait_time_status=true`
+- when interrupted by a newly received steer for the waiting agent, success output includes `end_reason=steer_received`
 - output failure: `wait_time_status=false` with optional `timed_out`, `timeout_seconds`, `error`
 
 2. `compress_context`
@@ -118,6 +119,7 @@ Runtime persistence keeps full fidelity for replay/debugging:
 - input: exactly one of `tool_run_id` or `agent_id`
 - schema compatibility note: to avoid provider-side tool schema rejections, this XOR rule is documented in field descriptions (not encoded as top-level `oneOf`/`not`)
 - output success: `wait_run_status=true`
+- when interrupted by a newly received steer for the waiting agent, success output includes `end_reason=steer_received`
 - output failure: `wait_run_status=false` with optional `timed_out`, `timeout_seconds`, `error`
 - agent wait success requires terminal status; `paused` is not a success state
 

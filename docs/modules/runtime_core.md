@@ -105,6 +105,7 @@ Worker agents:
 - UI/user steer and agent-tool `steer_agent` both enter the same `submit_steer_run(...)` pipeline.
 - Each steer run records both target agent (`agent_id`) and source actor snapshot (`source_agent_id`, `source_agent_name`).
 - Before each agent LLM request, runtime loads the agent's `waiting` steers in creation order.
+- If that agent is currently blocked in `wait_time` or `wait_run`, a newly submitted steer ends the wait early with `end_reason=steer_received`; steer content is still consumed in the normal next-ask path.
 - If a steer is submitted to a non-schedulable agent (`paused`/`completed`/`failed`/`cancelled`/`terminated`) while the session is still `running`, runtime reactivates that agent to `running` and re-enters normal session scheduling immediately.
 - Runtime prepends a localized steer intro line and appends a localized source signature to stored/delivered steer content (`--- from ...` in English, `--- 来自于 ...` in Chinese).
 - If a steer targets an agent currently in `completed`, runtime appends a final reminder sentence after the signature requiring a follow-up `finish` tool call after executing the new instruction.

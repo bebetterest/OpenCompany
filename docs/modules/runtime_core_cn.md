@@ -105,6 +105,7 @@ worker：
 - UI/用户 steer 与 agent 工具 `steer_agent` 会进入同一条 `submit_steer_run(...)` 提交流程。
 - 每条 steer run 同时记录目标 agent（`agent_id`）和来源 actor 快照（`source_agent_id`、`source_agent_name`）。
 - 每次 agent 调用 LLM 之前，会按创建顺序加载该 agent 的 `waiting` steers。
+- 若该 agent 当前阻塞在 `wait_time` 或 `wait_run`，新提交的 steer 会让 wait 提前结束，并返回 `end_reason=steer_received`；steer 内容仍按下一次 ask 的原有流程消费。
 - 当会话仍是 `running` 且 steer 提交目标是不可调度 agent（`paused`/`completed`/`failed`/`cancelled`/`terminated`）时，运行时会将该 agent 重新激活为 `running`，并立刻重新进入正常会话调度。
 - 运行时会在持久化/投递的 steer 文本顶部插入本地化引导提示，并追加本地化来源署名（英文为 `--- from ...`，中文为 `--- 来自于 ...`）。
 - 当 steer 目标 agent 当前处于 `completed` 时，运行时会在署名之后再追加一句提醒，要求执行新指令后再调用一次 `finish` 工具收尾。
