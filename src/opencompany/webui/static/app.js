@@ -3250,9 +3250,10 @@ function llmRetryText(payload) {
   const delaySeconds =
     typeof delayRaw === "number" && Number.isFinite(delayRaw) ? delayRaw : Number.NaN;
   const delayText = Number.isFinite(delaySeconds) ? `${delaySeconds.toFixed(2)}s` : "-s";
+  const clearedText = payload.partial_output_discarded ? " cleared=partial_output" : "";
   return `llm retry attempt=${attemptText} status=${httpStatusLabel(payload)} delay=${delayText} reason=${String(
     payload.retry_reason || "-"
-  )}`;
+  )}${clearedText}`;
 }
 
 function llmRequestErrorText(payload) {
@@ -3950,6 +3951,10 @@ function consumeRuntimeEvent(record) {
       appendStepEntry(agent, stepNumber, extraKind("summary"), agent.summary);
     }
   } else if (eventType === "llm_retry") {
+    if (payload.partial_output_discarded) {
+      agent.isGenerating = true;
+      clearPreviewEntries(agent, stepNumber);
+    }
     appendStepEntry(agent, stepNumber, extraKind("error"), llmRetryText(payload));
   } else if (eventType === "llm_request_error") {
     appendStepEntry(agent, stepNumber, extraKind("error"), llmRequestErrorText(payload));

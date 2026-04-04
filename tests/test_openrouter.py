@@ -773,10 +773,13 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_RateLimitedThenRecoverClient.attempts, 2)
         self.assertEqual(sleep_calls, [2.0])
 
-    async def test_stream_chat_does_not_retry_after_partial_stream_output(self) -> None:
+    async def test_stream_chat_retries_after_partial_stream_output(self) -> None:
         import httpx
 
-        class _PartialThenDropStream:
+        class _PartialThenDropOrRecoverStream:
+            def __init__(self, *, fail_with_partial_drop: bool) -> None:
+                self.fail_with_partial_drop = fail_with_partial_drop
+
             async def __aenter__(self):
                 return self
 
@@ -787,10 +790,13 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def aiter_text(self):
-                yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
-                raise httpx.RemoteProtocolError("server closed connection")
+                if self.fail_with_partial_drop:
+                    yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                    raise httpx.RemoteProtocolError("server closed connection")
+                yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                yield "data: [DONE]\n\n"
 
-        class _PartialThenDropClient:
+        class _PartialThenDropOrRecoverClient:
             attempts = 0
 
             def __init__(self, *, timeout: int) -> None:
@@ -812,7 +818,9 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
             ):
                 del method, url, headers, json
                 type(self).attempts += 1
-                return _PartialThenDropStream()
+                return _PartialThenDropOrRecoverStream(
+                    fail_with_partial_drop=type(self).attempts == 1
+                )
 
         client = OpenRouterClient(
             api_key="test-key",
@@ -821,16 +829,30 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
             max_retries=2,
             retry_backoff_seconds=0.0,
         )
-        with mock.patch("httpx.AsyncClient", _PartialThenDropClient):
-            with self.assertRaises(httpx.RemoteProtocolError):
-                await client.stream_chat(
-                    model="openai/gpt-4o-mini",
-                    messages=[{"role": "user", "content": "test"}],
-                    temperature=0.1,
-                    max_tokens=64,
-                )
+        retries: list[dict[str, object]] = []
 
-        self.assertEqual(_PartialThenDropClient.attempts, 1)
+        async def _on_retry(payload: dict[str, object]) -> None:
+            retries.append(payload)
+
+        with (
+            mock.patch("httpx.AsyncClient", _PartialThenDropOrRecoverClient),
+            mock.patch("opencompany.llm.openrouter.asyncio.sleep", new=mock.AsyncMock()),
+            mock.patch("opencompany.llm.openrouter.random.uniform", return_value=0.0),
+        ):
+            result = await client.stream_chat(
+                model="openai/gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                temperature=0.1,
+                max_tokens=64,
+                on_retry=_on_retry,
+            )
+
+        self.assertEqual(result.content, "ok")
+        self.assertEqual(_PartialThenDropOrRecoverClient.attempts, 2)
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(str(retries[0].get("retry_reason", "")), "remote_protocol_error")
+        self.assertEqual(bool(retries[0].get("partial_output_received")), True)
+        self.assertEqual(bool(retries[0].get("partial_output_discarded")), True)
 
     async def test_stream_chat_debug_log_includes_partial_output_on_stream_failure(self) -> None:
         import httpx
@@ -876,6 +898,7 @@ class OpenRouterClientTests(unittest.IsolatedAsyncioTestCase):
                 api_key="test-key",
                 base_url="https://openrouter.ai/api/v1",
                 timeout_seconds=30,
+                max_retries=0,
                 request_response_log_path=log_path,
             )
             with mock.patch("httpx.AsyncClient", _PartialThenDropClient):

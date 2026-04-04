@@ -5244,6 +5244,11 @@ class OpenCompanyApp(App):
             )
             return
         if event_type == "llm_retry":
+            if bool(details.get("partial_output_discarded")):
+                state.is_generating = True
+                state.raw_llm_buffer = ""
+                state.raw_reasoning_buffer = ""
+                self._clear_preview_entries(state, step_number=step_number)
             self._append_step_stream_entry(
                 state,
                 step_number,
@@ -5827,9 +5832,15 @@ class OpenCompanyApp(App):
             delay_text = "-s"
         status = self._http_status_label(details)
         attempt_label = self._retry_attempt_label(details)
+        cleared_text = (
+            " cleared=partial_output"
+            if bool(details.get("partial_output_discarded"))
+            else ""
+        )
         return (
             f"llm retry attempt={attempt_label} status={status} "
             f"delay={delay_text} reason={str(details.get('retry_reason', '-'))}"
+            f"{cleared_text}"
         )
 
     def _llm_request_error_stream_text(self, details: dict[str, Any]) -> str:

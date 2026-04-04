@@ -341,6 +341,8 @@ class OpenRouterClient:
                         "status_text": status_text,
                         "error_type": exc.__class__.__name__,
                         "error": str(exc),
+                        "partial_output_received": bool(received_event),
+                        "partial_output_discarded": bool(received_event),
                     }
                     try:
                         maybe = on_retry(retry_payload)
@@ -580,7 +582,8 @@ class OpenRouterClient:
         max_attempts: int,
         has_partial_output: bool,
     ) -> bool:
-        if has_partial_output or attempt >= max_attempts - 1:
+        del has_partial_output
+        if attempt >= max_attempts - 1:
             return False
 
         import httpx

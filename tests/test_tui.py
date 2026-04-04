@@ -2823,6 +2823,52 @@ backend = "anthropic"
         self.assertIn("status=400 Bad Request", state.stream_entries[0][1])
         self.assertIn("attempt=1/3", state.stream_entries[0][1])
 
+    def test_llm_retry_discards_partial_preview_entries(self) -> None:
+        try:
+            from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        state = AgentRuntimeView(id="agent-1", name="Worker")
+        app._update_stream_for_event(
+            state,
+            {"event_type": "agent_prompt", "payload": {"step_count": 1}},
+        )
+        app._update_stream_for_event(
+            state,
+            {"event_type": "llm_reasoning", "payload": {"step_count": 1, "token": "thinking..."}},
+        )
+        app._update_stream_for_event(
+            state,
+            {"event_type": "llm_token", "payload": {"step_count": 1, "token": "reply..."}},
+        )
+        self.assertEqual(
+            state.stream_entries,
+            [("thinking_preview", "thinking..."), ("reply_preview", "reply...")],
+        )
+
+        app._update_stream_for_event(
+            state,
+            {
+                "event_type": "llm_retry",
+                "payload": {
+                    "step_count": 1,
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "retry_delay_seconds": 1.0,
+                    "retry_reason": "remote_protocol_error",
+                    "partial_output_discarded": True,
+                },
+            },
+        )
+
+        self.assertEqual(state.raw_llm_buffer, "")
+        self.assertEqual(state.raw_reasoning_buffer, "")
+        self.assertEqual(len(state.stream_entries), 1)
+        self.assertEqual(state.stream_entries[0][0], "error_extra")
+        self.assertIn("cleared=partial_output", state.stream_entries[0][1])
+
     def test_format_event_includes_llm_request_error_http_status(self) -> None:
         try:
             from opencompany.tui.app import OpenCompanyApp
