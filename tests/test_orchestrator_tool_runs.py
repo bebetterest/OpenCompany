@@ -1090,6 +1090,46 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(record, dict)
             self.assertEqual(str(record.get("status", "")), SteerRunStatus.WAITING.value)
 
+    async def test_wait_run_timeout_returns_timeout_feedback(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-wait-run-timeout",
+            )
+            orchestrator.config.runtime.tool_timeouts.actions["wait_run"] = 0.05
+
+            waiting_tool_run_id = "toolrun-target-timeout"
+            orchestrator.storage.upsert_tool_run(
+                ToolRun(
+                    id=waiting_tool_run_id,
+                    session_id=session.id,
+                    agent_id=root.id,
+                    tool_name="shell",
+                    arguments={"type": "shell", "command": "sleep 30"},
+                    status=ToolRunStatus.RUNNING,
+                    blocking=True,
+                    created_at=utc_now(),
+                    started_at=utc_now(),
+                )
+            )
+            waited = await orchestrator._submit_tool_run(
+                session=session,
+                agent=root,
+                action={"type": "wait_run", "tool_run_id": waiting_tool_run_id},
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+            waited_result = waited.get("agent_result")
+            assert isinstance(waited_result, dict)
+            self.assertEqual(waited_result.get("wait_run_status"), False)
+            self.assertTrue(waited_result.get("timed_out"))
+            self.assertEqual(waited_result.get("end_reason"), "timeout")
+            self.assertGreater(float(waited_result.get("timeout_seconds", 0) or 0), 0)
+
     async def test_wait_run_keeps_invalid_target_error_even_with_pending_steer(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
@@ -1445,6 +1485,32 @@ class OrchestratorToolRunTests(unittest.IsolatedAsyncioTestCase):
             record = orchestrator.storage.load_steer_run(steer_id)
             assert isinstance(record, dict)
             self.assertEqual(str(record.get("status", "")), SteerRunStatus.WAITING.value)
+
+    async def test_wait_time_timeout_returns_timeout_feedback(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator, session, workspace_manager, root, agents = bootstrap_runtime(
+                project_dir,
+                session_id="session-wait-time-timeout",
+            )
+            orchestrator.config.runtime.tool_timeouts.actions["wait_time"] = 0.05
+
+            waited = await orchestrator._submit_tool_run(
+                session=session,
+                agent=root,
+                action={"type": "wait_time", "seconds": 10},
+                agents=agents,
+                workspace_manager=workspace_manager,
+                root_loop=0,
+                tracked_pending_ids=[],
+            )
+            waited_result = waited.get("agent_result")
+            assert isinstance(waited_result, dict)
+            self.assertEqual(waited_result.get("wait_time_status"), False)
+            self.assertTrue(waited_result.get("timed_out"))
+            self.assertEqual(waited_result.get("end_reason"), "timeout")
+            self.assertGreater(float(waited_result.get("timeout_seconds", 0) or 0), 0)
 
     async def test_submit_tool_run_validation_failure_persists_failed_tool_run(self) -> None:
         with TemporaryDirectory() as temp_dir:

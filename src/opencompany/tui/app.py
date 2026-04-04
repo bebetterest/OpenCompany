@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import shlex
 import tomllib
@@ -5344,13 +5345,21 @@ class OpenCompanyApp(App):
                 else:
                     entries.append(("multiagent_return", f"list_agent_runs result: runs_count={len(listed)}"))
         elif action_type == "wait_run":
-            status = result.get("wait_run_status")
-            if isinstance(status, bool):
-                entries.append(("tool_return", f"wait_run result: status={status}"))
+            summary = self._wait_result_stream_text(
+                action_label="wait_run",
+                status_key="wait_run_status",
+                result=result,
+            )
+            if summary:
+                entries.append(("tool_return", summary))
         elif action_type == "wait_time":
-            status = result.get("wait_time_status")
-            if isinstance(status, bool):
-                entries.append(("tool_return", f"wait_time result: status={status}"))
+            summary = self._wait_result_stream_text(
+                action_label="wait_time",
+                status_key="wait_time_status",
+                result=result,
+            )
+            if summary:
+                entries.append(("tool_return", summary))
         elif action_type == "list_tool_runs":
             listed = result.get("tool_runs", [])
             if isinstance(listed, list):
@@ -5407,6 +5416,39 @@ class OpenCompanyApp(App):
             else:
                 entries.append((action_kind, preview_result))
         return entries
+
+    def _wait_result_stream_text(
+        self,
+        *,
+        action_label: str,
+        status_key: str,
+        result: dict[str, Any],
+    ) -> str | None:
+        status = result.get(status_key)
+        if not isinstance(status, bool):
+            return None
+        text = f"{action_label} result: status={status}"
+        end_reason = str(result.get("end_reason", "")).strip()
+        if bool(result.get("timed_out", False)):
+            text += ", timed_out=True"
+            timeout_seconds_text = self._format_timeout_seconds(result.get("timeout_seconds"))
+            if timeout_seconds_text:
+                text += f", timeout_seconds={timeout_seconds_text}"
+            text += f", end_reason={end_reason or 'timeout'}"
+            return text
+        if end_reason:
+            text += f", end_reason={end_reason}"
+        return text
+
+    @staticmethod
+    def _format_timeout_seconds(value: Any) -> str:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(parsed) or parsed <= 0:
+            return ""
+        return f"{parsed:g}"
 
     def _tool_call_result_payload(self, details: dict[str, Any]) -> dict[str, Any]:
         action = details.get("action", {})

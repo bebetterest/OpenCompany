@@ -3044,6 +3044,35 @@ function sanitizeToolResultForStream(actionType, result) {
   return sanitized;
 }
 
+function formatTimeoutSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "";
+  }
+  return String(seconds);
+}
+
+function waitResultSummary(actionLabel, statusKey, result) {
+  if (!result || typeof result !== "object" || typeof result[statusKey] !== "boolean") {
+    return "";
+  }
+  let text = `${actionLabel} result: status=${String(result[statusKey])}`;
+  const endReason = String(result.end_reason || "").trim();
+  if (Boolean(result.timed_out)) {
+    text += ", timed_out=true";
+    const timeoutSeconds = formatTimeoutSeconds(result.timeout_seconds);
+    if (timeoutSeconds) {
+      text += `, timeout_seconds=${timeoutSeconds}`;
+    }
+    text += `, end_reason=${endReason || "timeout"}`;
+    return text;
+  }
+  if (endReason) {
+    text += `, end_reason=${endReason}`;
+  }
+  return text;
+}
+
 function toolCallResultEntries(payload) {
   const action = payload.action && typeof payload.action === "object" ? payload.action : {};
   const actionType = String(action.type || "");
@@ -3063,14 +3092,16 @@ function toolCallResultEntries(payload) {
       });
     }
   } else if (actionType === "wait_run" && result && typeof result.wait_run_status === "boolean") {
+    const summaryText = waitResultSummary("wait_run", "wait_run_status", result);
     entries.push({
       kind: "tool_return",
-      text: `wait_run result: status=${String(result.wait_run_status)}`,
+      text: summaryText || `wait_run result: status=${String(result.wait_run_status)}`,
     });
   } else if (actionType === "wait_time" && result && typeof result.wait_time_status === "boolean") {
+    const summaryText = waitResultSummary("wait_time", "wait_time_status", result);
     entries.push({
       kind: "tool_return",
-      text: `wait_time result: status=${String(result.wait_time_status)}`,
+      text: summaryText || `wait_time result: status=${String(result.wait_time_status)}`,
     });
   } else if (actionType === "cancel_agent" && result && typeof result.cancel_agent_status === "boolean") {
     entries.push({

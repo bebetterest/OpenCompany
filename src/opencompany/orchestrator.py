@@ -7681,6 +7681,7 @@ class Orchestrator:
             if timeout_seconds > 0 and (time.perf_counter() - started) >= timeout_seconds:
                 return {
                     "wait_run_status": False,
+                    "end_reason": "timeout",
                     "timed_out": True,
                     "timeout_seconds": timeout_seconds,
                 }
@@ -7724,6 +7725,7 @@ class Orchestrator:
         def _timed_out_result() -> dict[str, Any]:
             return {
                 "wait_time_status": False,
+                "end_reason": "timeout",
                 "timed_out": True,
                 "timeout_seconds": timeout_seconds,
             }

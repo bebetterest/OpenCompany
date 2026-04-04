@@ -2315,6 +2315,54 @@ backend = "anthropic"
         self.assertIn('"tree": {', entries[0][1])
         self.assertIn(nested_value, entries[0][1])
 
+    def test_wait_time_timeout_result_entries_include_timeout_feedback(self) -> None:
+        try:
+            from opencompany.tui.app import OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        entries = app._tool_call_result_entries(
+            {
+                "action": {"type": "wait_time"},
+                "result": {
+                    "wait_time_status": False,
+                    "timed_out": True,
+                    "timeout_seconds": 12,
+                },
+            }
+        )
+
+        self.assertIn(
+            (
+                "tool_return",
+                "wait_time result: status=False, timed_out=True, timeout_seconds=12, end_reason=timeout",
+            ),
+            entries,
+        )
+
+    def test_wait_run_result_entries_include_end_reason(self) -> None:
+        try:
+            from opencompany.tui.app import OpenCompanyApp
+        except ImportError:
+            self.skipTest("textual is not installed in the current environment")
+
+        app = OpenCompanyApp(project_dir=Path.cwd())
+        entries = app._tool_call_result_entries(
+            {
+                "action": {"type": "wait_run"},
+                "result": {
+                    "wait_run_status": True,
+                    "end_reason": "steer_received",
+                },
+            }
+        )
+
+        self.assertIn(
+            ("tool_return", "wait_run result: status=True, end_reason=steer_received"),
+            entries,
+        )
+
     def test_agent_response_prefers_reasoning_over_reasoning_details(self) -> None:
         try:
             from opencompany.tui.app import AgentRuntimeView, OpenCompanyApp
