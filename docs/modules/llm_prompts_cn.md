@@ -43,7 +43,7 @@ SSE 解析会合并：
 2. 否则从 assistant content 提取 JSON 对象
 3. 归一为 runtime action 列表
 
-无效或空协议响应会进入控制消息 + fallback finish 路径。
+无效或空协议响应会注入控制消息并返回空 actions（不走 fallback 自动 finish）。
 
 ## Prompt 与工具定义加载
 

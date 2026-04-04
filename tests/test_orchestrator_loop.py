@@ -780,11 +780,13 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                     wait_tool_calls.append(payload)
             self.assertEqual(wait_tool_calls, [])
 
-    async def test_worker_protocol_fallback_uses_progress_review_recommendation(self) -> None:
+    async def test_worker_protocol_error_returns_control_message_and_allows_next_step(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             build_test_project(project_dir)
             orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            orchestrator.config.runtime.tools.wait_time_min_seconds = 0.1
+            orchestrator.config.runtime.tools.wait_time_max_seconds = 1.0
             orchestrator.llm_client = RoutedLLMClient(
                 {
                     "root": [
@@ -804,6 +806,16 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "actions": [
                                     {
+                                        "type": "wait_time",
+                                        "seconds": 0.2,
+                                    }
+                                ]
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
                                         "type": "finish",
                                         "status": "partial",
                                         "summary": "Root finalized after worker protocol fallback.",
@@ -813,7 +825,19 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ],
                     "worker:Inspect the repository": [
-                        "This is a plain text response and not a valid protocol action payload."
+                        "This is a plain text response and not a valid protocol action payload.",
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "finish",
+                                        "status": "completed",
+                                        "summary": "Worker recovered after invalid protocol reminder.",
+                                        "next_recommendation": "Root can finalize now.",
+                                    }
+                                ]
+                            }
+                        ),
                     ],
                 }
             )
@@ -828,30 +852,60 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
             storage = Storage(project_dir / ".opencompany" / "opencompany.db")
             agents = storage.load_agents(session.id)
             worker = next(agent for agent in agents if agent["role"] == "worker")
-            self.assertEqual(worker["status"], "failed")
+            self.assertEqual(worker["status"], "completed")
             self.assertEqual(
                 worker["summary"],
-                "The agent produced an invalid protocol response.",
+                "Worker recovered after invalid protocol reminder.",
             )
             self.assertEqual(
                 worker["next_recommendation"],
-                "Review this agent's progress first, then plan and take the next steps.",
+                "Root can finalize now.",
+            )
+            self.assertEqual(
+                orchestrator.llm_client.calls.count("worker:Inspect the repository"),
+                2,
             )
 
-    async def test_root_protocol_fallback_exhausted_empty_responses_does_not_crash_runtime(self) -> None:
+            events = storage.load_events(session.id)
+            invalid_response_controls = []
+            for event in events:
+                if event["event_type"] != "control_message":
+                    continue
+                payload = json.loads(event["payload_json"])
+                if payload.get("kind") == "invalid_response":
+                    invalid_response_controls.append(payload)
+            self.assertEqual(len(invalid_response_controls), 1)
+
+    async def test_root_protocol_empty_response_recovery_requires_explicit_model_finish(self) -> None:
         with TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             build_test_project(project_dir)
             orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
-            client = RecordingLLMClient(["", ""])
+            client = RecordingLLMClient(
+                [
+                    "",
+                    "",
+                    json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "type": "finish",
+                                    "status": "completed",
+                                    "summary": "Root recovered after empty protocol retries.",
+                                }
+                            ]
+                        }
+                    ),
+                ]
+            )
             orchestrator.llm_client = client
 
             session = await orchestrator.run_task("Inspect this project")
 
             self.assertEqual(session.status.value, "completed")
-            self.assertEqual(session.completion_state, "partial")
-            self.assertEqual(session.final_summary, "The agent produced an invalid protocol response.")
-            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(session.completion_state, "completed")
+            self.assertEqual(session.final_summary, "Root recovered after empty protocol retries.")
+            self.assertEqual(len(client.calls), 3)
 
             storage = Storage(project_dir / ".opencompany" / "opencompany.db")
             events = storage.load_events(session.id)
@@ -885,3 +939,90 @@ class OrchestratorLoopTests(unittest.IsolatedAsyncioTestCase):
                 if payload.get("kind") == "invalid_response":
                     invalid_response_controls.append(payload)
             self.assertEqual(len(invalid_response_controls), 1)
+
+    async def test_root_protocol_error_with_running_child_does_not_auto_call_finish(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir)
+            build_test_project(project_dir)
+            orchestrator = Orchestrator(project_dir, locale="en", app_dir=project_dir)
+            orchestrator.config.runtime.tools.wait_time_min_seconds = 0.1
+            orchestrator.config.runtime.tools.wait_time_max_seconds = 1.0
+            orchestrator.llm_client = RoutedLLMClient(
+                {
+                    "root": [
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "spawn_agent",
+                                        "name": "Inspect",
+                                        "instruction": "Inspect the repository",
+                                        "blocking": True,
+                                    }
+                                ]
+                            }
+                        ),
+                        "This is not a valid protocol payload.",
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "wait_time",
+                                        "seconds": 0.2,
+                                    }
+                                ]
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "finish",
+                                        "status": "completed",
+                                        "summary": "Root finalized after protocol reminder.",
+                                    }
+                                ]
+                            }
+                        ),
+                    ],
+                    "worker:Inspect the repository": [
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "wait_time",
+                                        "seconds": 0.2,
+                                    }
+                                ]
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "finish",
+                                        "status": "completed",
+                                        "summary": "Worker finished after a short wait.",
+                                        "next_recommendation": "Root can finish.",
+                                    }
+                                ]
+                            }
+                        ),
+                    ],
+                }
+            )
+
+            session = await orchestrator.run_task("Inspect this project")
+
+            self.assertEqual(session.status.value, "completed")
+            self.assertEqual(session.final_summary, "Root finalized after protocol reminder.")
+
+            storage = Storage(project_dir / ".opencompany" / "opencompany.db")
+            events = storage.load_events(session.id)
+            finish_rejected_errors = [
+                event
+                for event in events
+                if "Cannot finish while unfinished child agents still exist."
+                in str(event.get("payload_json", ""))
+            ]
+            self.assertEqual(finish_rejected_errors, [])

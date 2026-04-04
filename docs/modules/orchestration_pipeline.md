@@ -49,7 +49,7 @@ Empty-protocol retry behavior:
 
 - retries only when response is structurally empty and configured retries remain
 - each empty-protocol retry is emitted as `llm_retry` with `retry_reason=empty_protocol_response`, sharing unified retry accounting with API/network/empty-stream retries
-- otherwise injects runtime invalid-response control message and falls back to a failure-style `finish`
+- otherwise injects runtime invalid-response control message and returns an empty action batch (no auto-`finish`), so the next runtime step is still model-decided
 
 ## Context Assembly and Storage
 

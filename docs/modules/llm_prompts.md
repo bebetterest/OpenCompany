@@ -43,7 +43,7 @@ Action extraction order:
 2. otherwise extract JSON object from assistant content
 3. normalize into runtime action list
 
-Invalid or empty protocol responses are handled by runtime control-message + fallback finish flow.
+Invalid or empty protocol responses are handled by runtime control-message injection plus an empty action return (no fallback auto-`finish`).
 
 ## Prompt and Tool Definition Loading
 

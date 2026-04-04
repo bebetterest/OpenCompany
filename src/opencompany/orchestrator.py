@@ -10038,43 +10038,6 @@ class Orchestrator:
             root_loop=root_loop,
         )
 
-    async def _auto_finalize_root(
-        self,
-        *,
-        session: RunSession,
-        root_agent: AgentNode,
-        agents: dict[str, AgentNode],
-        workspace_manager: WorkspaceManager,
-        reason: str,
-        root_loop: int,
-    ) -> None:
-        child_summaries = self._child_summaries(root_agent, agents)
-        summary = (
-            reason
-            + "\n\nCurrent child progress:\n"
-            + stable_json_dumps(child_summaries or [{"summary": "No child summaries recorded."}])
-        )
-        self._log_diagnostic(
-            "root_auto_finalize_triggered",
-            level="warning",
-            session_id=session.id,
-            agent_id=root_agent.id,
-            payload={"reason": reason, "root_loop": root_loop},
-        )
-        await self._finalize_root(
-            session=session,
-            root_agent=root_agent,
-            payload={
-                "user_summary": summary,
-                "completion_state": "partial",
-                "follow_up_needed": True,
-            },
-            agents=agents,
-            workspace_manager=workspace_manager,
-            pending_agent_ids=[],
-            root_loop=root_loop,
-        )
-
     async def _mark_interrupted(
         self,
         *,

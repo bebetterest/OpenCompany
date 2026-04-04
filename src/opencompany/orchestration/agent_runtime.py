@@ -482,19 +482,9 @@ class AgentRuntime:
                     },
                 )
                 self.persist_agent(agent)
-                fallback_status = "partial" if agent.role == AgentRole.ROOT else "failed"
-                fallback_finish: dict[str, Any] = {
-                    "type": "finish",
-                    "status": fallback_status,
-                    "summary": "The agent produced an invalid protocol response.",
-                }
-                if agent.role != AgentRole.ROOT:
-                    fallback_finish["next_recommendation"] = (
-                        "Review this agent's progress first, then plan and take the next steps."
-                    )
-                return [
-                    fallback_finish
-                ]
+                # Do not auto-finish on protocol errors; hand control back to the
+                # scheduler so the next step can be decided by the model.
+                return []
 
     async def compress_context(
         self,
